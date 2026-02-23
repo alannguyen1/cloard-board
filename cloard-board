@@ -1394,13 +1394,17 @@ _read_or_esc() {
   stty -echo raw
   local _first_char=""
   read -rk1 _first_char 2>/dev/null || { stty echo -raw; return 1; }
-  stty echo -raw
   if [[ "$_first_char" == $'\e' || "$_first_char" == $'\x03' ]]; then
-    # Esc or Ctrl-C: cancel
+    # Drain any buffered keypresses (user mashing Esc)
+    local _discard=""
+    while read -rk1 -t 0.05 _discard 2>/dev/null; do :; done
+    # Restore line mode but keep echo OFF so nothing leaks before handler cleanup
+    stty -raw
     echo ""
     eval "$_varname=''"
     return 1
   fi
+  stty echo -raw
   # Got a normal char; read the rest of the line in cooked mode
   if [[ "$_first_char" == $'\n' || "$_first_char" == $'\r' ]]; then
     _line=""
