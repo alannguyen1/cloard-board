@@ -103,6 +103,24 @@ update_task_field_raw() {
   _unlock_state
 }
 
+# Swap two tasks' positions in the state JSON array (for reordering within a column)
+_swap_tasks_in_state() {
+  local id_a="$1" id_b="$2"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg a "$id_a" --arg b "$id_b" '
+    (.tasks | to_entries) as $entries |
+    ($entries | map(select(.value.id == $a)) | .[0].key) as $idx_a |
+    ($entries | map(select(.value.id == $b)) | .[0].key) as $idx_b |
+    if $idx_a != null and $idx_b != null then
+      .tasks[$idx_a] = $entries[$idx_b].value |
+      .tasks[$idx_b] = $entries[$idx_a].value
+    else . end
+  ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
 # ── Repo helpers ──────────────────────────────────────────────────────────────
 repo_exists() {
   local name="$1"
@@ -2043,10 +2061,10 @@ cmd__dash_loop() {
       if [[ "$nav_mode" == "repo" ]]; then
         printf "${C_DIM}  Tab: filter  j/k: repos  Enter: zoom in  o: new session  S: import session  R: add repo  q: quit${C_RESET}"
       else
-        printf "${C_DIM}  j/k: scroll (overflows to next repo)  Esc: repos  o: new  S: import  t: rename  R: add repo  q: quit${C_RESET}"
+        printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  o: new  S: import  t: rename  R: add repo  q: quit${C_RESET}"
       fi
     else
-      printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  </> move  o: new  S: import  t: rename  s: shell  d: diff  q: quit${C_RESET}"
+      printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  </> move  :/\" reorder  o: new  S: import  t: rename  s: shell  d: diff  q: quit${C_RESET}"
     fi
 
     # Debug timing
@@ -2348,6 +2366,51 @@ cmd__dash_loop() {
           if [[ $mv_idx -gt 0 ]]; then
             local prev_status="${status_order[$((mv_idx - 1))]}"
             update_task_field "$sel_id" "status" "$prev_status"
+          fi
+        fi
+        ;;
+      ':') # Move card up in column
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local active_repo
+          if [[ "$filter_mode" != "all" ]]; then
+            active_repo="$filter_mode"
+          else
+            active_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          local ckey="${active_repo}:${cur_col}"
+          local crow="${cur_card_row[$ckey]:-0}"
+          if [[ $crow -gt 0 ]]; then
+            # Get the task above
+            _get_repo_task_at "$active_repo" "$cur_col" "$((crow - 1))"
+            local above_id="$_tid"
+            if [[ -n "$above_id" ]]; then
+              _swap_tasks_in_state "$sel_id" "$above_id"
+              cur_card_row[$ckey]=$((crow - 1))
+            fi
+          fi
+        fi
+        ;;
+      '"') # Move card down in column
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local active_repo
+          if [[ "$filter_mode" != "all" ]]; then
+            active_repo="$filter_mode"
+          else
+            active_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          local ckey="${active_repo}:${cur_col}"
+          local crow="${cur_card_row[$ckey]:-0}"
+          local max_idx=$(( ${_repo_col_cnt[$ckey]:-0} - 1 ))
+          if [[ $crow -lt $max_idx ]]; then
+            # Get the task below
+            _get_repo_task_at "$active_repo" "$cur_col" "$((crow + 1))"
+            local below_id="$_tid"
+            if [[ -n "$below_id" ]]; then
+              _swap_tasks_in_state "$sel_id" "$below_id"
+              cur_card_row[$ckey]=$((crow + 1))
+            fi
           fi
         fi
         ;;
@@ -2667,7 +2730,8 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     t           Rename focused task
     p           Pause task
     x           Done/remove task
-    </>         Move task left/right
+    </>         Move task left/right (change status)
+    :/"         Reorder card up/down within column
     s           Show shell output
     d           Show git diff
     R           Register a new repo
