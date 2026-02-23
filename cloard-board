@@ -1,17 +1,18 @@
 #!/usr/bin/env zsh
-# cloard-board: tmux kanban dashboard for Claude Code worktree sessions
+# cloard-board: multi-repo tmux kanban dashboard for Claude Code worktree sessions
 # Usage: cloard-board <command> [args]
 set -euo pipefail
 setopt KSH_ARRAYS  # Use 0-based array indexing (C-style, consistent with loop conventions)
+setopt TYPESET_SILENT  # Prevent typeset/local from printing values on re-declaration
 # Capture stable script path at startup (realpath "$0" inside functions resolves incorrectly in zsh)
 SCRIPT_PATH=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-readonly VERSION="0.1.0"
+readonly VERSION="0.2.0"
 readonly TMUX_SOCKET="cloard-board"
-readonly STATE_DIR=".cloard-board"
-readonly STATE_FILE="${STATE_DIR}/tasks.json"
-readonly INIT_SCRIPT="${STATE_DIR}/init.sh"
+readonly GLOBAL_DIR="$HOME/.cloard-board"
+readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
+readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
 
 # ── Colours (ANSI) ────────────────────────────────────────────────────────────
@@ -38,47 +39,144 @@ require_cmd() {
   command -v "$1" &>/dev/null || die "'$1' is required but not found"
 }
 
-require_init() {
-  [[ -f "$STATE_FILE" ]] || die "not initialised; run 'cloard-board init' first"
-}
-
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
-# ── JSON helpers (jq wrappers) ─────────────────────────────────────────────────
-read_tasks() { jq -r '.tasks' "$STATE_FILE"; }
+# ── Lock helpers (mkdir-based, portable to macOS) ─────────────────────────────
+_lock_state() {
+  local lockdir="${GLOBAL_DIR}/.lock"
+  local retries=100
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    retries=$((retries - 1))
+    if [[ $retries -le 0 ]]; then
+      warn "could not acquire state lock"
+      return 1
+    fi
+    sleep 0.02
+  done
+}
 
+_unlock_state() {
+  rmdir "${GLOBAL_DIR}/.lock" 2>/dev/null || true
+}
+
+# ── JSON helpers (jq wrappers, global state) ──────────────────────────────────
 read_task() {
   local id="$1"
-  jq -r --arg id "$id" '.tasks[] | select(.id == $id)' "$STATE_FILE"
+  jq -r --arg id "$id" '.tasks[] | select(.id == $id)' "$GLOBAL_STATE"
 }
 
 task_exists() {
   local id="$1"
-  [[ "$(jq -r --arg id "$id" '[.tasks[] | select(.id == $id)] | length' "$STATE_FILE")" -gt 0 ]]
+  [[ "$(jq -r --arg id "$id" '[.tasks[] | select(.id == $id)] | length' "$GLOBAL_STATE")" -gt 0 ]]
 }
 
 task_status() {
   local id="$1"
-  jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .status' "$STATE_FILE"
+  jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .status' "$GLOBAL_STATE"
+}
+
+task_field() {
+  local id="$1" field="$2"
+  jq -r --arg id "$id" --arg f "$field" '.tasks[] | select(.id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
 }
 
 update_task_field() {
   local id="$1" field="$2" value="$3"
+  _lock_state || return 1
   local tmp
-  tmp=$(mktemp "${STATE_DIR}/.tasks.XXXXXX")
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
   jq --arg id "$id" --arg f "$field" --arg v "$value" \
-    '(.tasks[] | select(.id == $id))[$f] = $v' "$STATE_FILE" > "$tmp" \
-    && mv "$tmp" "$STATE_FILE"
+    '(.tasks[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
 }
 
 update_task_field_raw() {
   # For non-string values (null, numbers)
   local id="$1" field="$2" value="$3"
+  _lock_state || return 1
   local tmp
-  tmp=$(mktemp "${STATE_DIR}/.tasks.XXXXXX")
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
   jq --arg id "$id" --arg f "$field" --argjson v "$value" \
-    '(.tasks[] | select(.id == $id))[$f] = $v' "$STATE_FILE" > "$tmp" \
-    && mv "$tmp" "$STATE_FILE"
+    '(.tasks[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+# ── Repo helpers ──────────────────────────────────────────────────────────────
+repo_exists() {
+  local name="$1"
+  [[ "$(jq -r --arg n "$name" '[.repos[] | select(.name == $n)] | length' "$GLOBAL_STATE")" -gt 0 ]]
+}
+
+repo_path() {
+  local name="$1"
+  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .path' "$GLOBAL_STATE"
+}
+
+repo_type() {
+  local name="$1"
+  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .type // "git"' "$GLOBAL_STATE"
+}
+
+repo_base_branch() {
+  local name="$1"
+  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .base_branch // "main"' "$GLOBAL_STATE"
+}
+
+task_repo() {
+  local id="$1"
+  jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .repo // ""' "$GLOBAL_STATE"
+}
+
+# Find which registered repo a Claude session belongs to by scanning ~/.claude/projects/
+_find_session_repo() {
+  local uid="$1"
+  local session_file
+  session_file=$(command find "$HOME/.claude/projects" -maxdepth 2 -name "${uid}.jsonl" -print -quit 2>/dev/null)
+  [[ -n "$session_file" ]] || return 1
+
+  local project_dir
+  project_dir=$(basename "$(dirname "$session_file")")
+
+  # For each registered repo, encode its path the way Claude does and compare
+  local rname rpath
+  while IFS=$'\x1e' read -r rname rpath; do
+    [[ -n "$rname" ]] || continue
+    local encoded="${rpath//\//-}"
+    encoded="${encoded// /-}"
+    if [[ "$project_dir" == "$encoded" ]]; then
+      echo "$rname"
+      return 0
+    fi
+  done < <(jq -r '.repos[] | select(.archived != true) | [.name, .path] | join("\u001e")' "$GLOBAL_STATE")
+
+  return 1
+}
+
+_next_task_id() {
+  _lock_state || return 1
+  local num
+  num=$(jq -r '.next_task_id' "$GLOBAL_STATE")
+  local new_id
+  new_id=$(printf "t-%03d" "$num")
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq '.next_task_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  echo "$new_id"
+}
+
+# Unlocked variant for migration (no concurrent access during first-time setup)
+_next_task_id_unlocked() {
+  local num
+  num=$(jq -r '.next_task_id' "$GLOBAL_STATE")
+  local new_id
+  new_id=$(printf "t-%03d" "$num")
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq '.next_task_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  echo "$new_id"
 }
 
 # ── tmux helpers ───────────────────────────────────────────────────────────────
@@ -90,10 +188,9 @@ tmux_session_exists() {
 
 ensure_tmux_session() {
   if ! tmux_session_exists; then
-    tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50 -c "$PWD"
+    tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50
     tmux_cmd bind-key -T prefix b select-window -t "board:dashboard"
     pin_dashboard_to_zero
-    # The dashboard window will be started by 'dash' command
   fi
 }
 
@@ -133,135 +230,73 @@ pin_dashboard_to_zero() {
 # ── Worktree helpers ───────────────────────────────────────────────────────────
 find_worktree_path() {
   # Discover worktree path for a given branch/name from git worktree list
+  # Optional second argument: repo directory to search in
   local id="$1"
+  local repo_dir="${2:-}"
   local branch="worktree-${id}"
-  git worktree list --porcelain 2>/dev/null | awk -v branch="refs/heads/$branch" '
-    /^worktree / { path = substr($0, 10) }
-    /^branch / { if ($2 == branch) print path }
-  '
-}
-
-# ── Commands ───────────────────────────────────────────────────────────────────
-
-cmd_help() {
-  cat <<EOF
-${C_BOLD}cloard-board${C_RESET} v${VERSION}
-tmux kanban dashboard for Claude Code worktree sessions
-
-${C_BOLD}USAGE${C_RESET}
-  cloard-board <command> [args]
-
-${C_BOLD}COMMANDS${C_RESET}
-  init                        Initialise .cloard-board/ in current repo
-  add <id> --title "..."      Add a task (status: pending)
-                              Options: --no-worktree (skip branch isolation)
-  start <id> [prompt]         Start Claude in a worktree (status: active)
-  pause <id>                  Pause a task (kill window, keep worktree)
-  go <id>                     Switch to a task's tmux window
-  dash                        Open the interactive kanban dashboard
-  attach                      Attach to the cloard-board tmux session
-  review <id>                 Push branch, create PR (status: review)
-  done <id>                   Clean up worktree and window (status: done)
-  resume <id>                 Reopen a task with claude --continue
-  list                        Print all tasks as a table
-  rm <id>                     Remove a task entirely
-  advance <id>                Move task to next status
-  status <id>                 Show task and Claude status
-  signal <id> <status>        Set Claude status (working|waiting|clear)
-  doctor                      Check for orphaned worktrees/windows
-
-${C_BOLD}OPTIONS${C_RESET}
-  --help, -h                  Show this help
-  --version, -v               Show version
-
-${C_BOLD}EXAMPLES${C_RESET}
-  cloard-board init
-  cloard-board add fix-auth --title "Fix authentication redirect loop"
-  cloard-board add fix-typo --title "Fix typo" --no-worktree
-  cloard-board start fix-auth "Fix the auth redirect loop in middleware"
-  cloard-board pause fix-auth
-  cloard-board resume fix-auth
-  cloard-board dash
-  cloard-board review fix-auth
-  cloard-board done fix-auth
-EOF
-}
-
-cmd_version() { echo "cloard-board v${VERSION}"; }
-
-cmd_init() {
-  if [[ -f "$STATE_FILE" ]]; then
-    info "already initialised at ${STATE_DIR}/"
+  if [[ -n "$repo_dir" ]]; then
+    (cd "$repo_dir" && git worktree list --porcelain 2>/dev/null) | awk -v branch="refs/heads/$branch" '
+      /^worktree / { path = substr($0, 10) }
+      /^branch / { if ($2 == branch) print path }
+    '
   else
-    # Detect project name from git toplevel or current directory
-    local project
-    local _git_root
-    _git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-    if [[ -n "$_git_root" ]]; then
-      project=$(basename "$_git_root")
-    else
-      project=$(basename "$PWD")
-    fi
+    git worktree list --porcelain 2>/dev/null | awk -v branch="refs/heads/$branch" '
+      /^worktree / { path = substr($0, 10) }
+      /^branch / { if ($2 == branch) print path }
+    '
+  fi
+}
 
-    # Detect default branch
-    local base_branch
-    base_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@refs/remotes/origin/@@' || echo "main")
+# ── Global state management ───────────────────────────────────────────────────
+ensure_global_state() {
+  mkdir -p "$GLOBAL_DIR"
 
-    mkdir -p "$STATE_DIR"
-
-    # Use jq to produce valid JSON (avoids injection from special chars in project/branch names)
-    jq -n --arg p "$project" --arg b "$base_branch" \
-      '{version: 1, project: $p, base_branch: $b, tasks: []}' > "$STATE_FILE"
-
-    # Add to .gitignore if not already there
-    if [[ -f .gitignore ]]; then
-      if ! grep -qx '.cloard-board/' .gitignore 2>/dev/null; then
-        echo '.cloard-board/' >> .gitignore
-        info "added .cloard-board/ to .gitignore"
-      fi
-    else
-      echo '.cloard-board/' > .gitignore
-      info "created .gitignore with .cloard-board/"
-    fi
-
-    ok "initialised ${STATE_DIR}/ for project '${project}' (base: ${base_branch})"
+  if [[ ! -f "$GLOBAL_STATE" ]]; then
+    jq -n '{version: 2, next_task_id: 1, repos: [], tasks: []}' > "$GLOBAL_STATE"
   fi
 
-  # Set up Claude Code hooks (idempotent; runs on both init and re-init)
-  mkdir -p "${STATE_DIR}/hooks"
+  # Install hooks if missing
+  if [[ ! -f "$HOOKS_DIR/on-stop.sh" || ! -f "$HOOKS_DIR/on-prompt.sh" ]]; then
+    _install_hook_scripts
+    _register_global_hooks
+  fi
+}
 
-  cat > "${STATE_DIR}/hooks/on-stop.sh" <<'HOOK'
+_install_hook_scripts() {
+  mkdir -p "$HOOKS_DIR"
+
+  cat > "$HOOKS_DIR/on-stop.sh" <<'HOOK'
 #!/usr/bin/env bash
 # cloard-board hook: set task status to "waiting" when Claude stops
 [[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
-[[ -n "${CLOARD_BOARD_DIR:-}" ]] || exit 0
-(cd "$CLOARD_BOARD_DIR" && cloard-board signal "$CLOARD_TASK_ID" waiting) &>/dev/null &
+cloard-board signal "$CLOARD_TASK_ID" waiting &>/dev/null &
 HOOK
-  chmod +x "${STATE_DIR}/hooks/on-stop.sh"
+  chmod +x "$HOOKS_DIR/on-stop.sh"
 
-  cat > "${STATE_DIR}/hooks/on-prompt.sh" <<'HOOK'
+  cat > "$HOOKS_DIR/on-prompt.sh" <<'HOOK'
 #!/usr/bin/env bash
 # cloard-board hook: set task status to "working" when user submits a prompt
 [[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
-[[ -n "${CLOARD_BOARD_DIR:-}" ]] || exit 0
-(cd "$CLOARD_BOARD_DIR" && cloard-board signal "$CLOARD_TASK_ID" working) &>/dev/null &
+cloard-board signal "$CLOARD_TASK_ID" working &>/dev/null &
 HOOK
-  chmod +x "${STATE_DIR}/hooks/on-prompt.sh"
+  chmod +x "$HOOKS_DIR/on-prompt.sh"
+}
 
-  # Register hooks in .claude/settings.json (merge, don't overwrite)
-  mkdir -p .claude
-  local settings_file=".claude/settings.json"
+_register_global_hooks() {
+  local settings_dir="$HOME/.claude"
+  local settings_file="$settings_dir/settings.json"
+  mkdir -p "$settings_dir"
+
   local new_hooks
-  new_hooks=$(jq -n '{
-    "Stop": [{"hooks": [{"type": "command", "command": ".cloard-board/hooks/on-stop.sh"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": ".cloard-board/hooks/on-prompt.sh"}]}]
+  new_hooks=$(jq -n --arg stop "$HOOKS_DIR/on-stop.sh" --arg prompt "$HOOKS_DIR/on-prompt.sh" '{
+    "Stop": [{"hooks": [{"type": "command", "command": $stop}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": $prompt}]}]
   }')
 
   if [[ -f "$settings_file" ]]; then
     local tmp_settings
-    tmp_settings=$(mktemp)
+    tmp_settings=$(mktemp "${GLOBAL_DIR}/.settings.XXXXXX")
     # Merge hooks: remove any existing cloard-board entries, then append ours
-    # This preserves other hooks for the same event types and is idempotent
     jq --argjson new_hooks "$new_hooks" '
       .hooks = ((.hooks // {}) |
         reduce ($new_hooks | to_entries[]) as $entry (.;
@@ -277,48 +312,392 @@ HOOK
   else
     jq -n --argjson hooks "$new_hooks" '{hooks: $hooks}' > "$settings_file"
   fi
+}
 
-  ok "hooks configured in .claude/settings.json"
+# Auto-migrate old per-repo state on first run from that directory
+check_and_migrate() {
+  local local_state=".cloard-board/tasks.json"
+  [[ -f "$local_state" ]] || return 0
+
+  # Check if it's v1 format
+  local version
+  version=$(jq -r '.version // 0' "$local_state" 2>/dev/null) || return 0
+  [[ "$version" == "1" ]] || return 0
+
+  # Check if this repo is already registered
+  local cwd_canonical
+  cwd_canonical=$(pwd -P)
+  local already_registered
+  already_registered=$(jq -r --arg p "$cwd_canonical" '[.repos[] | select(.path == $p)] | length' "$GLOBAL_STATE")
+  [[ "$already_registered" -eq 0 ]] || return 0
+
+  # Count tasks
+  local task_count
+  task_count=$(jq '.tasks | length' "$local_state")
+
+  # Skip migration prompt in non-interactive contexts
+  if [[ ! -t 0 ]]; then
+    return 0
+  fi
+
+  printf "${C_CYAN}Found local cloard-board state with ${task_count} tasks. Migrate to global dashboard? [Y/n] ${C_RESET}"
+  local answer
+  read -r answer
+  [[ "$answer" =~ ^[nN]$ ]] && return 0
+
+  # Register this repo
+  local repo_name
+  repo_name=$(basename "$cwd_canonical")
+  repo_name=$(_do_repo_add "$cwd_canonical" "$repo_name") || return 1
+
+  # Import tasks with new IDs
+  local old_tasks
+  old_tasks=$(jq -r '.tasks[] | [
+    .id, .title, .status,
+    (.worktree_mode // "worktree"),
+    (.claude_status // ""),
+    (.pr_url // ""),
+    (.branch // ""),
+    (.worktree // ""),
+    (.started_at // ""),
+    (.completed_at // "")
+  ] | join("\u001e")' "$local_state")
+
+  while IFS=$'\x1e' read -r old_id old_title old_status old_wm old_cs old_pr old_branch old_wt old_started old_completed; do
+    [[ -n "$old_id" ]] || continue
+    local new_id
+    new_id=$(_next_task_id_unlocked)
+    local tmp
+    tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+    local now
+    now=$(now_iso)
+    jq --arg id "$new_id" --arg title "$old_title" --arg status "$old_status" \
+       --arg wm "$old_wm" --arg repo "$repo_name" --arg cs "$old_cs" \
+       --arg pr "$old_pr" --arg branch "$old_branch" --arg wt "$old_wt" \
+       --arg old_id "$old_id" --arg started "$old_started" --arg completed "$old_completed" \
+       --arg now "$now" \
+      '.tasks += [{
+        id: $id,
+        title: $title,
+        repo: $repo,
+        status: $status,
+        worktree_mode: $wm,
+        worktree: (if $wt == "" then null else $wt end),
+        branch: (if $branch == "" then null else $branch end),
+        claude_status: (if $cs == "" then null else $cs end),
+        pr_number: null,
+        pr_url: (if $pr == "" then null else $pr end),
+        created_at: $now,
+        started_at: (if $started == "" then null else $started end),
+        completed_at: (if $completed == "" then null else $completed end),
+        legacy_id: $old_id
+      }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  done <<< "$old_tasks"
+
+  # Rename old state directory (backup)
+  mv ".cloard-board" ".cloard-board.migrated"
+
+  # Clean up per-repo hook entries from local .claude/settings.json
+  if [[ -f ".claude/settings.json" ]]; then
+    local tmp_s
+    tmp_s=$(mktemp)
+    jq '
+      if .hooks then
+        .hooks |= with_entries(
+          .value = [.value[] | select(.hooks | all(.command | test("cloard-board") | not))]
+        )
+      else . end
+    ' ".claude/settings.json" > "$tmp_s" && mv "$tmp_s" ".claude/settings.json"
+  fi
+
+  ok "migrated ${task_count} tasks from local state; old state backed up to .cloard-board.migrated/"
+}
+
+# ── Repo commands ──────────────────────────────────────────────────────────────
+cmd_repo() {
+  local subcmd="${1:-}"
+  shift 2>/dev/null || true
+  case "$subcmd" in
+    add)         cmd_repo_add "$@" ;;
+    remove|rm)   cmd_repo_remove "$@" ;;
+    list|ls)     cmd_repo_list "$@" ;;
+    update-path) cmd_repo_update_path "$@" ;;
+    archive)     cmd_repo_archive "$@" ;;
+    unarchive)   cmd_repo_unarchive "$@" ;;
+    *)           die "usage: cloard-board repo <add|remove|list|update-path|archive|unarchive>" ;;
+  esac
+}
+
+# Internal: add a repo to state, returns the name used
+_do_repo_add() {
+  local rpath="$1"
+  local rname="${2:-}"
+
+  # Resolve canonical path
+  rpath=$(cd "$rpath" && pwd -P)
+
+  # Remove trailing slash
+  rpath="${rpath%/}"
+
+  # Derive name from basename if not provided
+  [[ -n "$rname" ]] || rname=$(basename "$rpath")
+
+  # Handle name collisions
+  local original_name="$rname"
+  local suffix=2
+  while repo_exists "$rname"; do
+    # Check if same path (already registered)
+    local existing_path
+    existing_path=$(repo_path "$rname")
+    if [[ "$existing_path" == "$rpath" ]]; then
+      die "repo '${rname}' is already registered at ${rpath}"
+    fi
+    rname="${original_name}-${suffix}"
+    suffix=$((suffix + 1))
+  done
+
+  # Detect git or plain directory
+  local rtype="dir"
+  local base_branch=""
+  if (cd "$rpath" && git rev-parse --show-toplevel &>/dev/null); then
+    rtype="git"
+    base_branch=$(cd "$rpath" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@refs/remotes/origin/@@' || echo "main")
+  fi
+
+  # Atomic write
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.repos.XXXXXX")
+  local now
+  now=$(now_iso)
+  jq --arg name "$rname" --arg path "$rpath" --arg type "$rtype" \
+     --arg bb "$base_branch" --arg now "$now" \
+    '.repos += [{
+      name: $name,
+      path: $path,
+      type: $type,
+      base_branch: (if $bb == "" then null else $bb end),
+      archived: false,
+      added_at: $now
+    }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+
+  echo "$rname"
+}
+
+cmd_repo_add() {
+  local rpath="${1:-$PWD}"
+
+  # Normalize: remove trailing slash
+  rpath="${rpath%/}"
+
+  # Validate path exists
+  [[ -d "$rpath" ]] || die "path does not exist: $rpath"
+
+  local rname
+  rname=$(_do_repo_add "$rpath")
+  ok "registered '${rname}' (${rpath})"
+}
+
+cmd_repo_remove() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: cloard-board repo remove <name>"
+  repo_exists "$name" || die "repo '${name}' not registered"
+
+  # Warn about orphaned tasks
+  local task_count
+  task_count=$(jq -r --arg n "$name" '[.tasks[] | select(.repo == $n)] | length' "$GLOBAL_STATE")
+  if [[ "$task_count" -gt 0 ]]; then
+    warn "${task_count} task(s) will become orphaned"
+  fi
+
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.repos.XXXXXX")
+  jq --arg n "$name" '.repos = [.repos[] | select(.name != $n)]' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+
+  ok "removed repo '${name}'"
+}
+
+cmd_repo_list() {
+  local show_all=false
+  [[ "${1:-}" == "--all" ]] && show_all=true
+
+  local count
+  count=$(jq '.repos | length' "$GLOBAL_STATE")
+
+  if [[ "$count" -eq 0 ]]; then
+    info "no repos registered; run 'cloard-board repo add <path>' to register one"
+    return 0
+  fi
+
+  printf "\n${C_BOLD}%-20s %-8s %-40s %-8s %-10s${C_RESET}\n" "NAME" "TYPE" "PATH" "TASKS" "STATUS"
+  printf "%-20s %-8s %-40s %-8s %-10s\n" \
+    "$(printf '%0.s─' {1..20})" "$(printf '%0.s─' {1..8})" \
+    "$(printf '%0.s─' {1..40})" "$(printf '%0.s─' {1..8})" "$(printf '%0.s─' {1..10})"
+
+  local repo_data task_count rstatus
+  repo_data=$(jq -r '.repos[] | [.name, .type, .path, (if .archived == true then "true" else "false" end)] | join("\u001e")' "$GLOBAL_STATE")
+
+  while IFS=$'\x1e' read -r rname rtype rpath rarchived; do
+    [[ -n "$rname" ]] || continue
+    if [[ "$show_all" != "true" && "$rarchived" == "true" ]]; then
+      continue
+    fi
+    task_count=$(jq -r --arg n "$rname" '[.tasks[] | select(.repo == $n)] | length' "$GLOBAL_STATE")
+    rstatus="active"
+    [[ "$rarchived" == "true" ]] && rstatus="archived"
+    [[ -d "$rpath" ]] || rstatus="stale"
+    printf "%-20s %-8s %-40s %-8s %-10s\n" "$rname" "$rtype" "${rpath:0:40}" "$task_count" "$rstatus"
+  done <<< "$repo_data"
+  echo
+}
+
+cmd_repo_update_path() {
+  local name="${1:-}" new_path="${2:-}"
+  [[ -n "$name" ]] || die "usage: cloard-board repo update-path <name> <new-path>"
+  [[ -n "$new_path" ]] || die "usage: cloard-board repo update-path <name> <new-path>"
+  repo_exists "$name" || die "repo '${name}' not registered"
+  [[ -d "$new_path" ]] || die "path does not exist: $new_path"
+
+  new_path=$(cd "$new_path" && pwd -P)
+
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.repos.XXXXXX")
+  jq --arg n "$name" --arg p "$new_path" \
+    '(.repos[] | select(.name == $n)).path = $p' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+
+  ok "updated '${name}' path to ${new_path}"
+}
+
+cmd_repo_archive() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: cloard-board repo archive <name>"
+  repo_exists "$name" || die "repo '${name}' not registered"
+
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.repos.XXXXXX")
+  jq --arg n "$name" '(.repos[] | select(.name == $n)).archived = true' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+
+  ok "archived repo '${name}'"
+}
+
+cmd_repo_unarchive() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: cloard-board repo unarchive <name>"
+  repo_exists "$name" || die "repo '${name}' not registered"
+
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.repos.XXXXXX")
+  jq --arg n "$name" '(.repos[] | select(.name == $n)).archived = false' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+
+  ok "unarchived repo '${name}'"
+}
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+cmd_init() {
+  ensure_global_state
+  check_and_migrate
+  cmd_repo_add "${PWD}"
 }
 
 cmd_add() {
-  require_init
-  local id="" title="" worktree_mode="worktree"
+  local title="" repo_name="" worktree_mode=""
 
   # Parse args
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --title|-t) [[ $# -gt 1 ]] || die "--title requires a value"; title="$2"; shift 2 ;;
       --title=*) title="${1#*=}"; shift ;;
+      --repo|-r) [[ $# -gt 1 ]] || die "--repo requires a value"; repo_name="$2"; shift 2 ;;
+      --repo=*) repo_name="${1#*=}"; shift ;;
       --no-worktree) worktree_mode="none"; shift ;;
       -*) die "unknown flag: $1" ;;
-      *)
-        if [[ -z "$id" ]]; then
-          id="$1"; shift
-        else
-          die "unexpected argument: $1"
-        fi
-        ;;
+      *) die "unexpected argument: $1 (task IDs are now auto-generated)" ;;
     esac
   done
 
-  [[ -n "$id" ]] || die "usage: cloard-board add <id> --title \"...\""
-  [[ -n "$title" ]] || die "missing --title"
+  [[ -n "$title" ]] || title="(untitled)"
 
-  # Validate id (alphanumeric, hyphens, underscores)
-  [[ "$id" =~ ^[a-zA-Z0-9_-]+$ ]] || die "id must be alphanumeric with hyphens/underscores"
-
-  if task_exists "$id"; then
-    die "task '$id' already exists"
+  # Repo selection
+  if [[ -z "$repo_name" ]]; then
+    local repo_count
+    repo_count=$(jq '[.repos[] | select(.archived != true)] | length' "$GLOBAL_STATE")
+    if [[ "$repo_count" -eq 0 ]]; then
+      die "no repos registered; run 'cloard-board repo add <path>' first"
+    elif [[ "$repo_count" -eq 1 ]]; then
+      repo_name=$(jq -r '[.repos[] | select(.archived != true)][0].name' "$GLOBAL_STATE")
+    else
+      # Show picker
+      echo "${C_CYAN}Select a repo:${C_RESET}"
+      local -a repo_list=()
+      local idx=1
+      while IFS= read -r rn; do
+        repo_list+=("$rn")
+        echo "  ${idx}) ${rn}"
+        idx=$((idx + 1))
+      done < <(jq -r '.repos[] | select(.archived != true) | .name' "$GLOBAL_STATE")
+      printf "${C_CYAN}Choice [1-${#repo_list[@]}]: ${C_RESET}"
+      local choice
+      read -r choice
+      [[ "$choice" =~ ^[0-9]+$ ]] || die "invalid choice"
+      choice=$((choice - 1))
+      [[ $choice -ge 0 && $choice -lt ${#repo_list[@]} ]] || die "invalid choice"
+      repo_name="${repo_list[$choice]}"
+    fi
   fi
 
+  repo_exists "$repo_name" || die "repo '${repo_name}' not registered"
+
+  # Check not archived
+  local is_archived
+  is_archived=$(jq -r --arg n "$repo_name" '.repos[] | select(.name == $n) | .archived // false' "$GLOBAL_STATE")
+  [[ "$is_archived" != "true" ]] || die "repo '${repo_name}' is archived"
+
+  # Check not stale
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  [[ -d "$rpath" ]] || die "repo path not found: $rpath. Run: cloard-board repo update-path $repo_name <new-path>"
+
+  # Determine worktree mode
+  if [[ -z "$worktree_mode" ]]; then
+    local rtype
+    rtype=$(repo_type "$repo_name")
+    if [[ "$rtype" == "dir" ]]; then
+      worktree_mode="none"
+    else
+      worktree_mode="worktree"
+    fi
+  fi
+
+  # Generate ID
+  local id
+  id=$(_next_task_id)
+
+  # Add task
+  _lock_state || return 1
   local tmp
-  tmp=$(mktemp "${STATE_DIR}/.tasks.XXXXXX")
-  local now=$(now_iso)
-  jq --arg id "$id" --arg title "$title" --arg now "$now" --arg wm "$worktree_mode" \
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  local now
+  now=$(now_iso)
+  jq --arg id "$id" --arg title "$title" --arg now "$now" \
+     --arg wm "$worktree_mode" --arg repo "$repo_name" \
     '.tasks += [{
       id: $id,
       title: $title,
+      repo: $repo,
       status: "pending",
       branch: (if $wm == "none" then null else ("worktree-" + $id) end),
       worktree: null,
@@ -329,26 +708,146 @@ cmd_add() {
       started_at: null,
       completed_at: null,
       claude_status: null
-    }]' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+    }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
 
-  ok "added task '${id}': ${title}"
+  ok "created ${id} '${title}' in ${repo_name}"
+}
+
+cmd_title() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "usage: cloard-board title <id> <new-title>"
+  shift
+  local new_title="${*:-}"
+  [[ -n "$new_title" ]] || die "usage: cloard-board title <id> <new-title>"
+  task_exists "$id" || die "task '$id' not found"
+  update_task_field "$id" "title" "$new_title"
+  ok "renamed task '$id' to '${new_title}'"
+}
+
+cmd_session() {
+  require_cmd claude
+
+  local session_uid="${1:-}"
+  [[ -n "$session_uid" ]] || die "usage: cloard-board session <session-uid> [--repo <name>] [--title \"...\"]"
+  shift
+
+  local repo_name="" title=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo|-r) [[ $# -gt 1 ]] || die "--repo requires a value"; repo_name="$2"; shift 2 ;;
+      --title|-t) [[ $# -gt 1 ]] || die "--title requires a value"; title="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # Auto-detect repo from session file location
+  if [[ -z "$repo_name" ]]; then
+    repo_name=$(_find_session_repo "$session_uid") || true
+  fi
+
+  # If not found, try single-repo default or prompt
+  if [[ -z "$repo_name" ]]; then
+    local repo_count
+    repo_count=$(jq '[.repos[] | select(.archived != true)] | length' "$GLOBAL_STATE")
+    if [[ "$repo_count" -eq 1 ]]; then
+      repo_name=$(jq -r '[.repos[] | select(.archived != true)][0].name' "$GLOBAL_STATE")
+      warn "session not found in any registered repo; defaulting to '${repo_name}'"
+    else
+      die "could not determine repo for session '${session_uid}'. Use --repo to specify."
+    fi
+  fi
+
+  repo_exists "$repo_name" || die "repo '${repo_name}' not registered"
+
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  [[ -d "$rpath" ]] || die "repo path not found: $rpath"
+
+  # Default title: short session UID
+  [[ -z "$title" ]] && title="session-${session_uid:0:8}"
+
+  # Create task (always no-worktree since we're attaching an existing session)
+  local id
+  id=$(_next_task_id)
+
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  local now
+  now=$(now_iso)
+  jq --arg id "$id" --arg title "$title" --arg now "$now" \
+     --arg repo "$repo_name" --arg uid "$session_uid" \
+    '.tasks += [{
+      id: $id,
+      title: $title,
+      repo: $repo,
+      status: "active",
+      branch: null,
+      worktree: null,
+      worktree_mode: "none",
+      pr_number: null,
+      pr_url: null,
+      created_at: $now,
+      started_at: $now,
+      completed_at: null,
+      claude_status: null,
+      session_uid: $uid
+    }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+
+  # Start in tmux with claude --continue
+  ensure_tmux_session
+
+  local safe_repo_path=${(q)rpath}
+  local safe_global_dir=${(q)GLOBAL_DIR}
+
+  tmux_create_window "$id" "zsh" "-c" \
+    "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_repo_path} && claude --continue ${session_uid} --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+
+  ok "tracking session '${session_uid:0:8}...' as ${id} in ${repo_name}"
+
+  if [[ -z "${TMUX:-}" ]]; then
+    tmux_cmd attach -t "board:${id}"
+  else
+    tmux_select_window "$id"
+  fi
 }
 
 cmd_list() {
-  require_init
-  local count
-  count=$(jq '.tasks | length' "$STATE_FILE")
+  local filter_repo=""
 
-  if [[ "$count" -eq 0 ]]; then
-    info "no tasks yet; run 'cloard-board add <id> --title \"...\"' to create one"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo|-r) filter_repo="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local task_data
+  if [[ -n "$filter_repo" ]]; then
+    task_data=$(jq -r --arg r "$filter_repo" \
+      '.tasks[] | select(.repo == $r) | [.id, (.repo // ""), .status, .title, (.claude_status // ""), (.pr_url // "")] | join("\u001e")' \
+      "$GLOBAL_STATE")
+  else
+    task_data=$(jq -r \
+      '.tasks[] | [.id, (.repo // ""), .status, .title, (.claude_status // ""), (.pr_url // "")] | join("\u001e")' \
+      "$GLOBAL_STATE")
+  fi
+
+  if [[ -z "$task_data" ]]; then
+    info "no tasks yet; run 'cloard-board add --title \"...\"' to create one"
     return 0
   fi
 
   # Print table header
-  printf "\n${C_BOLD}%-20s %-15s %-40s %-12s %-10s${C_RESET}\n" "ID" "STATUS" "TITLE" "CLAUDE" "PR"
-  printf "%-20s %-15s %-40s %-12s %-10s\n" "$(printf '%0.s─' {1..20})" "$(printf '%0.s─' {1..15})" "$(printf '%0.s─' {1..40})" "$(printf '%0.s─' {1..12})" "$(printf '%0.s─' {1..10})"
+  printf "\n${C_BOLD}%-10s %-15s %-15s %-35s %-12s %-10s${C_RESET}\n" "ID" "REPO" "STATUS" "TITLE" "CLAUDE" "PR"
+  printf "%-10s %-15s %-15s %-35s %-12s %-10s\n" \
+    "$(printf '%0.s─' {1..10})" "$(printf '%0.s─' {1..15})" "$(printf '%0.s─' {1..15})" \
+    "$(printf '%0.s─' {1..35})" "$(printf '%0.s─' {1..12})" "$(printf '%0.s─' {1..10})"
 
-  jq -r '.tasks[] | [.id, .status, .title, (.claude_status // ""), (.pr_url // "")] | @tsv' "$STATE_FILE" | while IFS=$'\t' read -r t_id t_status t_title t_claude t_pr; do
+  while IFS=$'\x1e' read -r t_id t_repo t_status t_title t_claude t_pr; do
+    [[ -n "$t_id" ]] || continue
     local color="$C_RESET"
     case "$t_status" in
       pending)      color="$C_DIM" ;;
@@ -365,13 +864,13 @@ cmd_list() {
     local claude_display=""
     [[ "$t_claude" == "working" ]] && claude_display="● working"
     [[ "$t_claude" == "waiting" ]] && claude_display="○ waiting"
-    printf "${color}%-20s %-15s %-40s %-12s %-10s${C_RESET}\n" "$t_id" "$t_status" "${t_title:0:40}" "$claude_display" "$pr_display"
-  done
+    printf "${color}%-10s %-15s %-15s %-35s %-12s %-10s${C_RESET}\n" \
+      "$t_id" "${t_repo:0:15}" "$t_status" "${t_title:0:35}" "$claude_display" "$pr_display"
+  done <<< "$task_data"
   echo
 }
 
 cmd_start() {
-  require_init
   require_cmd claude
 
   local id="${1:-}"
@@ -385,34 +884,55 @@ cmd_start() {
   tsk_status=$(task_status "$id")
   [[ "$tsk_status" == "pending" ]] || die "task '$id' is '${tsk_status}', not 'pending'"
 
+  # Look up repo
+  local repo_name
+  repo_name=$(task_repo "$id")
+  [[ -n "$repo_name" ]] || die "task '$id' has no repo assigned"
+
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  [[ -d "$rpath" ]] || die "repo path not found: $rpath. Run: cloard-board repo update-path $repo_name <new-path>"
+
+  local rtype
+  rtype=$(repo_type "$repo_name")
+
   ensure_tmux_session
 
   if tmux_window_exists "$id"; then
     warn "tmux window '$id' already exists; switching to it"
     tmux_select_window "$id"
   else
-    # Build the claude command (--dangerously-skip-permissions for autonomous parallel agent work)
     local wt_mode
-    wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")
-    local claude_cmd
+    wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$GLOBAL_STATE")
+
+    # Force no-worktree for non-git repos
+    [[ "$rtype" == "dir" ]] && wt_mode="none"
+
+    local claude_cmd work_dir
+    local safe_repo_path=${(q)rpath}
+    local safe_global_dir=${(q)GLOBAL_DIR}
+
     if [[ "$wt_mode" == "none" ]]; then
       claude_cmd="claude --dangerously-skip-permissions"
+      work_dir="$rpath"
     else
       claude_cmd="claude --worktree ${id} --dangerously-skip-permissions"
+      work_dir="$rpath"
     fi
+
     if [[ -n "$prompt" ]]; then
-      # Escape single quotes in prompt for shell wrapping
       local escaped_prompt="${prompt//\'/\'\\\'\'}"
       claude_cmd="${claude_cmd} '${escaped_prompt}'"
     fi
 
-    local safe_pwd
-    safe_pwd=${(q)${PWD}}
-    tmux_create_window "$id" "zsh" "-c" "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_pwd} && cd ${safe_pwd} && ${claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+    local safe_work_dir=${(q)work_dir}
+    tmux_create_window "$id" "zsh" "-c" \
+      "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+
     if [[ "$wt_mode" == "none" ]]; then
-      info "created tmux window '${id}' with claude (no worktree)"
+      info "created tmux window '${id}' with claude (no worktree) in ${repo_name}"
     else
-      info "created tmux window '${id}' with claude --worktree ${id}"
+      info "created tmux window '${id}' with claude --worktree in ${repo_name}"
     fi
   fi
 
@@ -420,14 +940,14 @@ cmd_start() {
   update_task_field "$id" "status" "active"
   update_task_field "$id" "started_at" "$(now_iso)"
 
-  # Try to discover worktree path (may not exist yet if claude hasn't created it)
+  # Try to discover worktree path
   local wt_path
-  wt_path=$(find_worktree_path "$id")
+  wt_path=$(find_worktree_path "$id" "$rpath")
   if [[ -n "$wt_path" ]]; then
     update_task_field "$id" "worktree" "$wt_path"
   fi
 
-  ok "started task '${id}'"
+  ok "started task '${id}' in ${repo_name}"
 
   # Attach if not already in tmux
   if [[ -z "${TMUX:-}" ]]; then
@@ -438,7 +958,6 @@ cmd_start() {
 }
 
 cmd_go() {
-  require_init
   local id="${1:-}"
   [[ -n "$id" ]] || die "usage: cloard-board go <id>"
   task_exists "$id" || die "task '$id' not found"
@@ -468,7 +987,6 @@ cmd_attach() {
 }
 
 cmd_advance() {
-  require_init
   local id="${1:-}"
   [[ -n "$id" ]] || die "usage: cloard-board advance <id>"
   task_exists "$id" || die "task '$id' not found"
@@ -505,7 +1023,6 @@ cmd_advance() {
 }
 
 cmd_review() {
-  require_init
   require_cmd gh
   local id="${1:-}"
   [[ -n "$id" ]] || die "usage: cloard-board review <id>"
@@ -513,17 +1030,29 @@ cmd_review() {
 
   local tsk_status
   tsk_status=$(task_status "$id")
-  [[ "$tsk_status" == "needs_review" || "$tsk_status" == "active" ]] || die "task '$id' is '${tsk_status}'; must be 'needs_review' or 'active' to review"
+  [[ "$tsk_status" == "needs_review" || "$tsk_status" == "active" ]] || \
+    die "task '$id' is '${tsk_status}'; must be 'needs_review' or 'active' to review"
+
+  # Look up repo
+  local repo_name
+  repo_name=$(task_repo "$id")
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  local rtype
+  rtype=$(repo_type "$repo_name")
+
+  [[ "$rtype" == "git" ]] || die "review not available for non-git repos"
+  [[ -d "$rpath" ]] || die "repo path not found: $rpath"
 
   local wt_mode
-  wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")
+  wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$GLOBAL_STATE")
 
   local work_dir branch
   if [[ "$wt_mode" == "none" ]]; then
-    work_dir="$PWD"
-    branch=$(git rev-parse --abbrev-ref HEAD)
+    work_dir="$rpath"
+    branch=$(cd "$rpath" && git rev-parse --abbrev-ref HEAD)
   else
-    work_dir=$(find_worktree_path "$id")
+    work_dir=$(find_worktree_path "$id" "$rpath")
     if [[ -z "$work_dir" ]]; then
       die "could not find worktree for task '${id}'"
     fi
@@ -531,14 +1060,14 @@ cmd_review() {
   fi
 
   local base_branch
-  base_branch=$(jq -r '.base_branch' "$STATE_FILE")
+  base_branch=$(repo_base_branch "$repo_name")
   local title
-  title=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .title' "$STATE_FILE")
+  title=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .title' "$GLOBAL_STATE")
 
   info "pushing branch '${branch}'..."
   (cd "$work_dir" && git push -u origin "$branch") || die "git push failed"
 
-  # Check for existing PR to avoid duplicate creation
+  # Check for existing PR
   local pr_url
   pr_url=$(cd "$work_dir" && gh pr view --json url -q '.url' 2>/dev/null || true)
 
@@ -555,7 +1084,6 @@ cmd_review() {
 Created by cloard-board." 2>/dev/null) || die "gh pr create failed"
   fi
 
-  # Fetch PR number via structured output (avoids parsing text)
   local pr_number
   pr_number=$(cd "$work_dir" && gh pr view --json number -q '.number' 2>/dev/null || true)
 
@@ -571,7 +1099,6 @@ Created by cloard-board." 2>/dev/null) || die "gh pr create failed"
 }
 
 cmd_done() {
-  require_init
   local id="${1:-}"
   [[ -n "$id" ]] || die "usage: cloard-board done <id>"
   task_exists "$id" || die "task '$id' not found"
@@ -580,20 +1107,28 @@ cmd_done() {
   tmux_kill_window "$id"
 
   local wt_mode
-  wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")
+  wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$GLOBAL_STATE")
 
   if [[ "$wt_mode" != "none" ]]; then
-    # Remove worktree
-    local wt_path
-    wt_path=$(find_worktree_path "$id")
-    if [[ -n "$wt_path" ]]; then
-      info "removing worktree at ${wt_path}"
-      git worktree remove "$wt_path" --force 2>/dev/null || warn "could not remove worktree (may need manual cleanup)"
-    fi
+    local repo_name
+    repo_name=$(task_repo "$id")
+    local rpath
+    rpath=$(repo_path "$repo_name")
 
-    # Delete local branch
-    local branch="worktree-${id}"
-    git branch -D "$branch" 2>/dev/null || true
+    if [[ -d "$rpath" ]]; then
+      # Remove worktree
+      local wt_path
+      wt_path=$(find_worktree_path "$id" "$rpath")
+      if [[ -n "$wt_path" ]]; then
+        info "removing worktree at ${wt_path}"
+        (cd "$rpath" && git worktree remove "$wt_path" --force 2>/dev/null) || \
+          warn "could not remove worktree (may need manual cleanup)"
+      fi
+
+      # Delete local branch
+      local branch="worktree-${id}"
+      (cd "$rpath" && git branch -D "$branch" 2>/dev/null) || true
+    fi
   fi
 
   update_task_field "$id" "status" "done"
@@ -604,18 +1139,16 @@ cmd_done() {
 }
 
 cmd_pause() {
-  require_init
   local id="${1:-}"
   [[ -n "$id" ]] || die "usage: cloard-board pause <id>"
   task_exists "$id" || die "task '$id' not found"
 
   local tsk_status
   tsk_status=$(task_status "$id")
-  [[ "$tsk_status" == "active" || "$tsk_status" == "needs_review" ]] || die "task '$id' is '${tsk_status}'; must be 'active' or 'needs_review' to pause"
+  [[ "$tsk_status" == "active" || "$tsk_status" == "needs_review" ]] || \
+    die "task '$id' is '${tsk_status}'; must be 'active' or 'needs_review' to pause"
 
-  # Kill tmux window (keeps worktree and branch intact)
   tmux_kill_window "$id"
-
   update_task_field "$id" "status" "paused"
   update_task_field_raw "$id" "claude_status" "null"
 
@@ -623,7 +1156,6 @@ cmd_pause() {
 }
 
 cmd_resume() {
-  require_init
   require_cmd claude
 
   local id="${1:-}"
@@ -634,8 +1166,18 @@ cmd_resume() {
   tsk_status=$(task_status "$id")
   [[ "$tsk_status" != "done" ]] || die "task '$id' is done; nothing to resume"
 
+  # Look up repo
+  local repo_name
+  repo_name=$(task_repo "$id")
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  [[ -d "$rpath" ]] || die "repo path not found: $rpath"
+
   local wt_mode
-  wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")
+  wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$GLOBAL_STATE")
+
+  local safe_global_dir=${(q)GLOBAL_DIR}
+  local safe_repo_path=${(q)rpath}
 
   ensure_tmux_session
 
@@ -643,20 +1185,19 @@ cmd_resume() {
     info "window '${id}' already exists; switching to it"
   else
     if [[ "$wt_mode" == "none" ]]; then
-      local safe_pwd
-      safe_pwd=${(q)${PWD}}
-      tmux_create_window "$id" "zsh" "-c" "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_pwd} && cd ${safe_pwd} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+      local safe_work_dir=${(q)rpath}
+      tmux_create_window "$id" "zsh" "-c" \
+        "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
       info "created tmux window '${id}' with claude --continue (no worktree)"
     else
       local wt_path
-      wt_path=$(find_worktree_path "$id")
+      wt_path=$(find_worktree_path "$id" "$rpath")
       if [[ -z "$wt_path" ]]; then
         die "no worktree found for '${id}'; use 'cloard-board start' instead"
       fi
-      local safe_wt_path
-      safe_wt_path=${(q)${wt_path}}
-      local safe_board_dir=${(q)${PWD}}
-      tmux_create_window "$id" "zsh" "-c" "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_board_dir} && cd ${safe_wt_path} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+      local safe_wt_path=${(q)wt_path}
+      tmux_create_window "$id" "zsh" "-c" \
+        "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_wt_path} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
       info "created tmux window '${id}' with claude --continue"
     fi
   fi
@@ -674,7 +1215,6 @@ cmd_resume() {
 }
 
 cmd_rm() {
-  require_init
   local id="${1:-}"
   [[ -n "$id" ]] || die "usage: cloard-board rm <id>"
   task_exists "$id" || die "task '$id' not found"
@@ -682,42 +1222,51 @@ cmd_rm() {
   local tsk_status
   tsk_status=$(task_status "$id")
 
-  # Clean up resources for any non-done status (review tasks still have windows/worktrees/branches)
+  # Clean up resources for any non-done status
   if [[ "$tsk_status" != "done" ]]; then
     tmux_kill_window "$id"
     local wt_mode
-    wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")
+    wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$GLOBAL_STATE")
     if [[ "$wt_mode" != "none" ]]; then
-      local wt_path
-      wt_path=$(find_worktree_path "$id")
-      if [[ -n "$wt_path" ]]; then
-        git worktree remove "$wt_path" --force 2>/dev/null || true
+      local repo_name
+      repo_name=$(task_repo "$id")
+      local rpath
+      rpath=$(repo_path "$repo_name")
+      if [[ -d "$rpath" ]]; then
+        local wt_path
+        wt_path=$(find_worktree_path "$id" "$rpath")
+        if [[ -n "$wt_path" ]]; then
+          (cd "$rpath" && git worktree remove "$wt_path" --force 2>/dev/null) || true
+        fi
+        (cd "$rpath" && git branch -D "worktree-${id}" 2>/dev/null) || true
       fi
-      git branch -D "worktree-${id}" 2>/dev/null || true
     fi
   fi
 
   # Remove from JSON
+  _lock_state || return 1
   local tmp
-  tmp=$(mktemp "${STATE_DIR}/.tasks.XXXXXX")
-  jq --arg id "$id" '.tasks = [.tasks[] | select(.id != $id)]' "$STATE_FILE" > "$tmp" \
-    && mv "$tmp" "$STATE_FILE"
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg id "$id" '.tasks = [.tasks[] | select(.id != $id)]' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
 
   ok "removed task '${id}'"
 }
 
 cmd_status() {
-  require_init
   local id="${1:-}"
   [[ -n "$id" ]] || die "usage: cloard-board status <id>"
   task_exists "$id" || die "task '$id' not found"
 
-  local tsk_status claude_status title
+  local tsk_status claude_status title repo_name
   tsk_status=$(task_status "$id")
   claude_status=$(task_field "$id" "claude_status")
   title=$(task_field "$id" "title")
+  repo_name=$(task_repo "$id")
 
   echo "${C_BOLD}${id}${C_RESET}: ${title}"
+  echo "  repo:   ${repo_name}"
   echo "  task:   ${tsk_status}"
   if [[ "$claude_status" == "working" ]]; then
     echo "  claude: ${C_GREEN}● working${C_RESET}"
@@ -729,7 +1278,9 @@ cmd_status() {
 }
 
 cmd_signal() {
-  require_init
+  # Fast path for hooks: no ensure_global_state, just check file exists
+  [[ -f "$GLOBAL_STATE" ]] || return 0
+
   local id="${1:-}"
   local signal="${2:-}"
 
@@ -737,17 +1288,28 @@ cmd_signal() {
   [[ -n "$signal" ]] || { warn "usage: cloard-board signal <id> <working|waiting|clear>"; return 1; }
 
   if ! task_exists "$id"; then
-    warn "task '$id' not found (may have been removed)"
     return 0
   fi
 
   case "$signal" in
-    working|waiting)
-      # Only update if task is still active (prevents race with pause/done/review)
+    working)
+      local tsk_status
+      tsk_status=$(task_status "$id")
+      if [[ "$tsk_status" == "active" || "$tsk_status" == "needs_review" ]]; then
+        update_task_field "$id" "claude_status" "$signal"
+        # If task was moved to needs_review by a previous "waiting" signal, move it back
+        if [[ "$tsk_status" == "needs_review" ]]; then
+          update_task_field "$id" "status" "active"
+        fi
+      fi
+      ;;
+    waiting)
       local tsk_status
       tsk_status=$(task_status "$id")
       if [[ "$tsk_status" == "active" ]]; then
         update_task_field "$id" "claude_status" "$signal"
+        # Auto-move to needs_review when Claude is waiting
+        update_task_field "$id" "status" "needs_review"
       fi
       ;;
     clear)
@@ -761,32 +1323,47 @@ cmd_signal() {
 }
 
 cmd_doctor() {
-  require_init
   local issues=0
 
   info "checking cloard-board health..."
 
-  # Check for worktrees that have no matching task
-  while IFS= read -r line; do
-    if [[ "$line" =~ ^worktree\ (.+)$ ]]; then
-      local wt_path="${match[0]}"
-    elif [[ "$line" =~ ^branch\ refs/heads/worktree-(.+)$ ]]; then
-      local wt_id="${match[0]}"
-      if ! task_exists "$wt_id"; then
-        warn "orphaned worktree: ${wt_path} (branch worktree-${wt_id}, no matching task)"
-        issues=$((issues+1))
-      fi
-    fi
-  done < <(git worktree list --porcelain 2>/dev/null)
+  # Check each repo
+  local repo_data
+  repo_data=$(jq -r '.repos[] | [.name, .path, (.type // "git")] | join("\u001e")' "$GLOBAL_STATE")
 
-  # Check for tasks with windows that don't exist
+  while IFS=$'\x1e' read -r rname rpath rtype; do
+    [[ -n "$rname" ]] || continue
+
+    if [[ ! -d "$rpath" ]]; then
+      warn "repo '${rname}': path not found (${rpath})"
+      issues=$((issues + 1))
+      continue
+    fi
+
+    # Check worktrees for git repos
+    if [[ "$rtype" == "git" ]]; then
+      while IFS= read -r line; do
+        if [[ "$line" =~ ^worktree\ (.+)$ ]]; then
+          local wt_path="${match[0]}"
+        elif [[ "$line" =~ ^branch\ refs/heads/worktree-(.+)$ ]]; then
+          local wt_id="${match[0]}"
+          if ! task_exists "$wt_id"; then
+            warn "orphaned worktree in '${rname}': ${wt_path} (branch worktree-${wt_id})"
+            issues=$((issues + 1))
+          fi
+        fi
+      done < <(cd "$rpath" && git worktree list --porcelain 2>/dev/null)
+    fi
+  done <<< "$repo_data"
+
+  # Check for active tasks with no tmux window
   while read -r tid; do
     [[ -z "$tid" ]] && continue
     if ! tmux_window_exists "$tid" 2>/dev/null; then
       warn "task '${tid}' is active but has no tmux window"
-      issues=$((issues+1))
+      issues=$((issues + 1))
     fi
-  done < <(jq -r '.tasks[] | select(.status == "active") | .id' "$STATE_FILE")
+  done < <(jq -r '.tasks[] | select(.status == "active") | .id' "$GLOBAL_STATE")
 
   # Check for tmux windows with no matching task
   if tmux_session_exists; then
@@ -794,7 +1371,7 @@ cmd_doctor() {
       [[ -z "$wname" || "$wname" == "dashboard" ]] && continue
       if ! task_exists "$wname"; then
         warn "orphaned tmux window: '${wname}' (no matching task)"
-        issues=$((issues+1))
+        issues=$((issues + 1))
       fi
     done < <(tmux_cmd list-windows -t "board" -F '#{window_name}' 2>/dev/null)
   fi
@@ -807,6 +1384,34 @@ cmd_doctor() {
 }
 
 # ── Dashboard TUI ──────────────────────────────────────────────────────────────
+
+# Read a line from stdin; return 1 (cancelled) if user presses Esc.
+# Usage: _read_or_esc varname  -> sets varname, returns 0; or returns 1 on Esc/Ctrl-C.
+_read_or_esc() {
+  local _varname="$1"
+  local _line=""
+  # Temporarily switch to raw mode to catch Esc as first char
+  stty -echo raw
+  local _first_char=""
+  read -rk1 _first_char 2>/dev/null || { stty echo -raw; return 1; }
+  stty echo -raw
+  if [[ "$_first_char" == $'\e' || "$_first_char" == $'\x03' ]]; then
+    # Esc or Ctrl-C: cancel
+    echo ""
+    eval "$_varname=''"
+    return 1
+  fi
+  # Got a normal char; read the rest of the line in cooked mode
+  if [[ "$_first_char" == $'\n' || "$_first_char" == $'\r' ]]; then
+    _line=""
+  else
+    local _rest=""
+    read -r _rest 2>/dev/null || true
+    _line="${_first_char}${_rest}"
+  fi
+  eval "$_varname=\${_line}"
+  return 0
+}
 
 # Column names and matching statuses
 readonly -a COL_NAMES=("Pending" "Active" "Needs Review" "In PR" "Done")
@@ -823,28 +1428,6 @@ col_color() {
   esac
 }
 
-# Get task IDs for a given status
-tasks_for_status() {
-  local st="$1"
-  jq -r --arg s "$st" '[.tasks[] | select(.status == $s) | .id] | .[]' "$STATE_FILE" 2>/dev/null
-}
-
-# Get task IDs for a dashboard column (column 0 includes both pending and paused)
-tasks_for_column() {
-  local col="$1"
-  if [[ $col -eq 0 ]]; then
-    jq -r '[.tasks[] | select(.status == "pending" or .status == "paused") | .id] | .[]' "$STATE_FILE" 2>/dev/null
-  else
-    tasks_for_status "${COL_STATUSES[$col]}"
-  fi
-}
-
-# Get task field
-task_field() {
-  local id="$1" field="$2"
-  jq -r --arg id "$id" --arg f "$field" '.tasks[] | select(.id == $id) | .[$f] // ""' "$STATE_FILE" 2>/dev/null
-}
-
 # Truncate string to width
 trunc() {
   local str="$1" max="$2"
@@ -853,90 +1436,6 @@ trunc() {
   else
     echo "$str"
   fi
-}
-
-# Draw a horizontal line
-hline() {
-  local width="$1" char="${2:-─}"
-  printf '%*s' "$width" '' | tr ' ' "$char"
-}
-
-# ── Dashboard snapshot helpers (single-jq optimization) ────────────────────────
-
-# Snapshot all tasks into associative + indexed arrays (1 jq call per frame)
-# Relies on caller declaring: typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode
-#   local -a _col0_ids .. _col4_ids; local _project_name _task_count
-_snapshot_tasks() {
-  _task_status=()
-  _task_title=()
-  _task_pr=()
-  _task_claude=()
-  _task_wtmode=()
-  _col0_ids=()
-  _col1_ids=()
-  _col2_ids=()
-  _col3_ids=()
-  _col4_ids=()
-  _project_name=""
-  _task_count=0
-
-  local _snap
-  # Use RS (Record Separator U+001E) as delimiter; tab is IFS-whitespace
-  # and consecutive empty fields would collapse under POSIX read rules.
-  _snap=$(jq -r '
-    ([.project, (.tasks | length | tostring)] | join("\u001e")),
-    (.tasks[] | [
-      .id,
-      .status,
-      (.title // ""),
-      (.pr_url // ""),
-      (.claude_status // ""),
-      (.worktree_mode // "worktree")
-    ] | join("\u001e"))
-  ' "$STATE_FILE" 2>/dev/null) || return 0
-
-  local _first=true
-  while IFS=$'\x1e' read -r _f1 _f2 _f3 _f4 _f5 _f6; do
-    if $_first; then
-      _project_name="$_f1"
-      _task_count="$_f2"
-      _first=false
-      continue
-    fi
-    _task_status[$_f1]="$_f2"
-    _task_title[$_f1]="$_f3"
-    _task_pr[$_f1]="$_f4"
-    _task_claude[$_f1]="$_f5"
-    _task_wtmode[$_f1]="$_f6"
-    case "$_f2" in
-      pending|paused) _col0_ids+=("$_f1") ;;
-      active)         _col1_ids+=("$_f1") ;;
-      needs_review)   _col2_ids+=("$_f1") ;;
-      review)         _col3_ids+=("$_f1") ;;
-      done)           _col4_ids+=("$_f1") ;;
-    esac
-  done <<< "$_snap"
-}
-
-# O(1) task lookup by column and row index; sets _tid
-_get_task_at() {
-  local _col="$1" _row="$2"
-  case $_col in
-    0) _tid="${_col0_ids[$_row]:-}" ;;
-    1) _tid="${_col1_ids[$_row]:-}" ;;
-    2) _tid="${_col2_ids[$_row]:-}" ;;
-    3) _tid="${_col3_ids[$_row]:-}" ;;
-    4) _tid="${_col4_ids[$_row]:-}" ;;
-    *) _tid="" ;;
-  esac
-}
-
-# Get selected task ID for current cursor position; sets _tid, returns 1 if none
-_get_selected_id() {
-  _tid=""
-  [[ ${col_counts[$cur_col]:-0} -gt 0 ]] || return 1
-  _get_task_at "$cur_col" "${cur_row[$cur_col]}"
-  [[ -n "$_tid" ]] || return 1
 }
 
 # Move cursor
@@ -949,23 +1448,138 @@ cls() { printf '\e[2J\e[H'; }
 cursor_hide() { printf '\e[?25l'; }
 cursor_show() { printf '\e[?25h'; }
 
+# ── Dashboard snapshot (single jq call per frame) ────────────────────────────
+
+# Snapshot all task data into associative + indexed arrays
+# Relies on caller declaring the arrays (see cmd__dash_loop)
+_snapshot_tasks() {
+  _task_status=()
+  _task_title=()
+  _task_pr=()
+  _task_claude=()
+  _task_wtmode=()
+  _task_repo=()
+  _repo_names=()
+  _repo_paths=()
+  _repo_types=()
+  _repo_stale=()
+  _repo_task_count=()
+  _repo_cols=()
+  _repo_col_cnt=()
+  _total_task_count=0
+  _active_count=0
+  _review_count=0
+
+  local _snap
+  _snap=$(jq -r '
+    ("H\u001e" + (.next_task_id | tostring) + "\u001e" + (.repos | length | tostring) + "\u001e" + (.tasks | length | tostring)),
+    (.repos[] | "R\u001e" + .name + "\u001e" + .path + "\u001e" + (.type // "git") + "\u001e" + (if .archived == true then "1" else "0" end)),
+    (.tasks[] | "T\u001e" + .id + "\u001e" + .status + "\u001e" + (.title // "") + "\u001e" + (.pr_url // "") + "\u001e" + (.claude_status // "") + "\u001e" + (.worktree_mode // "worktree") + "\u001e" + (.repo // ""))
+  ' "$GLOBAL_STATE" 2>/dev/null) || return 0
+
+  while IFS=$'\x1e' read -r _type _f1 _f2 _f3 _f4 _f5 _f6 _f7; do
+    case "$_type" in
+      H)
+        _total_task_count="$_f3"
+        ;;
+      R)
+        # _f1=name, _f2=path, _f3=type, _f4=archived
+        if [[ "$_f4" != "1" ]]; then
+          _repo_names+=("$_f1")
+          _repo_paths[$_f1]="$_f2"
+          _repo_types[$_f1]="$_f3"
+          if [[ ! -d "$_f2" ]]; then
+            _repo_stale[$_f1]="1"
+          fi
+          _repo_task_count[$_f1]=0
+          for _ci in {0..4}; do
+            _repo_cols["${_f1}:${_ci}"]=""
+            _repo_col_cnt["${_f1}:${_ci}"]=0
+          done
+        fi
+        ;;
+      T)
+        # _f1=id, _f2=status, _f3=title, _f4=pr_url, _f5=claude_status, _f6=worktree_mode, _f7=repo
+        _task_status[$_f1]="$_f2"
+        _task_title[$_f1]="$_f3"
+        _task_pr[$_f1]="$_f4"
+        _task_claude[$_f1]="$_f5"
+        _task_wtmode[$_f1]="$_f6"
+        _task_repo[$_f1]="$_f7"
+
+        [[ "$_f2" == "active" ]] && _active_count=$((_active_count + 1))
+        [[ "$_f2" == "review" || "$_f2" == "needs_review" ]] && _review_count=$((_review_count + 1))
+
+        # Assign to repo column
+        local _col_idx
+        case "$_f2" in
+          pending|paused) _col_idx=0 ;;
+          active)         _col_idx=1 ;;
+          needs_review)   _col_idx=2 ;;
+          review)         _col_idx=3 ;;
+          done)           _col_idx=4 ;;
+          *) continue ;;
+        esac
+
+        local _key="${_f7}:${_col_idx}"
+        if [[ -n "${_repo_cols[$_key]:-}" ]]; then
+          if [[ "$_f5" == "waiting" ]]; then
+            # Waiting tasks float to top of the column
+            _repo_cols[$_key]="${_f1} ${_repo_cols[$_key]}"
+          else
+            _repo_cols[$_key]="${_repo_cols[$_key]} ${_f1}"
+          fi
+        else
+          _repo_cols[$_key]="${_f1}"
+        fi
+        _repo_col_cnt[$_key]=$(( ${_repo_col_cnt[$_key]:-0} + 1 ))
+        _repo_task_count[$_f7]=$(( ${_repo_task_count[$_f7]:-0} + 1 ))
+        ;;
+    esac
+  done <<< "$_snap"
+}
+
+# Get task ID at a position within a repo column
+_get_repo_task_at() {
+  local rname="$1" col="$2" row="$3"
+  local ids_str="${_repo_cols[${rname}:${col}]:-}"
+  [[ -n "$ids_str" ]] || { _tid=""; return; }
+  local -a ids_arr=(${(s: :)ids_str})
+  _tid="${ids_arr[$row]:-}"
+}
+
+# Get selected task ID for current navigation state
+_get_selected_id() {
+  _tid=""
+  local rname
+  if [[ "$filter_mode" != "all" ]]; then
+    rname="$filter_mode"
+  else
+    [[ ${#_repo_names[@]} -gt 0 ]] || return 1
+    [[ $cur_repo_idx -lt ${#_repo_names[@]} ]] || return 1
+    rname="${_repo_names[$cur_repo_idx]}"
+  fi
+  [[ -n "$rname" ]] || return 1
+
+  local cnt="${_repo_col_cnt[${rname}:${cur_col}]:-0}"
+  [[ $cnt -gt 0 ]] || return 1
+
+  local crow="${cur_card_row[${rname}:${cur_col}]:-0}"
+  _get_repo_task_at "$rname" "$cur_col" "$crow"
+  [[ -n "$_tid" ]] || return 1
+}
+
 cmd_dash() {
-  require_init
   ensure_tmux_session
 
   # If we're not in the cloard-board tmux, launch dashboard in it
   if [[ -z "${TMUX:-}" ]]; then
-    # Ensure the dashboard window exists before respawning
     if ! tmux_window_exists "dashboard"; then
-      tmux_cmd new-window -t "board" -n "dashboard" -c "$PWD"
+      tmux_cmd new-window -t "board" -n "dashboard"
     fi
-    # Always (re)launch _dash_loop in the dashboard window to guarantee it's running
-    # Pass PWD so the respawned process cd's to the project root (STATE_DIR is relative)
-    # Quote both PWD and SCRIPT_PATH to handle spaces in paths
-    local safe_pwd safe_script
-    safe_pwd=${(q)${PWD}}
+    local safe_script
     safe_script=${(q)${SCRIPT_PATH}}
-    tmux_cmd respawn-window -k -t "board:dashboard" "cd ${safe_pwd} && exec ${safe_script} _dash_loop"
+    tmux_cmd respawn-window -k -t "board:dashboard" "exec ${safe_script} _dash_loop"
     pin_dashboard_to_zero
     tmux_cmd attach -t "board:dashboard"
     return
@@ -983,43 +1597,48 @@ cmd_dash() {
 
 # The actual dashboard rendering loop (run inside tmux window)
 cmd__dash_loop() {
-  require_init
-  set +x  # Disable any inherited trace mode (set -x) that would corrupt TUI output
+  set +x  # Disable any inherited trace mode
   set +e  # Prevent unguarded commands from killing the TUI loop
-  setopt TYPESET_SILENT 2>/dev/null  # Prevent zsh from printing variable values on re-declaration
+  setopt TYPESET_SILENT 2>/dev/null
 
-  # Load zsh/datetime for optional CLOARD_DEBUG frame timing
   zmodload zsh/datetime 2>/dev/null || true
 
-  # State: current column and row selection
-  local cur_col=0
-  local -a cur_row=(0 0 0 0 0)  # per-column cursor
+  # Navigation state
+  local filter_mode="all"  # "all" or a repo name
+  local -i filter_idx=0    # 0=all, 1+=specific repo
+  local nav_mode="repo"    # "repo" or "card"
+  local -i cur_repo_idx=0  # selected repo in all view
+  local -i cur_col=0       # selected column (0-4)
 
-  # Declare snapshot arrays (persist across loop iterations, modified by _snapshot_tasks via dynamic scope)
-  typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode
-  local -a _col0_ids _col1_ids _col2_ids _col3_ids _col4_ids
-  local _project_name="" _task_count=0
-  local _tid=""  # scratch variable used by _get_task_at / _get_selected_id
-  local -a col_counts=(0 0 0 0 0)  # column counts; declared at function scope for _get_selected_id visibility
+  # Per-repo-per-column card cursor: keyed by "reponame:col" -> row index
+  typeset -A cur_card_row
+  # Per-repo scroll offset for card viewport
+  typeset -A _scroll_top
+
+  # Declare snapshot arrays (persist across loop, modified by _snapshot_tasks via dynamic scope)
+  typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo
+  typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
+  typeset -A _repo_cols _repo_col_cnt
+  local -a _repo_names
+  local _total_task_count=0 _active_count=0 _review_count=0
+  local _tid=""  # scratch variable for _get_selected_id / _get_repo_task_at
 
   # Trap to restore terminal on exit
   cleanup_dash() {
     cursor_show
     stty echo 2>/dev/null
-    printf '\033[?1049l'  # Leave alternate screen, restoring previous terminal content
+    printf '\033[?1049l'
   }
   trap cleanup_dash EXIT INT TERM
 
-  printf '\033[?1049h'  # Enter alternate screen (clean slate, no contamination on exit)
+  printf '\033[?1049h'  # Enter alternate screen
   cursor_hide
   stty -echo 2>/dev/null
 
-  # Drain any pending terminal responses (e.g. Ghostty DA1/DA2/DSR replies)
-  # that would otherwise be misinterpreted as key presses by the input handler
+  # Drain any pending terminal responses
   while read -rsk1 -t 0.05 _discard 2>/dev/null; do :; done
 
   while true; do
-    # Optional debug timing
     local _t0=""
     [[ "${CLOARD_DEBUG:-}" == "1" ]] && _t0=${EPOCHREALTIME:-}
 
@@ -1029,254 +1648,594 @@ cmd__dash_loop() {
     local col_width=$(( (cols - 2) / 5 ))
     local card_inner=$(( col_width - 4 ))
 
-    # Snapshot all task data in a single jq call (replaces ~47 per-field jq calls)
+    # Snapshot all data
     _snapshot_tasks
 
-    # Compute column counts from cached arrays
-    col_counts[0]=${#_col0_ids[@]}
-    col_counts[1]=${#_col1_ids[@]}
-    col_counts[2]=${#_col2_ids[@]}
-    col_counts[3]=${#_col3_ids[@]}
-    col_counts[4]=${#_col4_ids[@]}
-
-    # Clamp cursors
-    for i in {0..4}; do
-      if [[ ${cur_row[$i]} -ge ${col_counts[$i]} ]] && [[ ${col_counts[$i]} -gt 0 ]]; then
-        cur_row[$i]=$(( col_counts[$i] - 1 ))
-      elif [[ ${col_counts[$i]} -eq 0 ]]; then
-        cur_row[$i]=0
-      fi
-    done
-
-    # Pre-compute border strings (subprocess-free via zsh loop)
+    # Pre-compute border strings
     local _border_card="" _border_full="" _i
     for (( _i=0; _i<card_inner; _i++ )); do _border_card+="─"; done
     for (( _i=0; _i<cols; _i++ )); do _border_full+="─"; done
 
-    # Begin frame buffer (single output at end eliminates tearing)
-    local _frame=""
-
-    # Title bar
-    local title_str="  cloard-board | $_project_name | $_task_count tasks"
-    _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}" "$title_str")
-    _frame+=$'\n'
-
-    # Column headers
-    local header_line=""
-    for i in {0..4}; do
-      local cc=$(col_color "$i")
-      local name="${COL_NAMES[$i]}"
-      local cnt="${col_counts[$i]}"
-      local selected=""
-      [[ $i -eq $cur_col ]] && selected="${C_BOLD}"
-      local hdr=$(printf "%s (%d)" "$name" "$cnt")
-      hdr=$(trunc "$hdr" "$col_width")
-      header_line+=$(printf "${selected}${cc}%-${col_width}s${C_RESET}" "$hdr")
-    done
-    _frame+="$header_line"$'\n'
-
-    # Separator (pre-computed, no subprocess)
-    _frame+="$_border_full"$'\n'
-
-    # Render cards: iterate rows
-    local max_cards=0
-    for i in {0..4}; do
-      [[ ${col_counts[$i]} -gt $max_cards ]] && max_cards=${col_counts[$i]}
-    done
-
-    # Card height: 5 lines (top border, id, title, status/pr, bottom border)
-    local card_height=5
-    local max_visible_rows=$(( (rows - 5) / card_height ))
-    [[ $max_cards -gt $max_visible_rows ]] && max_cards=$max_visible_rows
-
-    local _row_seq=()
-    if [[ $max_cards -gt 0 ]]; then
-      _row_seq=($(seq 0 $((max_cards - 1))))
+    # Clamp navigation indices
+    if [[ ${#_repo_names[@]} -gt 0 ]]; then
+      [[ $cur_repo_idx -ge ${#_repo_names[@]} ]] && cur_repo_idx=$((${#_repo_names[@]} - 1))
+    else
+      cur_repo_idx=0
     fi
-    for row_idx in "${_row_seq[@]}"; do
-      # For each card line (0=top border, 1=id, 2=title, 3=extra, 4=bottom border)
-      for line in {0..4}; do
-        local output=""
-        for col_idx in {0..4}; do
-          local cc=$(col_color "$col_idx")
 
-          # O(1) task lookup via indexed array (replaces O(n) while-read scan)
-          _get_task_at "$col_idx" "$row_idx"
-          local task_id="$_tid"
-
-          if [[ -z "$task_id" ]]; then
-            # Empty cell
-            output+=$(printf '%-*s' "$col_width" "")
-          else
-            # Override color for paused tasks in the pending column (cached lookup)
-            if [[ $col_idx -eq 0 ]] && [[ "${_task_status[$task_id]}" == "paused" ]]; then
-              cc="$C_CYAN"
-            fi
-
-            local is_selected=false
-            [[ $col_idx -eq $cur_col && ${cur_row[$col_idx]} -eq $row_idx ]] && is_selected=true
-
-            local title="${_task_title[$task_id]}"
-            local pr="${_task_pr[$task_id]}"
-            local pr_short=""
-            [[ -n "$pr" ]] && pr_short=$(echo "$pr" | grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
-
-            local sel_prefix=" "
-            local sel_color=""
-            if $is_selected; then
-              sel_prefix=">"
-              sel_color="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
-            fi
-
-            local cell=""
-            case $line in
-              0) # Top border (pre-computed border string)
-                if $is_selected; then
-                  cell=$(printf "${sel_color}${sel_prefix}┌%s┐${C_RESET}" "$_border_card")
-                else
-                  cell=$(printf "${cc} ┌%s┐${C_RESET}" "$_border_card")
-                fi
-                ;;
-              1) # ID line
-                local id_str=$(trunc "$task_id" $((card_inner - 1)))
-                if $is_selected; then
-                  cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${id_str}")
-                else
-                  cell=$(printf "${cc} │${C_BOLD}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${id_str}")
-                fi
-                ;;
-              2) # Title line
-                local title_str=$(trunc "$title" $((card_inner - 1)))
-                if $is_selected; then
-                  cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
-                else
-                  cell=$(printf "${cc} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
-                fi
-                ;;
-              3) # Status/PR line (cached claude_status lookup)
-                local cstatus="${_task_claude[$task_id]}"
-                local extra=""
-                local extra_color=""
-                if [[ "$cstatus" == "working" ]]; then
-                  extra="● working"
-                  extra_color="${C_GREEN}"
-                elif [[ "$cstatus" == "waiting" ]]; then
-                  extra="○ waiting"
-                  extra_color="${C_YELLOW}"
-                fi
-                if [[ -n "$pr_short" ]]; then
-                  if [[ -n "$extra" ]]; then
-                    extra="${extra} ${pr_short}"
-                  else
-                    extra="$pr_short"
-                  fi
-                fi
-                extra=$(trunc "$extra" $((card_inner - 1)))
-                if $is_selected; then
-                  cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
-                elif [[ -n "$extra_color" ]]; then
-                  cell=$(printf "${cc} │${extra_color}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${extra}")
-                else
-                  cell=$(printf "${cc}${C_DIM} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
-                fi
-                ;;
-              4) # Bottom border (pre-computed border string)
-                if $is_selected; then
-                  cell=$(printf "${sel_color} └%s┘${C_RESET}" "$_border_card")
-                else
-                  cell=$(printf "${cc} └%s┘${C_RESET}" "$_border_card")
-                fi
-                ;;
-            esac
-            output+="$cell"
-            # Pad to column width if needed
-            local cell_visual_len=$((card_inner + 4))
-            local pad=$(( col_width - cell_visual_len ))
-            [[ $pad -gt 0 ]] && output+=$(printf '%*s' "$pad" "")
-          fi
-        done
-        _frame+="$output"$'\n'
+    # Clamp card cursors for all repos
+    for rn in "${_repo_names[@]}"; do
+      for ci in {0..4}; do
+        local ckey="${rn}:${ci}"
+        local ccnt="${_repo_col_cnt[$ckey]:-0}"
+        local crow="${cur_card_row[$ckey]:-0}"
+        if [[ $crow -ge $ccnt ]] && [[ $ccnt -gt 0 ]]; then
+          cur_card_row[$ckey]=$((ccnt - 1))
+        elif [[ $ccnt -eq 0 ]]; then
+          cur_card_row[$ckey]=0
+        fi
       done
     done
 
-    # Output entire frame at once: cursor home + buffered frame + clear below
+    # Validate filter_mode still exists
+    if [[ "$filter_mode" != "all" ]]; then
+      local _filter_valid=false
+      for rn in "${_repo_names[@]}"; do
+        [[ "$rn" == "$filter_mode" ]] && _filter_valid=true
+      done
+      if ! $_filter_valid; then
+        filter_mode="all"
+        filter_idx=0
+        nav_mode="repo"
+      fi
+    fi
+
+    # Begin frame buffer
+    local _frame=""
+
+    # Title bar
+    local title_str
+    if [[ "$filter_mode" == "all" ]]; then
+      title_str="  cloard-board -- All repos (${_total_task_count} tasks: ${_active_count} active, ${_review_count} review)"
+    else
+      local ft_cnt="${_repo_task_count[$filter_mode]:-0}"
+      title_str="  cloard-board -- ${filter_mode} (${ft_cnt} tasks)"
+    fi
+    _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}" "$title_str")
+    _frame+=$'\n'
+
+    if [[ ${#_repo_names[@]} -eq 0 ]]; then
+      # No repos registered
+      _frame+=$'\n'
+      _frame+="  ${C_DIM}No repos registered. Run: cloard-board repo add <path>${C_RESET}"$'\n'
+    elif [[ "$filter_mode" == "all" ]]; then
+      # ── All-repos view ──
+      # Calculate max cards per repo based on available space
+      local visible_repos=${#_repo_names[@]}
+      local per_repo_rows=$(( (rows - 4) / (visible_repos > 0 ? visible_repos : 1) ))
+      local max_cards_global=$(( (per_repo_rows - 3) / 5 ))
+      [[ $max_cards_global -lt 1 ]] && max_cards_global=1
+
+      local repo_idx=0
+      for rname in "${_repo_names[@]}"; do
+        local is_sel_repo=false
+        [[ $repo_idx -eq $cur_repo_idx ]] && is_sel_repo=true
+
+        local tcnt="${_repo_task_count[$rname]:-0}"
+        local stale_indicator=""
+        [[ -n "${_repo_stale[$rname]:-}" ]] && stale_indicator=" ${C_RED}(path not found)${C_RESET}"
+
+        # Repo header
+        local repo_hdr="[${rname}]${stale_indicator} (${tcnt} tasks)"
+        if $is_sel_repo && [[ "$nav_mode" == "repo" ]]; then
+          _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}> %-$((cols-2))s${C_RESET}" "$repo_hdr")
+        else
+          _frame+=$(printf "${C_BOLD}  %-$((cols-2))s${C_RESET}" "$repo_hdr")
+        fi
+        _frame+=$'\n'
+
+        # Skip card rendering for collapsed repos (0 tasks, not selected)
+        if [[ $tcnt -eq 0 ]] && ! $is_sel_repo; then
+          repo_idx=$((repo_idx + 1))
+          continue
+        fi
+
+        # Column headers
+        local header_line=""
+        for i in {0..4}; do
+          local cc=$(col_color "$i")
+          local cname="${COL_NAMES[$i]}"
+          local ccnt="${_repo_col_cnt[${rname}:${i}]:-0}"
+          local hdr=$(printf "%s (%d)" "$cname" "$ccnt")
+          hdr=$(trunc "$hdr" "$col_width")
+          local hdr_sel=""
+          if $is_sel_repo && [[ $i -eq $cur_col ]]; then
+            hdr_sel="${C_BOLD}"
+          fi
+          header_line+=$(printf "${hdr_sel}${cc}%-${col_width}s${C_RESET}" "$hdr")
+        done
+        _frame+="$header_line"$'\n'
+
+        # Cards: compute actual max and visible window with scrolling
+        local actual_max=0
+        for i in {0..4}; do
+          local cnt="${_repo_col_cnt[${rname}:${i}]:-0}"
+          [[ $cnt -gt $actual_max ]] && actual_max=$cnt
+        done
+        local visible_cards=$max_cards_global
+        [[ $visible_cards -gt $actual_max ]] && visible_cards=$actual_max
+
+        # Compute scroll offset for selected repo in card mode
+        local scroll_off="${_scroll_top[$rname]:-0}"
+        if $is_sel_repo && [[ "$nav_mode" == "card" ]]; then
+          local focused_row="${cur_card_row[${rname}:${cur_col}]:-0}"
+          if [[ $focused_row -ge $((scroll_off + visible_cards)) ]]; then
+            scroll_off=$((focused_row - visible_cards + 1))
+          fi
+          if [[ $focused_row -lt $scroll_off ]]; then
+            scroll_off=$focused_row
+          fi
+          _scroll_top[$rname]=$scroll_off
+        fi
+
+        if [[ $visible_cards -gt 0 ]]; then
+          # Scroll-up indicator
+          if [[ $scroll_off -gt 0 ]]; then
+            _frame+="  ${C_DIM}▲ ${scroll_off} more above${C_RESET}"$'\n'
+          fi
+
+          local _rseq=()
+          _rseq=($(seq $scroll_off $((scroll_off + visible_cards - 1))))
+          for row_idx in "${_rseq[@]}"; do
+            for line_no in {0..4}; do
+              local output=""
+              for col_idx in {0..4}; do
+                local cc=$(col_color "$col_idx")
+                _get_repo_task_at "$rname" "$col_idx" "$row_idx"
+                local task_id="$_tid"
+
+                if [[ -z "$task_id" ]]; then
+                  output+=$(printf '%-*s' "$col_width" "")
+                else
+                  # Paused override
+                  [[ $col_idx -eq 0 && "${_task_status[$task_id]}" == "paused" ]] && cc="$C_CYAN"
+
+                  local is_selected=false
+                  if $is_sel_repo && [[ "$nav_mode" == "card" ]]; then
+                    local crow="${cur_card_row[${rname}:${col_idx}]:-0}"
+                    [[ $col_idx -eq $cur_col && $crow -eq $row_idx ]] && is_selected=true
+                  fi
+
+                  local title="${_task_title[$task_id]}"
+                  local pr="${_task_pr[$task_id]}"
+                  local pr_short=""
+                  [[ -n "$pr" ]] && pr_short=$(echo "$pr" | grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
+
+                  local sel_prefix=" "
+                  local sel_color=""
+                  if $is_selected; then
+                    sel_prefix=">"
+                    sel_color="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+                  fi
+
+                  local cell=""
+                  case $line_no in
+                    0)
+                      if $is_selected; then
+                        cell=$(printf "${sel_color}${sel_prefix}┌%s┐${C_RESET}" "$_border_card")
+                      else
+                        cell=$(printf "${cc} ┌%s┐${C_RESET}" "$_border_card")
+                      fi
+                      ;;
+                    1)
+                      local id_str=$(trunc "$task_id" $((card_inner - 1)))
+                      if $is_selected; then
+                        cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${id_str}")
+                      else
+                        cell=$(printf "${cc} │${C_BOLD}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${id_str}")
+                      fi
+                      ;;
+                    2)
+                      local title_str=$(trunc "$title" $((card_inner - 1)))
+                      if $is_selected; then
+                        cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                      else
+                        cell=$(printf "${cc} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                      fi
+                      ;;
+                    3)
+                      local cstatus="${_task_claude[$task_id]}"
+                      local extra="" extra_color=""
+                      [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
+                      [[ "$cstatus" == "waiting" ]] && { extra="○ waiting"; extra_color="${C_YELLOW}"; }
+                      [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
+                      extra=$(trunc "$extra" $((card_inner - 1)))
+                      if $is_selected; then
+                        cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
+                      elif [[ -n "$extra_color" ]]; then
+                        cell=$(printf "${cc} │${extra_color}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${extra}")
+                      else
+                        cell=$(printf "${cc}${C_DIM} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
+                      fi
+                      ;;
+                    4)
+                      if $is_selected; then
+                        cell=$(printf "${sel_color} └%s┘${C_RESET}" "$_border_card")
+                      else
+                        cell=$(printf "${cc} └%s┘${C_RESET}" "$_border_card")
+                      fi
+                      ;;
+                  esac
+                  output+="$cell"
+                  local cell_visual_len=$((card_inner + 4))
+                  local pad=$(( col_width - cell_visual_len ))
+                  [[ $pad -gt 0 ]] && output+=$(printf '%*s' "$pad" "")
+                fi
+              done
+              _frame+="$output"$'\n'
+            done
+          done
+
+          # Scroll-down indicator
+          local below=$((actual_max - scroll_off - visible_cards))
+          if [[ $below -gt 0 ]]; then
+            _frame+="  ${C_DIM}▼ ${below} more below${C_RESET}"$'\n'
+          fi
+        fi
+
+        repo_idx=$((repo_idx + 1))
+      done
+
+    else
+      # ── Filtered single-repo view ──
+      local rname="$filter_mode"
+      local max_visible_rows=$(( (rows - 5) / 5 ))
+      [[ $max_visible_rows -lt 1 ]] && max_visible_rows=1
+
+      # Column headers
+      local header_line=""
+      for i in {0..4}; do
+        local cc=$(col_color "$i")
+        local cname="${COL_NAMES[$i]}"
+        local ccnt="${_repo_col_cnt[${rname}:${i}]:-0}"
+        local selected=""
+        [[ $i -eq $cur_col ]] && selected="${C_BOLD}"
+        local hdr=$(printf "%s (%d)" "$cname" "$ccnt")
+        hdr=$(trunc "$hdr" "$col_width")
+        header_line+=$(printf "${selected}${cc}%-${col_width}s${C_RESET}" "$hdr")
+      done
+      _frame+="$header_line"$'\n'
+      _frame+="$_border_full"$'\n'
+
+      # Cards: compute actual max and visible window with scrolling
+      local actual_max=0
+      for i in {0..4}; do
+        local cnt="${_repo_col_cnt[${rname}:${i}]:-0}"
+        [[ $cnt -gt $actual_max ]] && actual_max=$cnt
+      done
+      local visible_cards=$max_visible_rows
+      [[ $visible_cards -gt $actual_max ]] && visible_cards=$actual_max
+
+      # Compute scroll offset
+      local scroll_off="${_scroll_top[$rname]:-0}"
+      local focused_row="${cur_card_row[${rname}:${cur_col}]:-0}"
+      if [[ $focused_row -ge $((scroll_off + visible_cards)) ]]; then
+        scroll_off=$((focused_row - visible_cards + 1))
+      fi
+      if [[ $focused_row -lt $scroll_off ]]; then
+        scroll_off=$focused_row
+      fi
+      _scroll_top[$rname]=$scroll_off
+
+      if [[ $visible_cards -gt 0 ]]; then
+        # Scroll-up indicator
+        if [[ $scroll_off -gt 0 ]]; then
+          _frame+="  ${C_DIM}▲ ${scroll_off} more above${C_RESET}"$'\n'
+        fi
+
+        local _rseq=()
+        _rseq=($(seq $scroll_off $((scroll_off + visible_cards - 1))))
+        for row_idx in "${_rseq[@]}"; do
+          for line_no in {0..4}; do
+            local output=""
+            for col_idx in {0..4}; do
+              local cc=$(col_color "$col_idx")
+              _get_repo_task_at "$rname" "$col_idx" "$row_idx"
+              local task_id="$_tid"
+
+              if [[ -z "$task_id" ]]; then
+                output+=$(printf '%-*s' "$col_width" "")
+              else
+                [[ $col_idx -eq 0 && "${_task_status[$task_id]}" == "paused" ]] && cc="$C_CYAN"
+
+                local is_selected=false
+                local crow="${cur_card_row[${rname}:${col_idx}]:-0}"
+                [[ $col_idx -eq $cur_col && $crow -eq $row_idx ]] && is_selected=true
+
+                local title="${_task_title[$task_id]}"
+                local pr="${_task_pr[$task_id]}"
+                local pr_short=""
+                [[ -n "$pr" ]] && pr_short=$(echo "$pr" | grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
+
+                local sel_prefix=" "
+                local sel_color=""
+                if $is_selected; then
+                  sel_prefix=">"
+                  sel_color="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+                fi
+
+                local cell=""
+                case $line_no in
+                  0)
+                    if $is_selected; then
+                      cell=$(printf "${sel_color}${sel_prefix}┌%s┐${C_RESET}" "$_border_card")
+                    else
+                      cell=$(printf "${cc} ┌%s┐${C_RESET}" "$_border_card")
+                    fi
+                    ;;
+                  1)
+                    local id_str=$(trunc "$task_id" $((card_inner - 1)))
+                    if $is_selected; then
+                      cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${id_str}")
+                    else
+                      cell=$(printf "${cc} │${C_BOLD}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${id_str}")
+                    fi
+                    ;;
+                  2)
+                    local title_str=$(trunc "$title" $((card_inner - 1)))
+                    if $is_selected; then
+                      cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                    else
+                      cell=$(printf "${cc} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                    fi
+                    ;;
+                  3)
+                    local cstatus="${_task_claude[$task_id]}"
+                    local extra="" extra_color=""
+                    [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
+                    [[ "$cstatus" == "waiting" ]] && { extra="○ waiting"; extra_color="${C_YELLOW}"; }
+                    [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
+                    extra=$(trunc "$extra" $((card_inner - 1)))
+                    if $is_selected; then
+                      cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
+                    elif [[ -n "$extra_color" ]]; then
+                      cell=$(printf "${cc} │${extra_color}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${extra}")
+                    else
+                      cell=$(printf "${cc}${C_DIM} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
+                    fi
+                    ;;
+                  4)
+                    if $is_selected; then
+                      cell=$(printf "${sel_color} └%s┘${C_RESET}" "$_border_card")
+                    else
+                      cell=$(printf "${cc} └%s┘${C_RESET}" "$_border_card")
+                    fi
+                    ;;
+                esac
+                output+="$cell"
+                local cell_visual_len=$((card_inner + 4))
+                local pad=$(( col_width - cell_visual_len ))
+                [[ $pad -gt 0 ]] && output+=$(printf '%*s' "$pad" "")
+              fi
+            done
+            _frame+="$output"$'\n'
+          done
+        done
+
+        # Scroll-down indicator
+        local below=$((actual_max - scroll_off - visible_cards))
+        if [[ $below -gt 0 ]]; then
+          _frame+="  ${C_DIM}▼ ${below} more below${C_RESET}"$'\n'
+        fi
+      fi
+    fi
+
+    # Output frame
     printf '\033[H%s\033[J' "$_frame"
 
-    # Footer with keybindings
+    # Footer
     move_to "$((rows - 1))" 1
-    printf "${C_DIM}  h/l: columns  j/k: tasks  Enter: open  </> move  s: shell  p: pause  o: new  x: done  d: diff  q: quit  (^b b: here)${C_RESET}"
+    if [[ "$filter_mode" == "all" ]]; then
+      if [[ "$nav_mode" == "repo" ]]; then
+        printf "${C_DIM}  Tab: filter  j/k: repos  Enter: zoom in  o: new session  S: import session  R: add repo  q: quit${C_RESET}"
+      else
+        printf "${C_DIM}  j/k: scroll (overflows to next repo)  Esc: repos  o: new  S: import  t: rename  R: add repo  q: quit${C_RESET}"
+      fi
+    else
+      printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  </> move  o: new  S: import  t: rename  s: shell  d: diff  q: quit${C_RESET}"
+    fi
 
-    # Debug timing (CLOARD_DEBUG=1 logs frame render time)
+    # Debug timing
     if [[ -n "${_t0:-}" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
       local _elapsed=$(( (EPOCHREALTIME - _t0) * 1000 ))
       printf '%s frame: %.1fms\n' "$(date +%T)" "$_elapsed" >> /tmp/cloard-perf.log
     fi
 
-    # Read key with timeout (non-blocking refresh)
-    # NOTE: zsh uses -k (not -n) to read N chars without waiting for newline
+    # Read key with timeout
     local key=""
     read -rsk1 -t "$DASH_REFRESH" key 2>/dev/null || true
 
-    # Handle escape sequences (arrow keys)
+    # Handle escape sequences
     if [[ "$key" == $'\e' ]]; then
       local seq=""
       read -rsk2 -t 0.1 seq 2>/dev/null || true
       case "$seq" in
-        '[A') key='k' ;;  # up
-        '[B') key='j' ;;  # down
-        '[C') key='l' ;;  # right
-        '[D') key='h' ;;  # left
+        '[A') key='k' ;;     # up
+        '[B') key='j' ;;     # down
+        '[C') key='l' ;;     # right
+        '[D') key='h' ;;     # left
+        '[Z') key='SHIFT_TAB' ;;  # shift-tab
+        *)    key='ESC' ;;   # plain Esc
       esac
     fi
 
     case "$key" in
-      h) # Left column
-        [[ $cur_col -gt 0 ]] && cur_col=$((cur_col-1))
+      h) # Left column: skip empty columns
+        local _h_target=$((cur_col - 1))
+        local _h_repo=""
+        if [[ "$filter_mode" != "all" ]]; then
+          _h_repo="$filter_mode"
+        elif [[ ${#_repo_names[@]} -gt 0 ]]; then
+          _h_repo="${_repo_names[$cur_repo_idx]:-}"
+        fi
+        if [[ -n "$_h_repo" ]]; then
+          while [[ $_h_target -ge 0 ]]; do
+            local _hcnt="${_repo_col_cnt[${_h_repo}:${_h_target}]:-0}"
+            [[ $_hcnt -gt 0 ]] && break
+            _h_target=$((_h_target - 1))
+          done
+        fi
+        [[ $_h_target -ge 0 ]] && cur_col=$_h_target
         ;;
-      l) # Right column
-        [[ $cur_col -lt 4 ]] && cur_col=$((cur_col+1))
+      l) # Right column: skip empty columns
+        local _l_target=$((cur_col + 1))
+        local _l_repo=""
+        if [[ "$filter_mode" != "all" ]]; then
+          _l_repo="$filter_mode"
+        elif [[ ${#_repo_names[@]} -gt 0 ]]; then
+          _l_repo="${_repo_names[$cur_repo_idx]:-}"
+        fi
+        if [[ -n "$_l_repo" ]]; then
+          while [[ $_l_target -le 4 ]]; do
+            local _lcnt="${_repo_col_cnt[${_l_repo}:${_l_target}]:-0}"
+            [[ $_lcnt -gt 0 ]] && break
+            _l_target=$((_l_target + 1))
+          done
+        fi
+        [[ $_l_target -le 4 ]] && cur_col=$_l_target
         ;;
-      j) # Down in column
-        local max_idx=$(( col_counts[$cur_col] - 1 ))
-        [[ ${cur_row[$cur_col]} -lt $max_idx ]] && cur_row[$cur_col]=$(( cur_row[$cur_col] + 1 ))
+      j) # Down
+        if [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          # Move between repo rows
+          [[ $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]] && cur_repo_idx=$((cur_repo_idx + 1))
+        else
+          # Move between cards within the active repo
+          local active_repo
+          if [[ "$filter_mode" != "all" ]]; then
+            active_repo="$filter_mode"
+          else
+            active_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          if [[ -n "$active_repo" ]]; then
+            local ckey="${active_repo}:${cur_col}"
+            local max_idx=$(( ${_repo_col_cnt[$ckey]:-0} - 1 ))
+            local crow="${cur_card_row[$ckey]:-0}"
+            if [[ $crow -lt $max_idx ]]; then
+              cur_card_row[$ckey]=$((crow + 1))
+            elif [[ "$filter_mode" == "all" && $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]]; then
+              # Overflow to next repo
+              cur_repo_idx=$((cur_repo_idx + 1))
+            fi
+          elif [[ "$filter_mode" == "all" && $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]]; then
+            # Empty column; jump to next repo
+            cur_repo_idx=$((cur_repo_idx + 1))
+          fi
+        fi
         ;;
-      k) # Up in column
-        [[ ${cur_row[$cur_col]} -gt 0 ]] && cur_row[$cur_col]=$(( cur_row[$cur_col] - 1 ))
+      k) # Up
+        if [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          [[ $cur_repo_idx -gt 0 ]] && cur_repo_idx=$((cur_repo_idx - 1))
+        else
+          local active_repo
+          if [[ "$filter_mode" != "all" ]]; then
+            active_repo="$filter_mode"
+          else
+            active_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          if [[ -n "$active_repo" ]]; then
+            local ckey="${active_repo}:${cur_col}"
+            local crow="${cur_card_row[$ckey]:-0}"
+            if [[ $crow -gt 0 ]]; then
+              cur_card_row[$ckey]=$((crow - 1))
+            elif [[ "$filter_mode" == "all" && $cur_repo_idx -gt 0 ]]; then
+              # Overflow to previous repo
+              cur_repo_idx=$((cur_repo_idx - 1))
+            fi
+          elif [[ "$filter_mode" == "all" && $cur_repo_idx -gt 0 ]]; then
+            # Empty column; jump to previous repo
+            cur_repo_idx=$((cur_repo_idx - 1))
+          fi
+        fi
         ;;
-      '') ;; # Timeout/no input: just refresh the display
-      $'\n'|$'\r') # Enter: open/interact with task based on status
-        if _get_selected_id; then
+      '') ;; # Timeout: just refresh
+      $'\t') # Tab: next filter
+        local total_filters=$(( ${#_repo_names[@]} + 1 ))
+        filter_idx=$(( (filter_idx + 1) % total_filters ))
+        if [[ $filter_idx -eq 0 ]]; then
+          filter_mode="all"
+          nav_mode="repo"
+        else
+          filter_mode="${_repo_names[$((filter_idx - 1))]}"
+          nav_mode="card"
+        fi
+        ;;
+      SHIFT_TAB) # Shift-Tab: previous filter
+        local total_filters=$(( ${#_repo_names[@]} + 1 ))
+        filter_idx=$(( (filter_idx - 1 + total_filters) % total_filters ))
+        if [[ $filter_idx -eq 0 ]]; then
+          filter_mode="all"
+          nav_mode="repo"
+        else
+          filter_mode="${_repo_names[$((filter_idx - 1))]}"
+          nav_mode="card"
+        fi
+        ;;
+      ESC) # Escape: zoom out to repo mode
+        if [[ "$filter_mode" == "all" && "$nav_mode" == "card" ]]; then
+          nav_mode="repo"
+        fi
+        ;;
+      $'\n'|$'\r') # Enter
+        if [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          # Zoom into selected repo (switch to card mode)
+          nav_mode="card"
+        elif _get_selected_id; then
+          # Open/interact with selected task
           local sel_id="$_tid"
           local cur_status="${_task_status[$sel_id]}"
-          case "$cur_status" in
-            pending)
-              # Start task: prompt for instructions so Claude begins working immediately
-              cursor_show
-              stty echo
-              local task_title="${_task_title[$sel_id]}"
-              echo ""
-              echo "${C_CYAN}Starting task '${sel_id}': ${task_title}${C_RESET}"
-              printf "${C_CYAN}Prompt for Claude (or Enter to skip): ${C_RESET}"
-              local task_prompt=""
-              read -r task_prompt
-              # Ask about worktree mode (cached lookup)
-              local dash_wt_mode="${_task_wtmode[$sel_id]}"
-              if [[ "$dash_wt_mode" != "none" ]]; then
-                printf "${C_CYAN}Use worktree? [Y/n]: ${C_RESET}"
-                local wt_choice=""
-                read -r wt_choice
-                if [[ "$wt_choice" =~ ^[nN]$ ]]; then
+          local sel_repo="${_task_repo[$sel_id]}"
+          local sel_rpath
+          sel_rpath=$(repo_path "$sel_repo")
+
+          # Check for stale repo
+          if [[ -n "${_repo_stale[$sel_repo]:-}" ]]; then
+            cursor_show
+            stty echo
+            echo ""
+            echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${sel_repo} <new-path>${C_RESET}"
+            sleep 2
+            stty -echo
+            cursor_hide
+          else
+            case "$cur_status" in
+              pending)
+                cursor_show
+                stty echo
+                local task_title="${_task_title[$sel_id]}"
+                echo ""
+                echo "${C_CYAN}Starting task '${sel_id}': ${task_title}${C_RESET}"
+                printf "${C_CYAN}Prompt for Claude (or Enter to skip): ${C_RESET}"
+                local task_prompt=""
+                read -r task_prompt
+                local dash_wt_mode="${_task_wtmode[$sel_id]}"
+                local rtype="${_repo_types[$sel_repo]:-git}"
+                if [[ "$rtype" == "dir" ]]; then
                   dash_wt_mode="none"
-                  update_task_field "$sel_id" "worktree_mode" "none"
-                  update_task_field_raw "$sel_id" "branch" "null"
+                elif [[ "$dash_wt_mode" != "none" ]]; then
+                  printf "${C_CYAN}Use worktree? [Y/n]: ${C_RESET}"
+                  local wt_choice=""
+                  read -r wt_choice
+                  if [[ "$wt_choice" =~ ^[nN]$ ]]; then
+                    dash_wt_mode="none"
+                    update_task_field "$sel_id" "worktree_mode" "none"
+                    update_task_field_raw "$sel_id" "branch" "null"
+                  fi
                 fi
-              fi
-              stty -echo
-              cursor_hide
-              local wt_path_existing=$(find_worktree_path "$sel_id")
-              if [[ -z "$wt_path_existing" ]]; then
-                local safe_cwd
-                safe_cwd=${(q)${PWD}}
+                stty -echo
+                cursor_hide
+                local safe_global_dir=${(q)GLOBAL_DIR}
+                local safe_repo_path=${(q)sel_rpath}
+                local safe_work_dir=${(q)sel_rpath}
                 local dash_claude_cmd
                 if [[ "$dash_wt_mode" == "none" ]]; then
                   dash_claude_cmd="claude --dangerously-skip-permissions"
@@ -1287,60 +2246,61 @@ cmd__dash_loop() {
                   local escaped="${task_prompt//\'/\'\\\'\'}"
                   dash_claude_cmd="${dash_claude_cmd} '${escaped}'"
                 fi
-                tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_cwd} && cd ${safe_cwd} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-              fi
-              update_task_field "$sel_id" "status" "active"
-              update_task_field "$sel_id" "started_at" "$(now_iso)"
-              tmux_select_window "$sel_id"
-              ;;
-            paused)
-              # Resume paused task (cached worktree_mode lookup)
-              local wt_mode_paused="${_task_wtmode[$sel_id]}"
-              if ! tmux_window_exists "$sel_id"; then
-                if [[ "$wt_mode_paused" == "none" ]]; then
-                  local safe_pwd_p
-                  safe_pwd_p=${(q)${PWD}}
-                  tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_pwd_p} && cd ${safe_pwd_p} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-                else
-                  local wt_p=$(find_worktree_path "$sel_id")
-                  if [[ -n "$wt_p" ]]; then
-                    local safe_wt_p
-                    safe_wt_p=${(q)${wt_p}}
-                    local safe_board_dir_p=${(q)${PWD}}
-                    tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_board_dir_p} && cd ${safe_wt_p} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                tmux_create_window "$sel_id" "zsh" "-c" \
+                  "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                update_task_field "$sel_id" "status" "active"
+                update_task_field "$sel_id" "started_at" "$(now_iso)"
+                tmux_select_window "$sel_id"
+                ;;
+              paused)
+                local wt_mode_paused="${_task_wtmode[$sel_id]}"
+                if ! tmux_window_exists "$sel_id"; then
+                  local safe_global_dir=${(q)GLOBAL_DIR}
+                  local safe_repo_path=${(q)sel_rpath}
+                  if [[ "$wt_mode_paused" == "none" ]]; then
+                    local safe_work_dir=${(q)sel_rpath}
+                    tmux_create_window "$sel_id" "zsh" "-c" \
+                      "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                  else
+                    local wt_p=$(find_worktree_path "$sel_id" "$sel_rpath")
+                    if [[ -n "$wt_p" ]]; then
+                      local safe_wt_p=${(q)wt_p}
+                      tmux_create_window "$sel_id" "zsh" "-c" \
+                        "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_wt_p} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                    fi
                   fi
                 fi
-              fi
-              update_task_field "$sel_id" "status" "active"
-              tmux_select_window "$sel_id"
-              ;;
-            active|needs_review|review)
-              # Attach to task window, recreating it if needed
-              if ! tmux_window_exists "$sel_id"; then
-                local wt_mode_act="${_task_wtmode[$sel_id]}"
-                if [[ "$wt_mode_act" == "none" ]]; then
-                  local safe_pwd_a
-                  safe_pwd_a=${(q)${PWD}}
-                  tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_pwd_a} && cd ${safe_pwd_a} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-                else
-                  local wt_a=$(find_worktree_path "$sel_id")
-                  if [[ -n "$wt_a" ]]; then
-                    local safe_wt_a safe_board_a
-                    safe_wt_a=${(q)${wt_a}}
-                    safe_board_a=${(q)${PWD}}
-                    tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_board_a} && cd ${safe_wt_a} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                update_task_field "$sel_id" "status" "active"
+                tmux_select_window "$sel_id"
+                ;;
+              active|needs_review|review)
+                if ! tmux_window_exists "$sel_id"; then
+                  local wt_mode_act="${_task_wtmode[$sel_id]}"
+                  local safe_global_dir=${(q)GLOBAL_DIR}
+                  local safe_repo_path=${(q)sel_rpath}
+                  if [[ "$wt_mode_act" == "none" ]]; then
+                    local safe_work_dir=${(q)sel_rpath}
+                    tmux_create_window "$sel_id" "zsh" "-c" \
+                      "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                  else
+                    local wt_a=$(find_worktree_path "$sel_id" "$sel_rpath")
+                    if [[ -n "$wt_a" ]]; then
+                      local safe_wt_a=${(q)wt_a}
+                      tmux_create_window "$sel_id" "zsh" "-c" \
+                        "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_wt_a} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                    fi
                   fi
                 fi
-              fi
-              cursor_show
-              tmux_select_window "$sel_id"
-              cursor_hide
-              ;;
-            done) ;; # No-op
-          esac
+                cursor_show
+                tmux_select_window "$sel_id"
+                cursor_hide
+                ;;
+              done) ;; # No-op
+            esac
+          fi
         fi
         ;;
-      '>'|'.') # Move task one status to the right
+      '>'|'.') # Move task right
         if _get_selected_id; then
           local sel_id="$_tid"
           local mv_status="${_task_status[$sel_id]}"
@@ -1352,7 +2312,6 @@ cmd__dash_loop() {
           if [[ $mv_idx -ge 0 && $mv_idx -lt $((${#status_order[@]} - 1)) ]]; then
             local next_status="${status_order[$((mv_idx + 1))]}"
             if [[ "$mv_status" == "needs_review" && "$next_status" == "review" ]]; then
-              # Trigger PR creation flow
               cursor_show
               stty echo
               echo ""
@@ -1366,7 +2325,6 @@ cmd__dash_loop() {
               stty -echo
               cursor_hide
             elif [[ "$mv_status" == "review" && "$next_status" == "done" ]]; then
-              # Trigger cleanup flow
               (cmd_done "$sel_id") 2>&1 || true
             else
               update_task_field "$sel_id" "status" "$next_status"
@@ -1374,7 +2332,7 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      '<'|',') # Move task one status to the left
+      '<'|',') # Move task left
         if _get_selected_id; then
           local sel_id="$_tid"
           local mv_status="${_task_status[$sel_id]}"
@@ -1389,23 +2347,69 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      o) # Create new task
+      o) # Quick-create and start a Claude session
         cursor_show
         stty echo
         echo ""
-        printf "${C_CYAN}Task ID: ${C_RESET}"
-        local new_id=""
-        read -r new_id
-        if [[ -n "$new_id" ]]; then
-          printf "${C_CYAN}Title: ${C_RESET}"
+        local new_repo="" _cancelled=false
+        if [[ "$filter_mode" != "all" ]]; then
+          new_repo="$filter_mode"
+        else
+          # Show repo picker
+          echo "${C_CYAN}Select repo (Esc to cancel):${C_RESET}"
+          local -a picker_repos=()
+          local picker_idx=1
+          for rn in "${_repo_names[@]}"; do
+            [[ -n "${_repo_stale[$rn]:-}" ]] && continue
+            picker_repos+=("$rn")
+            echo "  ${picker_idx}) ${rn}"
+            picker_idx=$((picker_idx + 1))
+          done
+          if [[ ${#picker_repos[@]} -eq 0 ]]; then
+            echo "${C_RED}No repos available${C_RESET}"
+            sleep 1
+            stty -echo
+            cursor_hide
+            continue
+          elif [[ ${#picker_repos[@]} -eq 1 ]]; then
+            new_repo="${picker_repos[0]}"
+          else
+            printf "${C_CYAN}Choice: ${C_RESET}"
+            local pchoice=""
+            if ! _read_or_esc pchoice; then _cancelled=true; fi
+            if ! $_cancelled && [[ "$pchoice" =~ ^[0-9]+$ ]]; then
+              pchoice=$((pchoice - 1))
+              if [[ $pchoice -ge 0 && $pchoice -lt ${#picker_repos[@]} ]]; then
+                new_repo="${picker_repos[$pchoice]}"
+              fi
+            fi
+          fi
+        fi
+        if ! $_cancelled && [[ -n "$new_repo" ]]; then
+          printf "${C_CYAN}Title (Enter to skip, Esc to cancel): ${C_RESET}"
           local new_title=""
-          read -r new_title
-          if [[ -n "$new_title" ]]; then
-            local add_output
-            add_output=$( (cmd_add "$new_id" --title "$new_title") 2>&1 ) || true
-            if [[ -n "$add_output" ]]; then
-              echo "$add_output"
-              sleep 1.5
+          if ! _read_or_esc new_title; then _cancelled=true; fi
+        fi
+        if ! $_cancelled && [[ -n "$new_repo" ]]; then
+          # Create task with --no-worktree, title optional
+          local add_output
+          add_output=$( (cmd_add --title "$new_title" --repo "$new_repo" --no-worktree) 2>&1 ) || true
+          if [[ -n "$add_output" ]]; then
+            echo "$add_output"
+          fi
+          # Extract the task ID from the output (format: "✓ created t-NNN ...")
+          local new_id=""
+          new_id=$(echo "$add_output" | grep -oE 't-[0-9]+' | head -1)
+          if [[ -n "$new_id" ]]; then
+            printf "${C_CYAN}Prompt (Enter to skip, Esc to cancel): ${C_RESET}"
+            local new_prompt=""
+            if _read_or_esc new_prompt; then
+              # Start the session immediately
+              local start_output
+              start_output=$( (cmd_start "$new_id" $new_prompt) 2>&1 ) || true
+              if [[ -n "$start_output" ]]; then
+                echo "$start_output"
+              fi
             fi
           fi
         fi
@@ -1423,16 +2427,19 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      d) # Show diff (cached worktree_mode lookup)
+      d) # Show diff
         if _get_selected_id; then
           local sel_id="$_tid"
+          local sel_repo="${_task_repo[$sel_id]}"
+          local sel_rpath
+          sel_rpath=$(repo_path "$sel_repo")
           local diff_dir=""
           if [[ "${_task_wtmode[$sel_id]}" == "none" ]]; then
-            diff_dir="$PWD"
+            diff_dir="$sel_rpath"
           else
-            diff_dir=$(find_worktree_path "$sel_id")
+            diff_dir=$(find_worktree_path "$sel_id" "$sel_rpath")
           fi
-          if [[ -n "$diff_dir" ]]; then
+          if [[ -n "$diff_dir" && -d "$diff_dir" ]]; then
             cursor_show
             stty echo
             (cd "$diff_dir" && git diff --stat && echo "" && git diff) | less
@@ -1441,19 +2448,123 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      s) # Shell popup: capture tmux pane output
+      s) # Shell popup
         if _get_selected_id; then
           local sel_id="$_tid"
           if tmux_window_exists "$sel_id"; then
             cursor_show
             stty echo
-            # Capture pane content with history
             local pane_content
             pane_content=$(tmux_cmd capture-pane -t "board:${sel_id}" -p -S -500 2>/dev/null || echo "(no output)")
             echo "$pane_content" | less -R +G
             stty -echo
             cursor_hide
           fi
+        fi
+        ;;
+      R) # Register a new repo
+        cursor_show
+        stty echo
+        echo ""
+        printf "${C_CYAN}Path to register (drag folder or Esc to cancel): ${C_RESET}"
+        local new_repo_path=""
+        if _read_or_esc new_repo_path; then
+          # Strip trailing whitespace and quotes (common when dragging folders into terminal)
+          new_repo_path="${new_repo_path## }"
+          new_repo_path="${new_repo_path%% }"
+          new_repo_path="${new_repo_path#\'}"
+          new_repo_path="${new_repo_path%\'}"
+          new_repo_path="${new_repo_path#\"}"
+          new_repo_path="${new_repo_path%\"}"
+          if [[ -n "$new_repo_path" ]]; then
+            local reg_output
+            reg_output=$( (cmd_repo_add "$new_repo_path") 2>&1 ) || true
+            if [[ -n "$reg_output" ]]; then
+              echo "$reg_output"
+              sleep 1.5
+            fi
+          fi
+        fi
+        stty -echo
+        cursor_hide
+        ;;
+      S) # Import an existing Claude session
+        cursor_show
+        stty echo
+        echo ""
+        local session_uid="" _s_cancelled=false
+        printf "${C_CYAN}Claude session UID (Esc to cancel): ${C_RESET}"
+        if ! _read_or_esc session_uid; then _s_cancelled=true; fi
+        session_uid="${session_uid## }"
+        session_uid="${session_uid%% }"
+        if ! $_s_cancelled && [[ -n "$session_uid" ]]; then
+          # Auto-detect repo
+          local sess_repo=""
+          sess_repo=$(_find_session_repo "$session_uid") || true
+          if [[ -z "$sess_repo" ]]; then
+            # Fallback: use filtered repo or picker
+            if [[ "$filter_mode" != "all" ]]; then
+              sess_repo="$filter_mode"
+              echo "${C_DIM}Session not found in Claude projects; using filtered repo '${sess_repo}'${C_RESET}"
+            else
+              echo "${C_YELLOW}Could not auto-detect repo. Select one (Esc to cancel):${C_RESET}"
+              local -a sp_repos=()
+              local sp_idx=1
+              for rn in "${_repo_names[@]}"; do
+                [[ -n "${_repo_stale[$rn]:-}" ]] && continue
+                sp_repos+=("$rn")
+                echo "  ${sp_idx}) ${rn}"
+                sp_idx=$((sp_idx + 1))
+              done
+              if [[ ${#sp_repos[@]} -eq 1 ]]; then
+                sess_repo="${sp_repos[0]}"
+              elif [[ ${#sp_repos[@]} -gt 1 ]]; then
+                printf "${C_CYAN}Choice: ${C_RESET}"
+                local sp_choice=""
+                if ! _read_or_esc sp_choice; then _s_cancelled=true; fi
+                if ! $_s_cancelled && [[ "$sp_choice" =~ ^[0-9]+$ ]]; then
+                  sp_choice=$((sp_choice - 1))
+                  if [[ $sp_choice -ge 0 && $sp_choice -lt ${#sp_repos[@]} ]]; then
+                    sess_repo="${sp_repos[$sp_choice]}"
+                  fi
+                fi
+              fi
+            fi
+          else
+            echo "${C_GREEN}Detected repo: ${sess_repo}${C_RESET}"
+          fi
+          if ! $_s_cancelled && [[ -n "$sess_repo" ]]; then
+            printf "${C_CYAN}Title (Enter to skip, Esc to cancel): ${C_RESET}"
+            local sess_title=""
+            if ! _read_or_esc sess_title; then _s_cancelled=true; fi
+            if ! $_s_cancelled; then
+              local sess_output
+              local sess_args=("$session_uid" --repo "$sess_repo")
+              [[ -n "$sess_title" ]] && sess_args+=(--title "$sess_title")
+              sess_output=$( (cmd_session "${sess_args[@]}") 2>&1 ) || true
+              if [[ -n "$sess_output" ]]; then
+                echo "$sess_output"
+              fi
+            fi
+          fi
+        fi
+        stty -echo
+        cursor_hide
+        ;;
+      t) # Rename focused task
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local cur_title="${_task_title[$sel_id]}"
+          cursor_show
+          stty echo
+          echo ""
+          printf "${C_CYAN}Rename '${sel_id}' [${cur_title}] (Esc to cancel): ${C_RESET}"
+          local rename_input=""
+          if _read_or_esc rename_input && [[ -n "$rename_input" ]]; then
+            update_task_field "$sel_id" "title" "$rename_input"
+          fi
+          stty -echo
+          cursor_hide
         fi
         ;;
       p) # Pause active task
@@ -1476,40 +2587,132 @@ cmd__dash_loop() {
   done
 }
 
+# ── Help ───────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}cloard-board${C_RESET} v${VERSION}
+multi-repo tmux kanban dashboard for Claude Code worktree sessions
+
+${C_BOLD}USAGE${C_RESET}
+  cloard-board <command> [args]
+
+${C_BOLD}REPO MANAGEMENT${C_RESET}
+  repo add <path>              Register a directory (git or non-git)
+  repo remove <name>           Unregister a repo
+  repo list [--all]            List registered repos
+  repo update-path <name> <p>  Update a repo's directory path
+  repo archive <name>          Hide repo from dashboard
+  repo unarchive <name>        Restore an archived repo
+
+${C_BOLD}TASK COMMANDS${C_RESET}
+  add [--title "..."] [--repo] Add a task (title optional, auto-ID)
+                               Options: --no-worktree
+  session <uid> [--repo] [--title]  Import a Claude session by UID
+  title <id> <new-title>       Rename a task
+  start <id> [prompt]          Start Claude in a worktree (status: active)
+  pause <id>                   Pause a task (kill window, keep worktree)
+  go <id>                      Switch to a task's tmux window
+  resume <id>                  Reopen with claude --continue
+  advance <id>                 Move task to next status
+  review <id>                  Push branch, create PR (status: review)
+  done <id>                    Clean up worktree and window (status: done)
+  rm <id>                      Remove a task entirely
+  list [--repo name]           Print all tasks as a table
+  status <id>                  Show task and Claude status
+  signal <id> <status>         Set Claude status (working|waiting|clear)
+
+${C_BOLD}DASHBOARD${C_RESET}
+  dash                         Open the interactive kanban dashboard
+  attach                       Attach to the cloard-board tmux session
+  doctor                       Check for orphaned worktrees/windows
+
+${C_BOLD}SETUP${C_RESET}
+  init                         Register current directory as a repo
+
+${C_BOLD}OPTIONS${C_RESET}
+  --help, -h                   Show this help
+  --version, -v                Show version
+
+${C_BOLD}EXAMPLES${C_RESET}
+  cloard-board repo add ~/code/my-api
+  cloard-board repo add ~/scripts
+  cloard-board add --title "Fix auth bug" --repo my-api
+  cloard-board add --repo my-api --no-worktree
+  cloard-board session abc123-def4-5678 --repo my-api
+  cloard-board title t-001 "Better task name"
+  cloard-board start t-001 "Fix the auth redirect loop"
+  cloard-board dash
+  cloard-board repo list
+
+${C_BOLD}DASHBOARD KEYS${C_RESET}
+  All-repos view:
+    j/k         Move between repo rows
+    h/l         Move between columns
+    Enter       Zoom into repo (card-level nav)
+    Esc         Zoom out to repo-level nav
+    Tab         Next filter (All > Repo1 > Repo2 > ... > All)
+    Shift-Tab   Previous filter
+
+  Card-level / filtered view:
+    j/k         Move between cards (overflows to next repo in all-repos view)
+    h/l         Move between columns
+    Enter       Open/start/attach to task
+    o           Quick-create and start a Claude session
+    S           Import an existing Claude session by UID
+    t           Rename focused task
+    p           Pause task
+    x           Done/remove task
+    </>         Move task left/right
+    s           Show shell output
+    d           Show git diff
+    R           Register a new repo
+    q           Quit (detach)
+EOF
+}
+
+cmd_version() { echo "cloard-board v${VERSION}"; }
+
 # ── Main dispatcher ────────────────────────────────────────────────────────────
 main() {
   require_cmd jq
   require_cmd tmux
-  require_cmd git
-
-  # Anchor to repo root for consistent state file location regardless of CWD
-  local _root
-  _root=$(git rev-parse --show-toplevel 2>/dev/null) && cd "$_root" || true
 
   local cmd="${1:-help}"
   shift 2>/dev/null || true
 
   case "$cmd" in
-    init)       cmd_init "$@" ;;
-    add)        cmd_add "$@" ;;
-    list|ls)    cmd_list "$@" ;;
-    start)      cmd_start "$@" ;;
-    go)         cmd_go "$@" ;;
-    dash)       cmd_dash "$@" ;;
-    attach)     cmd_attach "$@" ;;
-    advance)    cmd_advance "$@" ;;
-    review)     cmd_review "$@" ;;
-    done)       cmd_done "$@" ;;
-    pause)      cmd_pause "$@" ;;
-    resume)     cmd_resume "$@" ;;
-    rm|remove)  cmd_rm "$@" ;;
-    status)     cmd_status "$@" ;;
-    signal)     cmd_signal "$@" ;;
-    doctor)     cmd_doctor "$@" ;;
-    _dash_loop) cmd__dash_loop "$@" ;;
-    help|-h|--help)    cmd_help ;;
-    version|-v|--version) cmd_version ;;
-    *)          die "unknown command: ${cmd}; run 'cloard-board help'" ;;
+    # Fast paths (no ensure_global_state)
+    help|-h|--help)        cmd_help ;;
+    version|-v|--version)  cmd_version ;;
+    signal)                cmd_signal "$@" ;;
+    # Standard commands (ensure global state first)
+    *)
+      ensure_global_state
+      check_and_migrate
+      case "$cmd" in
+        init)       cmd_init "$@" ;;
+        repo)       cmd_repo "$@" ;;
+        add)        cmd_add "$@" ;;
+        title)      cmd_title "$@" ;;
+        session)    cmd_session "$@" ;;
+        list|ls)    cmd_list "$@" ;;
+        start)      cmd_start "$@" ;;
+        go)         cmd_go "$@" ;;
+        dash)       cmd_dash "$@" ;;
+        attach)     cmd_attach "$@" ;;
+        advance)    cmd_advance "$@" ;;
+        review)     cmd_review "$@" ;;
+        done)       cmd_done "$@" ;;
+        pause)      cmd_pause "$@" ;;
+        resume)     cmd_resume "$@" ;;
+        rm|remove)  cmd_rm "$@" ;;
+        status)     cmd_status "$@" ;;
+        doctor)     cmd_doctor "$@" ;;
+        _dash_loop) cmd__dash_loop "$@" ;;
+        *)          die "unknown command: ${cmd}; run 'cloard-board help'" ;;
+      esac
+      ;;
   esac
 }
 
