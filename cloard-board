@@ -12,7 +12,7 @@ readonly TMUX_SOCKET="cloard-board"
 readonly STATE_DIR=".cloard-board"
 readonly STATE_FILE="${STATE_DIR}/tasks.json"
 readonly INIT_SCRIPT="${STATE_DIR}/init.sh"
-readonly DASH_REFRESH=1  # seconds between dashboard refreshes
+readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
 
 # ── Colours (ANSI) ────────────────────────────────────────────────────────────
 readonly C_RESET=$'\e[0m'
@@ -91,6 +91,8 @@ tmux_session_exists() {
 ensure_tmux_session() {
   if ! tmux_session_exists; then
     tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50 -c "$PWD"
+    tmux_cmd bind-key -T prefix b select-window -t "board:dashboard"
+    pin_dashboard_to_zero
     # The dashboard window will be started by 'dash' command
   fi
 }
@@ -104,6 +106,7 @@ tmux_create_window() {
   local name="$1"
   shift
   tmux_cmd new-window -t "board" -n "$name" "$@"
+  pin_dashboard_to_zero
 }
 
 tmux_kill_window() {
@@ -116,6 +119,15 @@ tmux_kill_window() {
 tmux_select_window() {
   local name="$1"
   tmux_cmd select-window -t "board:$name" 2>/dev/null
+}
+
+pin_dashboard_to_zero() {
+  local dash_idx
+  dash_idx=$(tmux_cmd list-windows -t "board" -F '#{window_name} #{window_index}' 2>/dev/null \
+    | awk '$1 == "dashboard" { print $2 }')
+  if [[ -n "$dash_idx" && "$dash_idx" != "0" ]]; then
+    tmux_cmd swap-window -s "board:dashboard" -t "board:0" 2>/dev/null || true
+  fi
 }
 
 # ── Worktree helpers ───────────────────────────────────────────────────────────
@@ -154,6 +166,8 @@ ${C_BOLD}COMMANDS${C_RESET}
   list                        Print all tasks as a table
   rm <id>                     Remove a task entirely
   advance <id>                Move task to next status
+  status <id>                 Show task and Claude status
+  signal <id> <status>        Set Claude status (working|waiting|clear)
   doctor                      Check for orphaned worktrees/windows
 
 ${C_BOLD}OPTIONS${C_RESET}
@@ -177,42 +191,94 @@ cmd_version() { echo "cloard-board v${VERSION}"; }
 
 cmd_init() {
   if [[ -f "$STATE_FILE" ]]; then
-    warn "already initialised at ${STATE_DIR}/"
-    return 0
-  fi
-
-  # Detect project name from git toplevel or current directory
-  local project
-  local _git_root
-  _git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-  if [[ -n "$_git_root" ]]; then
-    project=$(basename "$_git_root")
+    info "already initialised at ${STATE_DIR}/"
   else
-    project=$(basename "$PWD")
-  fi
-
-  # Detect default branch
-  local base_branch
-  base_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@refs/remotes/origin/@@' || echo "main")
-
-  mkdir -p "$STATE_DIR"
-
-  # Use jq to produce valid JSON (avoids injection from special chars in project/branch names)
-  jq -n --arg p "$project" --arg b "$base_branch" \
-    '{version: 1, project: $p, base_branch: $b, tasks: []}' > "$STATE_FILE"
-
-  # Add to .gitignore if not already there
-  if [[ -f .gitignore ]]; then
-    if ! grep -qx '.cloard-board/' .gitignore 2>/dev/null; then
-      echo '.cloard-board/' >> .gitignore
-      info "added .cloard-board/ to .gitignore"
+    # Detect project name from git toplevel or current directory
+    local project
+    local _git_root
+    _git_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [[ -n "$_git_root" ]]; then
+      project=$(basename "$_git_root")
+    else
+      project=$(basename "$PWD")
     fi
-  else
-    echo '.cloard-board/' > .gitignore
-    info "created .gitignore with .cloard-board/"
+
+    # Detect default branch
+    local base_branch
+    base_branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@refs/remotes/origin/@@' || echo "main")
+
+    mkdir -p "$STATE_DIR"
+
+    # Use jq to produce valid JSON (avoids injection from special chars in project/branch names)
+    jq -n --arg p "$project" --arg b "$base_branch" \
+      '{version: 1, project: $p, base_branch: $b, tasks: []}' > "$STATE_FILE"
+
+    # Add to .gitignore if not already there
+    if [[ -f .gitignore ]]; then
+      if ! grep -qx '.cloard-board/' .gitignore 2>/dev/null; then
+        echo '.cloard-board/' >> .gitignore
+        info "added .cloard-board/ to .gitignore"
+      fi
+    else
+      echo '.cloard-board/' > .gitignore
+      info "created .gitignore with .cloard-board/"
+    fi
+
+    ok "initialised ${STATE_DIR}/ for project '${project}' (base: ${base_branch})"
   fi
 
-  ok "initialised ${STATE_DIR}/ for project '${project}' (base: ${base_branch})"
+  # Set up Claude Code hooks (idempotent; runs on both init and re-init)
+  mkdir -p "${STATE_DIR}/hooks"
+
+  cat > "${STATE_DIR}/hooks/on-stop.sh" <<'HOOK'
+#!/usr/bin/env bash
+# cloard-board hook: set task status to "waiting" when Claude stops
+[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
+[[ -n "${CLOARD_BOARD_DIR:-}" ]] || exit 0
+(cd "$CLOARD_BOARD_DIR" && cloard-board signal "$CLOARD_TASK_ID" waiting) &>/dev/null &
+HOOK
+  chmod +x "${STATE_DIR}/hooks/on-stop.sh"
+
+  cat > "${STATE_DIR}/hooks/on-prompt.sh" <<'HOOK'
+#!/usr/bin/env bash
+# cloard-board hook: set task status to "working" when user submits a prompt
+[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
+[[ -n "${CLOARD_BOARD_DIR:-}" ]] || exit 0
+(cd "$CLOARD_BOARD_DIR" && cloard-board signal "$CLOARD_TASK_ID" working) &>/dev/null &
+HOOK
+  chmod +x "${STATE_DIR}/hooks/on-prompt.sh"
+
+  # Register hooks in .claude/settings.json (merge, don't overwrite)
+  mkdir -p .claude
+  local settings_file=".claude/settings.json"
+  local new_hooks
+  new_hooks=$(jq -n '{
+    "Stop": [{"hooks": [{"type": "command", "command": ".cloard-board/hooks/on-stop.sh"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": ".cloard-board/hooks/on-prompt.sh"}]}]
+  }')
+
+  if [[ -f "$settings_file" ]]; then
+    local tmp_settings
+    tmp_settings=$(mktemp)
+    # Merge hooks: remove any existing cloard-board entries, then append ours
+    # This preserves other hooks for the same event types and is idempotent
+    jq --argjson new_hooks "$new_hooks" '
+      .hooks = ((.hooks // {}) |
+        reduce ($new_hooks | to_entries[]) as $entry (.;
+          .[$entry.key] = (
+            [(.[$entry.key] // [])[] |
+              select(.hooks | all(.command | test("cloard-board") | not))
+            ] + $entry.value
+          )
+        )
+      )
+    ' "$settings_file" > "$tmp_settings" \
+      && mv "$tmp_settings" "$settings_file"
+  else
+    jq -n --argjson hooks "$new_hooks" '{hooks: $hooks}' > "$settings_file"
+  fi
+
+  ok "hooks configured in .claude/settings.json"
 }
 
 cmd_add() {
@@ -261,7 +327,8 @@ cmd_add() {
       pr_url: null,
       created_at: $now,
       started_at: null,
-      completed_at: null
+      completed_at: null,
+      claude_status: null
     }]' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
 
   ok "added task '${id}': ${title}"
@@ -278,10 +345,10 @@ cmd_list() {
   fi
 
   # Print table header
-  printf "\n${C_BOLD}%-20s %-15s %-40s %-10s${C_RESET}\n" "ID" "STATUS" "TITLE" "PR"
-  printf "%-20s %-15s %-40s %-10s\n" "$(printf '%0.s─' {1..20})" "$(printf '%0.s─' {1..15})" "$(printf '%0.s─' {1..40})" "$(printf '%0.s─' {1..10})"
+  printf "\n${C_BOLD}%-20s %-15s %-40s %-12s %-10s${C_RESET}\n" "ID" "STATUS" "TITLE" "CLAUDE" "PR"
+  printf "%-20s %-15s %-40s %-12s %-10s\n" "$(printf '%0.s─' {1..20})" "$(printf '%0.s─' {1..15})" "$(printf '%0.s─' {1..40})" "$(printf '%0.s─' {1..12})" "$(printf '%0.s─' {1..10})"
 
-  jq -r '.tasks[] | [.id, .status, .title, (.pr_url // "")] | @tsv' "$STATE_FILE" | while IFS=$'\t' read -r t_id t_status t_title t_pr; do
+  jq -r '.tasks[] | [.id, .status, .title, (.claude_status // ""), (.pr_url // "")] | @tsv' "$STATE_FILE" | while IFS=$'\t' read -r t_id t_status t_title t_claude t_pr; do
     local color="$C_RESET"
     case "$t_status" in
       pending)      color="$C_DIM" ;;
@@ -295,7 +362,10 @@ cmd_list() {
     if [[ -n "$t_pr" ]]; then
       pr_display=$(echo "$t_pr" | grep -oE '#[0-9]+' || echo "$t_pr")
     fi
-    printf "${color}%-20s %-15s %-40s %-10s${C_RESET}\n" "$t_id" "$t_status" "${t_title:0:40}" "$pr_display"
+    local claude_display=""
+    [[ "$t_claude" == "working" ]] && claude_display="● working"
+    [[ "$t_claude" == "waiting" ]] && claude_display="○ waiting"
+    printf "${color}%-20s %-15s %-40s %-12s %-10s${C_RESET}\n" "$t_id" "$t_status" "${t_title:0:40}" "$claude_display" "$pr_display"
   done
   echo
 }
@@ -338,7 +408,7 @@ cmd_start() {
 
     local safe_pwd
     safe_pwd=${(q)${PWD}}
-    tmux_create_window "$id" "zsh" "-c" "cd ${safe_pwd} && ${claude_cmd}; zsh"
+    tmux_create_window "$id" "zsh" "-c" "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_pwd} && cd ${safe_pwd} && ${claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
     if [[ "$wt_mode" == "none" ]]; then
       info "created tmux window '${id}' with claude (no worktree)"
     else
@@ -417,6 +487,7 @@ cmd_advance() {
       ;;
     active)
       update_task_field "$id" "status" "needs_review"
+      update_task_field_raw "$id" "claude_status" "null"
       ok "advanced '${id}': active -> needs_review"
       ;;
     needs_review)
@@ -489,6 +560,7 @@ Created by cloard-board." 2>/dev/null) || die "gh pr create failed"
   pr_number=$(cd "$work_dir" && gh pr view --json number -q '.number' 2>/dev/null || true)
 
   update_task_field "$id" "status" "review"
+  update_task_field_raw "$id" "claude_status" "null"
   update_task_field "$id" "pr_url" "$pr_url"
   if [[ -n "$pr_number" ]]; then
     update_task_field_raw "$id" "pr_number" "$pr_number"
@@ -526,6 +598,7 @@ cmd_done() {
 
   update_task_field "$id" "status" "done"
   update_task_field "$id" "completed_at" "$(now_iso)"
+  update_task_field_raw "$id" "claude_status" "null"
 
   ok "task '${id}' marked done; window and worktree cleaned up"
 }
@@ -544,6 +617,7 @@ cmd_pause() {
   tmux_kill_window "$id"
 
   update_task_field "$id" "status" "paused"
+  update_task_field_raw "$id" "claude_status" "null"
 
   ok "paused task '${id}'; worktree and branch preserved"
 }
@@ -571,7 +645,7 @@ cmd_resume() {
     if [[ "$wt_mode" == "none" ]]; then
       local safe_pwd
       safe_pwd=${(q)${PWD}}
-      tmux_create_window "$id" "zsh" "-c" "cd ${safe_pwd} && claude --continue --dangerously-skip-permissions; zsh"
+      tmux_create_window "$id" "zsh" "-c" "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_pwd} && cd ${safe_pwd} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
       info "created tmux window '${id}' with claude --continue (no worktree)"
     else
       local wt_path
@@ -581,7 +655,8 @@ cmd_resume() {
       fi
       local safe_wt_path
       safe_wt_path=${(q)${wt_path}}
-      tmux_create_window "$id" "zsh" "-c" "cd ${safe_wt_path} && claude --continue --dangerously-skip-permissions; zsh"
+      local safe_board_dir=${(q)${PWD}}
+      tmux_create_window "$id" "zsh" "-c" "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_board_dir} && cd ${safe_wt_path} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
       info "created tmux window '${id}' with claude --continue"
     fi
   fi
@@ -629,6 +704,60 @@ cmd_rm() {
     && mv "$tmp" "$STATE_FILE"
 
   ok "removed task '${id}'"
+}
+
+cmd_status() {
+  require_init
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "usage: cloard-board status <id>"
+  task_exists "$id" || die "task '$id' not found"
+
+  local tsk_status claude_status title
+  tsk_status=$(task_status "$id")
+  claude_status=$(task_field "$id" "claude_status")
+  title=$(task_field "$id" "title")
+
+  echo "${C_BOLD}${id}${C_RESET}: ${title}"
+  echo "  task:   ${tsk_status}"
+  if [[ "$claude_status" == "working" ]]; then
+    echo "  claude: ${C_GREEN}● working${C_RESET}"
+  elif [[ "$claude_status" == "waiting" ]]; then
+    echo "  claude: ${C_YELLOW}○ waiting${C_RESET}"
+  else
+    echo "  claude: ${C_DIM}no status${C_RESET}"
+  fi
+}
+
+cmd_signal() {
+  require_init
+  local id="${1:-}"
+  local signal="${2:-}"
+
+  [[ -n "$id" ]] || { warn "usage: cloard-board signal <id> <working|waiting|clear>"; return 1; }
+  [[ -n "$signal" ]] || { warn "usage: cloard-board signal <id> <working|waiting|clear>"; return 1; }
+
+  if ! task_exists "$id"; then
+    warn "task '$id' not found (may have been removed)"
+    return 0
+  fi
+
+  case "$signal" in
+    working|waiting)
+      # Only update if task is still active (prevents race with pause/done/review)
+      local tsk_status
+      tsk_status=$(task_status "$id")
+      if [[ "$tsk_status" == "active" ]]; then
+        update_task_field "$id" "claude_status" "$signal"
+      fi
+      ;;
+    clear)
+      update_task_field_raw "$id" "claude_status" "null"
+      ;;
+    *)
+      warn "unknown signal: ${signal}; expected working, waiting, or clear"
+      return 1
+      ;;
+  esac
 }
 
 cmd_doctor() {
@@ -732,6 +861,84 @@ hline() {
   printf '%*s' "$width" '' | tr ' ' "$char"
 }
 
+# ── Dashboard snapshot helpers (single-jq optimization) ────────────────────────
+
+# Snapshot all tasks into associative + indexed arrays (1 jq call per frame)
+# Relies on caller declaring: typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode
+#   local -a _col0_ids .. _col4_ids; local _project_name _task_count
+_snapshot_tasks() {
+  _task_status=()
+  _task_title=()
+  _task_pr=()
+  _task_claude=()
+  _task_wtmode=()
+  _col0_ids=()
+  _col1_ids=()
+  _col2_ids=()
+  _col3_ids=()
+  _col4_ids=()
+  _project_name=""
+  _task_count=0
+
+  local _snap
+  # Use RS (Record Separator U+001E) as delimiter; tab is IFS-whitespace
+  # and consecutive empty fields would collapse under POSIX read rules.
+  _snap=$(jq -r '
+    ([.project, (.tasks | length | tostring)] | join("\u001e")),
+    (.tasks[] | [
+      .id,
+      .status,
+      (.title // ""),
+      (.pr_url // ""),
+      (.claude_status // ""),
+      (.worktree_mode // "worktree")
+    ] | join("\u001e"))
+  ' "$STATE_FILE" 2>/dev/null) || return 0
+
+  local _first=true
+  while IFS=$'\x1e' read -r _f1 _f2 _f3 _f4 _f5 _f6; do
+    if $_first; then
+      _project_name="$_f1"
+      _task_count="$_f2"
+      _first=false
+      continue
+    fi
+    _task_status[$_f1]="$_f2"
+    _task_title[$_f1]="$_f3"
+    _task_pr[$_f1]="$_f4"
+    _task_claude[$_f1]="$_f5"
+    _task_wtmode[$_f1]="$_f6"
+    case "$_f2" in
+      pending|paused) _col0_ids+=("$_f1") ;;
+      active)         _col1_ids+=("$_f1") ;;
+      needs_review)   _col2_ids+=("$_f1") ;;
+      review)         _col3_ids+=("$_f1") ;;
+      done)           _col4_ids+=("$_f1") ;;
+    esac
+  done <<< "$_snap"
+}
+
+# O(1) task lookup by column and row index; sets _tid
+_get_task_at() {
+  local _col="$1" _row="$2"
+  case $_col in
+    0) _tid="${_col0_ids[$_row]:-}" ;;
+    1) _tid="${_col1_ids[$_row]:-}" ;;
+    2) _tid="${_col2_ids[$_row]:-}" ;;
+    3) _tid="${_col3_ids[$_row]:-}" ;;
+    4) _tid="${_col4_ids[$_row]:-}" ;;
+    *) _tid="" ;;
+  esac
+}
+
+# Get selected task ID for current cursor position; sets _tid, returns 1 if none
+_get_selected_id() {
+  _tid=""
+  [[ ${col_counts[$cur_col]:-0} -gt 0 ]] || return 1
+  _get_task_at "$cur_col" "${cur_row[$cur_col]}"
+  [[ -n "$_tid" ]] || return 1
+}
+
 # Move cursor
 move_to() { printf '\e[%d;%dH' "$1" "$2"; }
 
@@ -759,6 +966,7 @@ cmd_dash() {
     safe_pwd=${(q)${PWD}}
     safe_script=${(q)${SCRIPT_PATH}}
     tmux_cmd respawn-window -k -t "board:dashboard" "cd ${safe_pwd} && exec ${safe_script} _dash_loop"
+    pin_dashboard_to_zero
     tmux_cmd attach -t "board:dashboard"
     return
   fi
@@ -777,11 +985,22 @@ cmd_dash() {
 cmd__dash_loop() {
   require_init
   set +x  # Disable any inherited trace mode (set -x) that would corrupt TUI output
+  set +e  # Prevent unguarded commands from killing the TUI loop
   setopt TYPESET_SILENT 2>/dev/null  # Prevent zsh from printing variable values on re-declaration
+
+  # Load zsh/datetime for optional CLOARD_DEBUG frame timing
+  zmodload zsh/datetime 2>/dev/null || true
 
   # State: current column and row selection
   local cur_col=0
   local -a cur_row=(0 0 0 0 0)  # per-column cursor
+
+  # Declare snapshot arrays (persist across loop iterations, modified by _snapshot_tasks via dynamic scope)
+  typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode
+  local -a _col0_ids _col1_ids _col2_ids _col3_ids _col4_ids
+  local _project_name="" _task_count=0
+  local _tid=""  # scratch variable used by _get_task_at / _get_selected_id
+  local -a col_counts=(0 0 0 0 0)  # column counts; declared at function scope for _get_selected_id visibility
 
   # Trap to restore terminal on exit
   cleanup_dash() {
@@ -800,23 +1019,28 @@ cmd__dash_loop() {
   while read -rsk1 -t 0.05 _discard 2>/dev/null; do :; done
 
   while true; do
+    # Optional debug timing
+    local _t0=""
+    [[ "${CLOARD_DEBUG:-}" == "1" ]] && _t0=${EPOCHREALTIME:-}
+
     # Terminal dimensions
     local cols=$(tput cols)
     local rows=$(tput lines)
     local col_width=$(( (cols - 2) / 5 ))
     local card_inner=$(( col_width - 4 ))
 
-    # Gather tasks per column
-    local -a col_tasks
-    local -a col_counts
+    # Snapshot all task data in a single jq call (replaces ~47 per-field jq calls)
+    _snapshot_tasks
+
+    # Compute column counts from cached arrays
+    col_counts[0]=${#_col0_ids[@]}
+    col_counts[1]=${#_col1_ids[@]}
+    col_counts[2]=${#_col2_ids[@]}
+    col_counts[3]=${#_col3_ids[@]}
+    col_counts[4]=${#_col4_ids[@]}
+
+    # Clamp cursors
     for i in {0..4}; do
-      col_tasks[$i]=$(tasks_for_column "$i")
-      if [[ -z "${col_tasks[$i]}" ]]; then
-        col_counts[$i]=0
-      else
-        col_counts[$i]=$(echo "${col_tasks[$i]}" | wc -l | tr -d ' ')
-      fi
-      # Clamp cursor
       if [[ ${cur_row[$i]} -ge ${col_counts[$i]} ]] && [[ ${col_counts[$i]} -gt 0 ]]; then
         cur_row[$i]=$(( col_counts[$i] - 1 ))
       elif [[ ${col_counts[$i]} -eq 0 ]]; then
@@ -824,11 +1048,18 @@ cmd__dash_loop() {
       fi
     done
 
-    printf '\033[H'  # Cursor home (no screen erase = no blank flash frame)
+    # Pre-compute border strings (subprocess-free via zsh loop)
+    local _border_card="" _border_full="" _i
+    for (( _i=0; _i<card_inner; _i++ )); do _border_card+="─"; done
+    for (( _i=0; _i<cols; _i++ )); do _border_full+="─"; done
+
+    # Begin frame buffer (single output at end eliminates tearing)
+    local _frame=""
 
     # Title bar
-    local title_str="  cloard-board | $(jq -r '.project' "$STATE_FILE") | $(jq '.tasks | length' "$STATE_FILE") tasks"
-    printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}\n" "$title_str"
+    local title_str="  cloard-board | $_project_name | $_task_count tasks"
+    _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}" "$title_str")
+    _frame+=$'\n'
 
     # Column headers
     local header_line=""
@@ -842,10 +1073,10 @@ cmd__dash_loop() {
       hdr=$(trunc "$hdr" "$col_width")
       header_line+=$(printf "${selected}${cc}%-${col_width}s${C_RESET}" "$hdr")
     done
-    echo "$header_line"
+    _frame+="$header_line"$'\n'
 
-    # Separator
-    printf '%s\n' "$(hline "$cols" "─")"
+    # Separator (pre-computed, no subprocess)
+    _frame+="$_border_full"$'\n'
 
     # Render cards: iterate rows
     local max_cards=0
@@ -853,7 +1084,7 @@ cmd__dash_loop() {
       [[ ${col_counts[$i]} -gt $max_cards ]] && max_cards=${col_counts[$i]}
     done
 
-    # Card height: 4 lines (id, title line 1, title line 2/pr, blank)
+    # Card height: 5 lines (top border, id, title, status/pr, bottom border)
     local card_height=5
     local max_visible_rows=$(( (rows - 5) / card_height ))
     [[ $max_cards -gt $max_visible_rows ]] && max_cards=$max_visible_rows
@@ -868,33 +1099,25 @@ cmd__dash_loop() {
         local output=""
         for col_idx in {0..4}; do
           local cc=$(col_color "$col_idx")
-          local task_id=""
 
-          # Get the task_id at this row for this column
-          local idx=0
-          while IFS= read -r tid; do
-            [[ -z "$tid" ]] && continue
-            if [[ $idx -eq $row_idx ]]; then
-              task_id="$tid"
-              break
-            fi
-            idx=$((idx+1))
-          done <<< "${col_tasks[$col_idx]}"
+          # O(1) task lookup via indexed array (replaces O(n) while-read scan)
+          _get_task_at "$col_idx" "$row_idx"
+          local task_id="$_tid"
 
           if [[ -z "$task_id" ]]; then
             # Empty cell
             output+=$(printf '%-*s' "$col_width" "")
           else
-            # Override color for paused tasks in the pending column
-            if [[ $col_idx -eq 0 ]] && [[ "$(task_field "$task_id" "status")" == "paused" ]]; then
+            # Override color for paused tasks in the pending column (cached lookup)
+            if [[ $col_idx -eq 0 ]] && [[ "${_task_status[$task_id]}" == "paused" ]]; then
               cc="$C_CYAN"
             fi
 
             local is_selected=false
             [[ $col_idx -eq $cur_col && ${cur_row[$col_idx]} -eq $row_idx ]] && is_selected=true
 
-            local title=$(task_field "$task_id" "title")
-            local pr=$(task_field "$task_id" "pr_url")
+            local title="${_task_title[$task_id]}"
+            local pr="${_task_pr[$task_id]}"
             local pr_short=""
             [[ -n "$pr" ]] && pr_short=$(echo "$pr" | grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
 
@@ -907,11 +1130,11 @@ cmd__dash_loop() {
 
             local cell=""
             case $line in
-              0) # Top border
+              0) # Top border (pre-computed border string)
                 if $is_selected; then
-                  cell=$(printf "${sel_color}${sel_prefix}┌%s┐${C_RESET}" "$(hline $((card_inner)) "─")")
+                  cell=$(printf "${sel_color}${sel_prefix}┌%s┐${C_RESET}" "$_border_card")
                 else
-                  cell=$(printf "${cc} ┌%s┐${C_RESET}" "$(hline $((card_inner)) "─")")
+                  cell=$(printf "${cc} ┌%s┐${C_RESET}" "$_border_card")
                 fi
                 ;;
               1) # ID line
@@ -930,21 +1153,38 @@ cmd__dash_loop() {
                   cell=$(printf "${cc} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
                 fi
                 ;;
-              3) # PR/extra line
+              3) # Status/PR line (cached claude_status lookup)
+                local cstatus="${_task_claude[$task_id]}"
                 local extra=""
-                [[ -n "$pr_short" ]] && extra="$pr_short"
+                local extra_color=""
+                if [[ "$cstatus" == "working" ]]; then
+                  extra="● working"
+                  extra_color="${C_GREEN}"
+                elif [[ "$cstatus" == "waiting" ]]; then
+                  extra="○ waiting"
+                  extra_color="${C_YELLOW}"
+                fi
+                if [[ -n "$pr_short" ]]; then
+                  if [[ -n "$extra" ]]; then
+                    extra="${extra} ${pr_short}"
+                  else
+                    extra="$pr_short"
+                  fi
+                fi
                 extra=$(trunc "$extra" $((card_inner - 1)))
                 if $is_selected; then
                   cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
+                elif [[ -n "$extra_color" ]]; then
+                  cell=$(printf "${cc} │${extra_color}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${extra}")
                 else
                   cell=$(printf "${cc}${C_DIM} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
                 fi
                 ;;
-              4) # Bottom border
+              4) # Bottom border (pre-computed border string)
                 if $is_selected; then
-                  cell=$(printf "${sel_color} └%s┘${C_RESET}" "$(hline $((card_inner)) "─")")
+                  cell=$(printf "${sel_color} └%s┘${C_RESET}" "$_border_card")
                 else
-                  cell=$(printf "${cc} └%s┘${C_RESET}" "$(hline $((card_inner)) "─")")
+                  cell=$(printf "${cc} └%s┘${C_RESET}" "$_border_card")
                 fi
                 ;;
             esac
@@ -955,16 +1195,22 @@ cmd__dash_loop() {
             [[ $pad -gt 0 ]] && output+=$(printf '%*s' "$pad" "")
           fi
         done
-        echo "$output"
+        _frame+="$output"$'\n'
       done
     done
 
-    # Clear everything below rendered content (removes stale rows from previous frame)
-    printf '\033[J'
+    # Output entire frame at once: cursor home + buffered frame + clear below
+    printf '\033[H%s\033[J' "$_frame"
 
     # Footer with keybindings
     move_to "$((rows - 1))" 1
-    printf "${C_DIM}  h/l: columns  j/k: tasks  Enter: attach  s: shell  m: advance  p: pause  o: new  x: done  d: diff  r: resume  q: quit${C_RESET}"
+    printf "${C_DIM}  h/l: columns  j/k: tasks  Enter: open  </> move  s: shell  p: pause  o: new  x: done  d: diff  q: quit  (^b b: here)${C_RESET}"
+
+    # Debug timing (CLOARD_DEBUG=1 logs frame render time)
+    if [[ -n "${_t0:-}" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
+      local _elapsed=$(( (EPOCHREALTIME - _t0) * 1000 ))
+      printf '%s frame: %.1fms\n' "$(date +%T)" "$_elapsed" >> /tmp/cloard-perf.log
+    fi
 
     # Read key with timeout (non-blocking refresh)
     # NOTE: zsh uses -k (not -n) to read N chars without waiting for newline
@@ -998,111 +1244,148 @@ cmd__dash_loop() {
         [[ ${cur_row[$cur_col]} -gt 0 ]] && cur_row[$cur_col]=$(( cur_row[$cur_col] - 1 ))
         ;;
       '') ;; # Timeout/no input: just refresh the display
-      $'\n') # Enter: attach to task window
-        if [[ ${col_counts[$cur_col]} -gt 0 ]]; then
-          local sel_id=$(echo "${col_tasks[$cur_col]}" | sed -n "$((cur_row[$cur_col] + 1))p")
-          if [[ -n "$sel_id" ]] && tmux_window_exists "$sel_id"; then
-            cursor_show
-            tmux_select_window "$sel_id"
-            # When we come back, hide cursor again
-            cursor_hide
+      $'\n'|$'\r') # Enter: open/interact with task based on status
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local cur_status="${_task_status[$sel_id]}"
+          case "$cur_status" in
+            pending)
+              # Start task: prompt for instructions so Claude begins working immediately
+              cursor_show
+              stty echo
+              local task_title="${_task_title[$sel_id]}"
+              echo ""
+              echo "${C_CYAN}Starting task '${sel_id}': ${task_title}${C_RESET}"
+              printf "${C_CYAN}Prompt for Claude (or Enter to skip): ${C_RESET}"
+              local task_prompt=""
+              read -r task_prompt
+              # Ask about worktree mode (cached lookup)
+              local dash_wt_mode="${_task_wtmode[$sel_id]}"
+              if [[ "$dash_wt_mode" != "none" ]]; then
+                printf "${C_CYAN}Use worktree? [Y/n]: ${C_RESET}"
+                local wt_choice=""
+                read -r wt_choice
+                if [[ "$wt_choice" =~ ^[nN]$ ]]; then
+                  dash_wt_mode="none"
+                  update_task_field "$sel_id" "worktree_mode" "none"
+                  update_task_field_raw "$sel_id" "branch" "null"
+                fi
+              fi
+              stty -echo
+              cursor_hide
+              local wt_path_existing=$(find_worktree_path "$sel_id")
+              if [[ -z "$wt_path_existing" ]]; then
+                local safe_cwd
+                safe_cwd=${(q)${PWD}}
+                local dash_claude_cmd
+                if [[ "$dash_wt_mode" == "none" ]]; then
+                  dash_claude_cmd="claude --dangerously-skip-permissions"
+                else
+                  dash_claude_cmd="claude --worktree ${sel_id} --dangerously-skip-permissions"
+                fi
+                if [[ -n "$task_prompt" ]]; then
+                  local escaped="${task_prompt//\'/\'\\\'\'}"
+                  dash_claude_cmd="${dash_claude_cmd} '${escaped}'"
+                fi
+                tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_cwd} && cd ${safe_cwd} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+              fi
+              update_task_field "$sel_id" "status" "active"
+              update_task_field "$sel_id" "started_at" "$(now_iso)"
+              tmux_select_window "$sel_id"
+              ;;
+            paused)
+              # Resume paused task (cached worktree_mode lookup)
+              local wt_mode_paused="${_task_wtmode[$sel_id]}"
+              if ! tmux_window_exists "$sel_id"; then
+                if [[ "$wt_mode_paused" == "none" ]]; then
+                  local safe_pwd_p
+                  safe_pwd_p=${(q)${PWD}}
+                  tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_pwd_p} && cd ${safe_pwd_p} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                else
+                  local wt_p=$(find_worktree_path "$sel_id")
+                  if [[ -n "$wt_p" ]]; then
+                    local safe_wt_p
+                    safe_wt_p=${(q)${wt_p}}
+                    local safe_board_dir_p=${(q)${PWD}}
+                    tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_board_dir_p} && cd ${safe_wt_p} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                  fi
+                fi
+              fi
+              update_task_field "$sel_id" "status" "active"
+              tmux_select_window "$sel_id"
+              ;;
+            active|needs_review|review)
+              # Attach to task window, recreating it if needed
+              if ! tmux_window_exists "$sel_id"; then
+                local wt_mode_act="${_task_wtmode[$sel_id]}"
+                if [[ "$wt_mode_act" == "none" ]]; then
+                  local safe_pwd_a
+                  safe_pwd_a=${(q)${PWD}}
+                  tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_pwd_a} && cd ${safe_pwd_a} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                else
+                  local wt_a=$(find_worktree_path "$sel_id")
+                  if [[ -n "$wt_a" ]]; then
+                    local safe_wt_a safe_board_a
+                    safe_wt_a=${(q)${wt_a}}
+                    safe_board_a=${(q)${PWD}}
+                    tmux_create_window "$sel_id" "zsh" "-c" "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_board_a} && cd ${safe_wt_a} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                  fi
+                fi
+              fi
+              cursor_show
+              tmux_select_window "$sel_id"
+              cursor_hide
+              ;;
+            done) ;; # No-op
+          esac
+        fi
+        ;;
+      '>'|'.') # Move task one status to the right
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local mv_status="${_task_status[$sel_id]}"
+          local -a status_order=("pending" "paused" "active" "needs_review" "review" "done")
+          local mv_idx=-1
+          for (( i=0; i<${#status_order[@]}; i++ )); do
+            [[ "${status_order[$i]}" == "$mv_status" ]] && mv_idx=$i
+          done
+          if [[ $mv_idx -ge 0 && $mv_idx -lt $((${#status_order[@]} - 1)) ]]; then
+            local next_status="${status_order[$((mv_idx + 1))]}"
+            if [[ "$mv_status" == "needs_review" && "$next_status" == "review" ]]; then
+              # Trigger PR creation flow
+              cursor_show
+              stty echo
+              echo ""
+              echo "${C_YELLOW}Review '${sel_id}': this will push the branch and create a PR.${C_RESET}"
+              printf "Proceed? [y/N] "
+              local confirm=""
+              read -r confirm
+              if [[ "$confirm" =~ ^[yY]$ ]]; then
+                (cmd_review "$sel_id") 2>&1 || true
+              fi
+              stty -echo
+              cursor_hide
+            elif [[ "$mv_status" == "review" && "$next_status" == "done" ]]; then
+              # Trigger cleanup flow
+              (cmd_done "$sel_id") 2>&1 || true
+            else
+              update_task_field "$sel_id" "status" "$next_status"
+            fi
           fi
         fi
         ;;
-      m) # Advance task
-        if [[ ${col_counts[$cur_col]} -gt 0 ]]; then
-          local sel_id=$(echo "${col_tasks[$cur_col]}" | sed -n "$((cur_row[$cur_col] + 1))p")
-          if [[ -n "$sel_id" ]]; then
-            local cur_status=$(task_status "$sel_id")
-            case "$cur_status" in
-              pending)
-                # Start task: prompt for instructions so Claude begins working immediately
-                cursor_show
-                stty echo
-                local task_title
-                task_title=$(task_field "$sel_id" "title")
-                echo ""
-                echo "${C_CYAN}Starting task '${sel_id}': ${task_title}${C_RESET}"
-                printf "${C_CYAN}Prompt for Claude (or Enter to skip): ${C_RESET}"
-                local task_prompt=""
-                read -r task_prompt
-                # Ask about worktree mode
-                local dash_wt_mode
-                dash_wt_mode=$(jq -r --arg id "$sel_id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")
-                if [[ "$dash_wt_mode" != "none" ]]; then
-                  printf "${C_CYAN}Use worktree? [Y/n]: ${C_RESET}"
-                  local wt_choice=""
-                  read -r wt_choice
-                  if [[ "$wt_choice" =~ ^[nN]$ ]]; then
-                    dash_wt_mode="none"
-                    update_task_field "$sel_id" "worktree_mode" "none"
-                    update_task_field_raw "$sel_id" "branch" "null"
-                  fi
-                fi
-                stty -echo
-                cursor_hide
-                local wt_path_existing=$(find_worktree_path "$sel_id")
-                if [[ -z "$wt_path_existing" ]]; then
-                  local safe_cwd
-                  safe_cwd=${(q)${PWD}}
-                  local dash_claude_cmd
-                  if [[ "$dash_wt_mode" == "none" ]]; then
-                    dash_claude_cmd="claude --dangerously-skip-permissions"
-                  else
-                    dash_claude_cmd="claude --worktree ${sel_id} --dangerously-skip-permissions"
-                  fi
-                  if [[ -n "$task_prompt" ]]; then
-                    local escaped="${task_prompt//\'/\'\\\'\'}"
-                    dash_claude_cmd="${dash_claude_cmd} '${escaped}'"
-                  fi
-                  tmux_create_window "$sel_id" "zsh" "-c" "cd ${safe_cwd} && ${dash_claude_cmd}; zsh"
-                fi
-                update_task_field "$sel_id" "status" "active"
-                update_task_field "$sel_id" "started_at" "$(now_iso)"
-                ;;
-              paused)
-                # Resume paused task
-                local wt_mode_paused
-                wt_mode_paused=$(jq -r --arg id "$sel_id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")
-                if ! tmux_window_exists "$sel_id"; then
-                  if [[ "$wt_mode_paused" == "none" ]]; then
-                    local safe_pwd_p
-                    safe_pwd_p=${(q)${PWD}}
-                    tmux_create_window "$sel_id" "zsh" "-c" "cd ${safe_pwd_p} && claude --continue --dangerously-skip-permissions; zsh"
-                  else
-                    local wt_p=$(find_worktree_path "$sel_id")
-                    if [[ -n "$wt_p" ]]; then
-                      local safe_wt_p
-                      safe_wt_p=${(q)${wt_p}}
-                      tmux_create_window "$sel_id" "zsh" "-c" "cd ${safe_wt_p} && claude --continue --dangerously-skip-permissions; zsh"
-                    fi
-                  fi
-                fi
-                update_task_field "$sel_id" "status" "active"
-                ;;
-              active)
-                update_task_field "$sel_id" "status" "needs_review"
-                ;;
-              needs_review)
-                # Show a message; review requires explicit cmd outside dashboard
-                cursor_show
-                stty echo
-                echo ""
-                echo "${C_YELLOW}Review '${sel_id}': this will push the branch and create a PR.${C_RESET}"
-                printf "Proceed? [y/N] "
-                local confirm=""
-                read -r confirm
-                if [[ "$confirm" =~ ^[yY]$ ]]; then
-                  cmd_review "$sel_id" 2>&1 || true
-                fi
-                stty -echo
-                cursor_hide
-                ;;
-              review)
-                # Use cmd_done for full cleanup (worktree + branch + window)
-                cmd_done "$sel_id" 2>&1 || true
-                ;;
-            esac
+      '<'|',') # Move task one status to the left
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local mv_status="${_task_status[$sel_id]}"
+          local -a status_order=("pending" "paused" "active" "needs_review" "review" "done")
+          local mv_idx=-1
+          for (( i=0; i<${#status_order[@]}; i++ )); do
+            [[ "${status_order[$i]}" == "$mv_status" ]] && mv_idx=$i
+          done
+          if [[ $mv_idx -gt 0 ]]; then
+            local prev_status="${status_order[$((mv_idx - 1))]}"
+            update_task_field "$sel_id" "status" "$prev_status"
           fi
         fi
         ;;
@@ -1118,71 +1401,50 @@ cmd__dash_loop() {
           local new_title=""
           read -r new_title
           if [[ -n "$new_title" ]]; then
-            cmd_add "$new_id" --title "$new_title" 2>&1 || true
+            local add_output
+            add_output=$( (cmd_add "$new_id" --title "$new_title") 2>&1 ) || true
+            if [[ -n "$add_output" ]]; then
+              echo "$add_output"
+              sleep 1.5
+            fi
           fi
         fi
         stty -echo
         cursor_hide
         ;;
       x) # Done/delete selected task
-        if [[ ${col_counts[$cur_col]} -gt 0 ]]; then
-          local sel_id=$(echo "${col_tasks[$cur_col]}" | sed -n "$((cur_row[$cur_col] + 1))p")
-          if [[ -n "$sel_id" ]]; then
-            local sel_status=$(task_status "$sel_id")
-            if [[ "$sel_status" == "done" ]]; then
-              cmd_rm "$sel_id" 2>&1 || true
-            else
-              cmd_done "$sel_id" 2>&1 || true
-            fi
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local sel_status="${_task_status[$sel_id]}"
+          if [[ "$sel_status" == "done" ]]; then
+            (cmd_rm "$sel_id") 2>&1 || true
+          else
+            (cmd_done "$sel_id") 2>&1 || true
           fi
         fi
         ;;
-      d) # Show diff
-        if [[ ${col_counts[$cur_col]} -gt 0 ]]; then
-          local sel_id=$(echo "${col_tasks[$cur_col]}" | sed -n "$((cur_row[$cur_col] + 1))p")
-          if [[ -n "$sel_id" ]]; then
-            local diff_dir=""
-            if [[ "$(jq -r --arg id "$sel_id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")" == "none" ]]; then
-              diff_dir="$PWD"
-            else
-              diff_dir=$(find_worktree_path "$sel_id")
-            fi
-            if [[ -n "$diff_dir" ]]; then
-              cursor_show
-              stty echo
-              (cd "$diff_dir" && git diff --stat && echo "" && git diff) | less
-              stty -echo
-              cursor_hide
-            fi
+      d) # Show diff (cached worktree_mode lookup)
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local diff_dir=""
+          if [[ "${_task_wtmode[$sel_id]}" == "none" ]]; then
+            diff_dir="$PWD"
+          else
+            diff_dir=$(find_worktree_path "$sel_id")
           fi
-        fi
-        ;;
-      r) # Resume
-        if [[ ${col_counts[$cur_col]} -gt 0 ]]; then
-          local sel_id=$(echo "${col_tasks[$cur_col]}" | sed -n "$((cur_row[$cur_col] + 1))p")
-          if [[ -n "$sel_id" ]] && ! tmux_window_exists "$sel_id"; then
-            local r_wt_mode=$(jq -r --arg id "$sel_id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$STATE_FILE")
-            if [[ "$r_wt_mode" == "none" ]]; then
-              local safe_pwd_r=${(q)${PWD}}
-              tmux_create_window "$sel_id" "zsh" "-c" "cd ${safe_pwd_r} && claude --continue --dangerously-skip-permissions; zsh"
-            else
-              local wt=$(find_worktree_path "$sel_id")
-              if [[ -n "$wt" ]]; then
-                local safe_wt=${(q)${wt}}
-                tmux_create_window "$sel_id" "zsh" "-c" "cd ${safe_wt} && claude --continue --dangerously-skip-permissions; zsh"
-              fi
-            fi
-            update_task_field "$sel_id" "status" "active"
-          fi
-          if [[ -n "$sel_id" ]] && tmux_window_exists "$sel_id"; then
-            tmux_select_window "$sel_id"
+          if [[ -n "$diff_dir" ]]; then
+            cursor_show
+            stty echo
+            (cd "$diff_dir" && git diff --stat && echo "" && git diff) | less
+            stty -echo
+            cursor_hide
           fi
         fi
         ;;
       s) # Shell popup: capture tmux pane output
-        if [[ ${col_counts[$cur_col]} -gt 0 ]]; then
-          local sel_id=$(echo "${col_tasks[$cur_col]}" | sed -n "$((cur_row[$cur_col] + 1))p")
-          if [[ -n "$sel_id" ]] && tmux_window_exists "$sel_id"; then
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          if tmux_window_exists "$sel_id"; then
             cursor_show
             stty echo
             # Capture pane content with history
@@ -1195,14 +1457,13 @@ cmd__dash_loop() {
         fi
         ;;
       p) # Pause active task
-        if [[ ${col_counts[$cur_col]} -gt 0 ]]; then
-          local sel_id=$(echo "${col_tasks[$cur_col]}" | sed -n "$((cur_row[$cur_col] + 1))p")
-          if [[ -n "$sel_id" ]]; then
-            local p_status=$(task_status "$sel_id")
-            if [[ "$p_status" == "active" || "$p_status" == "needs_review" ]]; then
-              tmux_kill_window "$sel_id"
-              update_task_field "$sel_id" "status" "paused"
-            fi
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local p_status="${_task_status[$sel_id]}"
+          if [[ "$p_status" == "active" || "$p_status" == "needs_review" ]]; then
+            tmux_kill_window "$sel_id"
+            update_task_field "$sel_id" "status" "paused"
+            update_task_field_raw "$sel_id" "claude_status" "null"
           fi
         fi
         ;;
@@ -1242,6 +1503,8 @@ main() {
     pause)      cmd_pause "$@" ;;
     resume)     cmd_resume "$@" ;;
     rm|remove)  cmd_rm "$@" ;;
+    status)     cmd_status "$@" ;;
+    signal)     cmd_signal "$@" ;;
     doctor)     cmd_doctor "$@" ;;
     _dash_loop) cmd__dash_loop "$@" ;;
     help|-h|--help)    cmd_help ;;
