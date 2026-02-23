@@ -803,7 +803,7 @@ cmd_session() {
   local safe_global_dir=${(q)GLOBAL_DIR}
 
   tmux_create_window "$id" "zsh" "-c" \
-    "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_repo_path} && claude --continue ${session_uid} --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+    "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_repo_path} && claude --resume ${session_uid} --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
 
   ok "tracking session '${session_uid:0:8}...' as ${id} in ${repo_name}"
 
