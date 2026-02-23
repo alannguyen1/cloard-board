@@ -38,8 +38,9 @@ cloard-board dash      # open the interactive kanban dashboard
 | Command | Description |
 |---|---|
 | `init` | Initialise `.cloard-board/` in the current repo |
-| `add <id> --title "..."` | Add a task (starts as pending) |
+| `add <id> --title "..."` | Add a task (starts as pending). Use `--no-worktree` to skip branch isolation |
 | `start <id> [prompt]` | Launch Claude in a new worktree; task becomes active |
+| `pause <id>` | Pause a task: kill tmux window but keep worktree and branch |
 | `go <id>` | Switch to a task's tmux window |
 | `dash` | Open the interactive kanban dashboard |
 | `attach` | Attach to the cloard-board tmux session |
@@ -59,6 +60,7 @@ cloard-board dash      # open the interactive kanban dashboard
 | `j` / `k` (or arrows) | Move between tasks in a column |
 | `Enter` | Attach to the selected task's tmux window |
 | `m` | Advance: move the selected task to the next status |
+| `p` | Pause: kill the tmux window but keep the worktree (active/needs_review only) |
 | `o` | Create a new task interactively |
 | `x` | Mark task as done (or remove if already done) |
 | `d` | Show git diff for the selected task's worktree |
@@ -71,9 +73,27 @@ cloard-board dash      # open the interactive kanban dashboard
 ```
 pending  -->  active  -->  needs_review  -->  review (PR)  -->  done
    add()      start()        advance()        review()        done()
+                 \              |
+                  <-- paused <--
+                      pause()     resume()
 ```
 
 Each `start` creates a git worktree and launches `claude --worktree <id>` in a dedicated tmux window. Multiple tasks run truly in parallel, each in their own isolated branch and directory.
+
+### Pausing tasks
+
+Use `pause` to temporarily free a tmux window without losing work. The worktree and branch remain intact. Resume later with `resume` or the `r` key in the dashboard. Paused tasks appear in the Pending column with cyan coloring.
+
+### Worktree-free tasks
+
+For quick fixes that don't need branch isolation, use `--no-worktree`:
+
+```sh
+cloard-board add fix-typo --title "Fix typo" --no-worktree
+cloard-board start fix-typo "Fix the typo in README"
+```
+
+The dashboard also prompts "Use worktree? [Y/n]" when starting a task via the `m` key.
 
 ## Dependencies
 
