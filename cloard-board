@@ -29,6 +29,537 @@ readonly C_WHITE=$'\e[37m'
 readonly C_BG_BLUE=$'\e[44m'
 readonly C_BG_DEFAULT=$'\e[49m'
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+die()  { echo "${C_RED}error:${C_RESET} $*" >&2; exit 1; }
+info() { echo "${C_CYAN}▸${C_RESET} $*"; }
+ok()   { echo "${C_GREEN}✓${C_RESET} $*"; }
+warn() { echo "${C_YELLOW}!${C_RESET} $*" >&2; }
+
+require_cmd() {
+  command -v "$1" &>/dev/null || die "'$1' is required but not found"
+}
+
+# Escape XML special characters for plist generation
+_xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  echo "$s"
+}
+
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# ── Lock helpers (mkdir-based, portable to macOS) ─────────────────────────────
+_lock_state() {
+  local lockdir="${GLOBAL_DIR}/.lock"
+  local retries=100
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    retries=$((retries - 1))
+    if [[ $retries -le 0 ]]; then
+      warn "could not acquire state lock"
+      return 1
+    fi
+    sleep 0.02
+  done
+}
+
+_unlock_state() {
+  rmdir "${GLOBAL_DIR}/.lock" 2>/dev/null || true
+}
+
+# ── JSON helpers (jq wrappers, global state) ──────────────────────────────────
+read_task() {
+  local id="$1"
+  jq -r --arg id "$id" '.tasks[] | select(.id == $id)' "$GLOBAL_STATE"
+}
+
+task_exists() {
+  local id="$1"
+  [[ "$(jq -r --arg id "$id" '[.tasks[] | select(.id == $id)] | length' "$GLOBAL_STATE")" -gt 0 ]]
+}
+
+task_status() {
+  local id="$1"
+  jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .status' "$GLOBAL_STATE"
+}
+
+task_field() {
+  local id="$1" field="$2"
+  jq -r --arg id "$id" --arg f "$field" '.tasks[] | select(.id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
+}
+
+update_task_field() {
+  local id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg id "$id" --arg f "$field" --arg v "$value" \
+    '(.tasks[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+update_task_field_raw() {
+  # For non-string values (null, numbers)
+  local id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg id "$id" --arg f "$field" --argjson v "$value" \
+    '(.tasks[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+# Swap two tasks' positions in the state JSON array (for reordering within a column)
+_swap_tasks_in_state() {
+  local id_a="$1" id_b="$2"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg a "$id_a" --arg b "$id_b" '
+    (.tasks | to_entries) as $entries |
+    ($entries | map(select(.value.id == $a)) | .[0].key) as $idx_a |
+    ($entries | map(select(.value.id == $b)) | .[0].key) as $idx_b |
+    if $idx_a != null and $idx_b != null then
+      .tasks[$idx_a] = $entries[$idx_b].value |
+      .tasks[$idx_b] = $entries[$idx_a].value
+    else . end
+  ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+# ── Cron helpers ──────────────────────────────────────────────────────────────
+cron_job_exists() {
+  local id="$1"
+  [[ "$(jq -r --arg id "$id" '[.cron_jobs[] | select(.id == $id)] | length' "$GLOBAL_STATE")" -gt 0 ]]
+}
+
+cron_job_field() {
+  local id="$1" field="$2"
+  jq -r --arg id "$id" --arg f "$field" '.cron_jobs[] | select(.id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
+}
+
+update_cron_job_field() {
+  local id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$id" --arg f "$field" --arg v "$value" \
+    '(.cron_jobs[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+update_cron_job_field_raw() {
+  local id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$id" --arg f "$field" --argjson v "$value" \
+    '(.cron_jobs[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+cron_run_field() {
+  local run_id="$1" field="$2"
+  jq -r --arg id "$run_id" --arg f "$field" '.cron_runs[] | select(.run_id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
+}
+
+update_cron_run_field() {
+  local run_id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$run_id" --arg f "$field" --arg v "$value" \
+    '(.cron_runs[] | select(.run_id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+update_cron_run_field_raw() {
+  local run_id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$run_id" --arg f "$field" --argjson v "$value" \
+    '(.cron_runs[] | select(.run_id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+_next_cron_id() {
+  _lock_state || return 1
+  local num
+  num=$(jq -r '.next_cron_id' "$GLOBAL_STATE")
+  local new_id
+  new_id=$(printf "cj-%03d" "$num")
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq '.next_cron_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  echo "$new_id"
+}
+
+_next_run_id() {
+  _lock_state || return 1
+  local num
+  num=$(jq -r '.next_run_id' "$GLOBAL_STATE")
+  local new_id
+  new_id=$(printf "cr-%03d" "$num")
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq '.next_run_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  echo "$new_id"
+}
+
+# ── Repo helpers ──────────────────────────────────────────────────────────────
+repo_exists() {
+  local name="$1"
+  [[ "$(jq -r --arg n "$name" '[.repos[] | select(.name == $n)] | length' "$GLOBAL_STATE")" -gt 0 ]]
+}
+
+repo_path() {
+  local name="$1"
+  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .path' "$GLOBAL_STATE"
+}
+
+repo_type() {
+  local name="$1"
+  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .type // "git"' "$GLOBAL_STATE"
+}
+
+repo_base_branch() {
+  local name="$1"
+  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .base_branch // "main"' "$GLOBAL_STATE"
+}
+
+task_repo() {
+  local id="$1"
+  jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .repo // ""' "$GLOBAL_STATE"
+}
+
+# Find which registered repo a Claude session belongs to by scanning ~/.claude/projects/
+_find_session_repo() {
+  local uid="$1"
+  local session_file
+  session_file=$(command find "$HOME/.claude/projects" -maxdepth 2 -name "${uid}.jsonl" -print -quit 2>/dev/null)
+  [[ -n "$session_file" ]] || return 1
+
+  local project_dir
+  project_dir=$(basename "$(dirname "$session_file")")
+
+  # For each registered repo, encode its path the way Claude does and compare
+  local rname rpath
+  while IFS=$'\x1e' read -r rname rpath; do
+    [[ -n "$rname" ]] || continue
+    local encoded="${rpath//\//-}"
+    encoded="${encoded// /-}"
+    if [[ "$project_dir" == "$encoded" ]]; then
+      echo "$rname"
+      return 0
+    fi
+  done < <(jq -r '.repos[] | select(.archived != true) | [.name, .path] | join("\u001e")' "$GLOBAL_STATE")
+
+  return 1
+}
+
+_next_task_id() {
+  _lock_state || return 1
+  local num
+  num=$(jq -r '.next_task_id' "$GLOBAL_STATE")
+  local new_id
+  new_id=$(printf "t-%03d" "$num")
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq '.next_task_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  echo "$new_id"
+}
+
+# Unlocked variant for migration (no concurrent access during first-time setup)
+_next_task_id_unlocked() {
+  local num
+  num=$(jq -r '.next_task_id' "$GLOBAL_STATE")
+  local new_id
+  new_id=$(printf "t-%03d" "$num")
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq '.next_task_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  echo "$new_id"
+}
+
+# ── tmux helpers ───────────────────────────────────────────────────────────────
+tmux_cmd() { tmux -L "$TMUX_SOCKET" "$@"; }
+
+tmux_session_exists() {
+  tmux_cmd has-session -t "board" 2>/dev/null
+}
+
+ensure_tmux_session() {
+  if ! tmux_session_exists; then
+    tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50
+    pin_dashboard_to_zero
+  fi
+  # Always refresh the prefix-b binding (handles upgrades from old static binding).
+  # Write a small helper script so run-shell doesn't need full cloard-board init.
+  local _helper="${GLOBAL_DIR}/dash-switch.sh"
+  cat > "$_helper" <<DASHEOF
+#!/bin/sh
+S=cloard-board
+tmux -L \$S select-window -t board:dashboard 2>/dev/null && exit 0
+tmux -L \$S new-window -t board -n dashboard
+tmux -L \$S respawn-window -k -t board:dashboard "exec '${SCRIPT_PATH}' _dash_loop"
+tmux -L \$S select-window -t board:dashboard 2>/dev/null
+DASHEOF
+  chmod +x "$_helper"
+  tmux_cmd bind-key -T prefix b run-shell "$_helper"
+}
+
+tmux_window_exists() {
+  local name="$1"
+  tmux_cmd list-windows -t "board" -F '#{window_name}' 2>/dev/null | grep -qx "$name"
+}
+
+tmux_create_window() {
+  local name="$1"
+  shift
+  tmux_cmd new-window -t "board" -n "$name" "$@"
+  pin_dashboard_to_zero
+}
+
+tmux_kill_window() {
+  local name="$1"
+  if tmux_window_exists "$name"; then
+    tmux_cmd kill-window -t "board:$name" 2>/dev/null || true
+  fi
+}
+
+tmux_select_window() {
+  local name="$1"
+  tmux_cmd select-window -t "board:$name" 2>/dev/null
+}
+
+pin_dashboard_to_zero() {
+  local dash_idx
+  dash_idx=$(tmux_cmd list-windows -t "board" -F '#{window_name} #{window_index}' 2>/dev/null \
+    | awk '$1 == "dashboard" { print $2 }')
+  if [[ -n "$dash_idx" && "$dash_idx" != "0" ]]; then
+    tmux_cmd swap-window -s "board:dashboard" -t "board:0" 2>/dev/null || true
+  fi
+}
+
+# ── Worktree helpers ───────────────────────────────────────────────────────────
+find_worktree_path() {
+  # Discover worktree path for a given branch/name from git worktree list
+  # Optional second argument: repo directory to search in
+  local id="$1"
+  local repo_dir="${2:-}"
+  local branch="worktree-${id}"
+  if [[ -n "$repo_dir" ]]; then
+    (cd "$repo_dir" && git worktree list --porcelain 2>/dev/null) | awk -v branch="refs/heads/$branch" '
+      /^worktree / { path = substr($0, 10) }
+      /^branch / { if ($2 == branch) print path }
+    '
+  else
+    git worktree list --porcelain 2>/dev/null | awk -v branch="refs/heads/$branch" '
+      /^worktree / { path = substr($0, 10) }
+      /^branch / { if ($2 == branch) print path }
+    '
+  fi
+}
+
+# ── Global state management ───────────────────────────────────────────────────
+ensure_global_state() {
+  mkdir -p "$GLOBAL_DIR"
+
+  if [[ ! -f "$GLOBAL_STATE" ]]; then
+    jq -n '{version: 3, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
+  else
+    # Check for schema migrations
+    local _ver
+    _ver=$(jq -r '.version // 0' "$GLOBAL_STATE" 2>/dev/null) || _ver=0
+    if [[ "$_ver" == "2" ]]; then
+      _migrate_v2_to_v3
+    fi
+  fi
+
+  # Install hooks if missing
+  if [[ ! -f "$HOOKS_DIR/on-stop.sh" || ! -f "$HOOKS_DIR/on-prompt.sh" ]]; then
+    _install_hook_scripts
+    _register_global_hooks
+  fi
+}
+
+_install_hook_scripts() {
+  mkdir -p "$HOOKS_DIR"
+
+  cat > "$HOOKS_DIR/on-stop.sh" <<'HOOK'
+#!/usr/bin/env bash
+# cloard-board hook: set task status to "waiting" when Claude stops
+[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
+cloard-board signal "$CLOARD_TASK_ID" waiting &>/dev/null &
+HOOK
+  chmod +x "$HOOKS_DIR/on-stop.sh"
+
+  cat > "$HOOKS_DIR/on-prompt.sh" <<'HOOK'
+#!/usr/bin/env bash
+# cloard-board hook: set task status to "working" when user submits a prompt
+[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
+cloard-board signal "$CLOARD_TASK_ID" working &>/dev/null &
+HOOK
+  chmod +x "$HOOKS_DIR/on-prompt.sh"
+}
+
+_register_global_hooks() {
+  local settings_dir="$HOME/.claude"
+  local settings_file="$settings_dir/settings.json"
+  mkdir -p "$settings_dir"
+
+  local new_hooks
+  new_hooks=$(jq -n --arg stop "$HOOKS_DIR/on-stop.sh" --arg prompt "$HOOKS_DIR/on-prompt.sh" '{
+    "Stop": [{"hooks": [{"type": "command", "command": $stop}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": $prompt}]}]
+  }')
+
+  if [[ -f "$settings_file" ]]; then
+    local tmp_settings
+    tmp_settings=$(mktemp "${GLOBAL_DIR}/.settings.XXXXXX")
+    # Merge hooks: remove any existing cloard-board entries, then append ours
+    jq --argjson new_hooks "$new_hooks" '
+      .hooks = ((.hooks // {}) |
+        reduce ($new_hooks | to_entries[]) as $entry (.;
+          .[$entry.key] = (
+            [(.[$entry.key] // [])[] |
+              select(.hooks | all(.command | test("cloard-board") | not))
+            ] + $entry.value
+          )
+        )
+      )
+    ' "$settings_file" > "$tmp_settings" \
+      && mv "$tmp_settings" "$settings_file"
+  else
+    jq -n --argjson hooks "$new_hooks" '{hooks: $hooks}' > "$settings_file"
+  fi
+}
+
+_migrate_v2_to_v3() {
+  info "migrating state schema v2 -> v3 (adding cron support)..."
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.migrate.XXXXXX")
+  jq '.version = 3
+    | .next_cron_id = (.next_cron_id // 1)
+    | .next_run_id = (.next_run_id // 1)
+    | .cron_jobs = (.cron_jobs // [])
+    | .cron_runs = (.cron_runs // [])' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  ok "state schema migrated to v3"
+}
+
+# Auto-migrate old per-repo state on first run from that directory
+check_and_migrate() {
+  local local_state=".cloard-board/tasks.json"
+  [[ -f "$local_state" ]] || return 0
+
+  # Check if it's v1 format
+  local version
+  version=$(jq -r '.version // 0' "$local_state" 2>/dev/null) || return 0
+  [[ "$version" == "1" ]] || return 0
+
+  # Check if this repo is already registered
+  local cwd_canonical
+  cwd_canonical=$(pwd -P)
+  local already_registered
+  already_registered=$(jq -r --arg p "$cwd_canonical" '[.repos[] | select(.path == $p)] | length' "$GLOBAL_STATE")
+  [[ "$already_registered" -eq 0 ]] || return 0
+
+  # Count tasks
+  local task_count
+  task_count=$(jq '.tasks | length' "$local_state")
+
+  # Skip migration prompt in non-interactive contexts
+  if [[ ! -t 0 ]]; then
+    return 0
+  fi
+
+  printf "${C_CYAN}Found local cloard-board state with ${task_count} tasks. Migrate to global dashboard? [Y/n] ${C_RESET}"
+  local answer
+  read -r answer
+  [[ "$answer" =~ ^[nN]$ ]] && return 0
+
+  # Register this repo
+  local repo_name
+  repo_name=$(basename "$cwd_canonical")
+  repo_name=$(_do_repo_add "$cwd_canonical" "$repo_name") || return 1
+
+  # Import tasks with new IDs
+  local old_tasks
+  old_tasks=$(jq -r '.tasks[] | [
+    .id, .title, .status,
+    (.worktree_mode // "worktree"),
+    (.claude_status // ""),
+    (.pr_url // ""),
+    (.branch // ""),
+    (.worktree // ""),
+    (.started_at // ""),
+    (.completed_at // "")
+  ] | join("\u001e")' "$local_state")
+
+  while IFS=$'\x1e' read -r old_id old_title old_status old_wm old_cs old_pr old_branch old_wt old_started old_completed; do
+    [[ -n "$old_id" ]] || continue
+    local new_id
+    new_id=$(_next_task_id_unlocked)
+    local tmp
+    tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+    local now
+    now=$(now_iso)
+    jq --arg id "$new_id" --arg title "$old_title" --arg status "$old_status" \
+       --arg wm "$old_wm" --arg repo "$repo_name" --arg cs "$old_cs" \
+       --arg pr "$old_pr" --arg branch "$old_branch" --arg wt "$old_wt" \
+       --arg old_id "$old_id" --arg started "$old_started" --arg completed "$old_completed" \
+       --arg now "$now" \
+      '.tasks += [{
+        id: $id,
+        title: $title,
+        repo: $repo,
+        status: $status,
+        worktree_mode: $wm,
+        worktree: (if $wt == "" then null else $wt end),
+        branch: (if $branch == "" then null else $branch end),
+        claude_status: (if $cs == "" then null else $cs end),
+        pr_number: null,
+        pr_url: (if $pr == "" then null else $pr end),
+        created_at: $now,
+        started_at: (if $started == "" then null else $started end),
+        completed_at: (if $completed == "" then null else $completed end),
+        legacy_id: $old_id
+      }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  done <<< "$old_tasks"
+
+  # Rename old state directory (backup)
+  mv ".cloard-board" ".cloard-board.migrated"
+
+  # Clean up per-repo hook entries from local .claude/settings.json
+  if [[ -f ".claude/settings.json" ]]; then
+    local tmp_s
+    tmp_s=$(mktemp)
+    jq '
+      if .hooks then
+        .hooks |= with_entries(
+          .value = [.value[] | select(.hooks | all(.command | test("cloard-board") | not))]
+        )
+      else . end
+    ' ".claude/settings.json" > "$tmp_s" && mv "$tmp_s" ".claude/settings.json"
+  fi
+
+  ok "migrated ${task_count} tasks from local state; old state backed up to .cloard-board.migrated/"
+}
+
 # ── Cron: plist discovery ─────────────────────────────────────────────────────
 
 # Scan ~/Library/LaunchAgents for plists that invoke Claude.
@@ -3727,27 +4258,6 @@ EOF
 
 cmd_version() { echo "cloard-board v${VERSION}"; }
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-die()  { echo "${C_RED}error:${C_RESET} $*" >&2; exit 1; }
-info() { echo "${C_CYAN}▸${C_RESET} $*"; }
-ok()   { echo "${C_GREEN}✓${C_RESET} $*"; }
-warn() { echo "${C_YELLOW}!${C_RESET} $*" >&2; }
-
-require_cmd() {
-  command -v "$1" &>/dev/null || die "'$1' is required but not found"
-}
-
-# Escape XML special characters for plist generation
-_xml_escape() {
-  local s="$1"
-  s="${s//&/&amp;}"
-  s="${s//</&lt;}"
-  s="${s//>/&gt;}"
-  echo "$s"
-}
-
-now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-
 # ── Main dispatcher ────────────────────────────────────────────────────────────
 main() {
   require_cmd jq
@@ -3800,513 +4310,3 @@ main() {
 }
 
 main "$@"
-# ── Lock helpers (mkdir-based, portable to macOS) ─────────────────────────────
-_lock_state() {
-  local lockdir="${GLOBAL_DIR}/.lock"
-  local retries=100
-  while ! mkdir "$lockdir" 2>/dev/null; do
-    retries=$((retries - 1))
-    if [[ $retries -le 0 ]]; then
-      warn "could not acquire state lock"
-      return 1
-    fi
-    sleep 0.02
-  done
-}
-
-_unlock_state() {
-  rmdir "${GLOBAL_DIR}/.lock" 2>/dev/null || true
-}
-
-# ── JSON helpers (jq wrappers, global state) ──────────────────────────────────
-read_task() {
-  local id="$1"
-  jq -r --arg id "$id" '.tasks[] | select(.id == $id)' "$GLOBAL_STATE"
-}
-
-task_exists() {
-  local id="$1"
-  [[ "$(jq -r --arg id "$id" '[.tasks[] | select(.id == $id)] | length' "$GLOBAL_STATE")" -gt 0 ]]
-}
-
-task_status() {
-  local id="$1"
-  jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .status' "$GLOBAL_STATE"
-}
-
-task_field() {
-  local id="$1" field="$2"
-  jq -r --arg id "$id" --arg f "$field" '.tasks[] | select(.id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
-}
-
-update_task_field() {
-  local id="$1" field="$2" value="$3"
-  _lock_state || return 1
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
-  jq --arg id "$id" --arg f "$field" --arg v "$value" \
-    '(.tasks[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
-    && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-}
-
-update_task_field_raw() {
-  # For non-string values (null, numbers)
-  local id="$1" field="$2" value="$3"
-  _lock_state || return 1
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
-  jq --arg id "$id" --arg f "$field" --argjson v "$value" \
-    '(.tasks[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
-    && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-}
-
-# Swap two tasks' positions in the state JSON array (for reordering within a column)
-_swap_tasks_in_state() {
-  local id_a="$1" id_b="$2"
-  _lock_state || return 1
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
-  jq --arg a "$id_a" --arg b "$id_b" '
-    (.tasks | to_entries) as $entries |
-    ($entries | map(select(.value.id == $a)) | .[0].key) as $idx_a |
-    ($entries | map(select(.value.id == $b)) | .[0].key) as $idx_b |
-    if $idx_a != null and $idx_b != null then
-      .tasks[$idx_a] = $entries[$idx_b].value |
-      .tasks[$idx_b] = $entries[$idx_a].value
-    else . end
-  ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-}
-
-# ── Cron helpers ──────────────────────────────────────────────────────────────
-cron_job_exists() {
-  local id="$1"
-  [[ "$(jq -r --arg id "$id" '[.cron_jobs[] | select(.id == $id)] | length' "$GLOBAL_STATE")" -gt 0 ]]
-}
-
-cron_job_field() {
-  local id="$1" field="$2"
-  jq -r --arg id "$id" --arg f "$field" '.cron_jobs[] | select(.id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
-}
-
-update_cron_job_field() {
-  local id="$1" field="$2" value="$3"
-  _lock_state || return 1
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
-  jq --arg id "$id" --arg f "$field" --arg v "$value" \
-    '(.cron_jobs[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
-    && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-}
-
-update_cron_job_field_raw() {
-  local id="$1" field="$2" value="$3"
-  _lock_state || return 1
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
-  jq --arg id "$id" --arg f "$field" --argjson v "$value" \
-    '(.cron_jobs[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
-    && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-}
-
-cron_run_field() {
-  local run_id="$1" field="$2"
-  jq -r --arg id "$run_id" --arg f "$field" '.cron_runs[] | select(.run_id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
-}
-
-update_cron_run_field() {
-  local run_id="$1" field="$2" value="$3"
-  _lock_state || return 1
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
-  jq --arg id "$run_id" --arg f "$field" --arg v "$value" \
-    '(.cron_runs[] | select(.run_id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
-    && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-}
-
-update_cron_run_field_raw() {
-  local run_id="$1" field="$2" value="$3"
-  _lock_state || return 1
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
-  jq --arg id "$run_id" --arg f "$field" --argjson v "$value" \
-    '(.cron_runs[] | select(.run_id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
-    && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-}
-
-_next_cron_id() {
-  _lock_state || return 1
-  local num
-  num=$(jq -r '.next_cron_id' "$GLOBAL_STATE")
-  local new_id
-  new_id=$(printf "cj-%03d" "$num")
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
-  jq '.next_cron_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-  echo "$new_id"
-}
-
-_next_run_id() {
-  _lock_state || return 1
-  local num
-  num=$(jq -r '.next_run_id' "$GLOBAL_STATE")
-  local new_id
-  new_id=$(printf "cr-%03d" "$num")
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
-  jq '.next_run_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-  echo "$new_id"
-}
-
-# ── Repo helpers ──────────────────────────────────────────────────────────────
-repo_exists() {
-  local name="$1"
-  [[ "$(jq -r --arg n "$name" '[.repos[] | select(.name == $n)] | length' "$GLOBAL_STATE")" -gt 0 ]]
-}
-
-repo_path() {
-  local name="$1"
-  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .path' "$GLOBAL_STATE"
-}
-
-repo_type() {
-  local name="$1"
-  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .type // "git"' "$GLOBAL_STATE"
-}
-
-repo_base_branch() {
-  local name="$1"
-  jq -r --arg n "$name" '.repos[] | select(.name == $n) | .base_branch // "main"' "$GLOBAL_STATE"
-}
-
-task_repo() {
-  local id="$1"
-  jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .repo // ""' "$GLOBAL_STATE"
-}
-
-# Find which registered repo a Claude session belongs to by scanning ~/.claude/projects/
-_find_session_repo() {
-  local uid="$1"
-  local session_file
-  session_file=$(command find "$HOME/.claude/projects" -maxdepth 2 -name "${uid}.jsonl" -print -quit 2>/dev/null)
-  [[ -n "$session_file" ]] || return 1
-
-  local project_dir
-  project_dir=$(basename "$(dirname "$session_file")")
-
-  # For each registered repo, encode its path the way Claude does and compare
-  local rname rpath
-  while IFS=$'\x1e' read -r rname rpath; do
-    [[ -n "$rname" ]] || continue
-    local encoded="${rpath//\//-}"
-    encoded="${encoded// /-}"
-    if [[ "$project_dir" == "$encoded" ]]; then
-      echo "$rname"
-      return 0
-    fi
-  done < <(jq -r '.repos[] | select(.archived != true) | [.name, .path] | join("\u001e")' "$GLOBAL_STATE")
-
-  return 1
-}
-
-_next_task_id() {
-  _lock_state || return 1
-  local num
-  num=$(jq -r '.next_task_id' "$GLOBAL_STATE")
-  local new_id
-  new_id=$(printf "t-%03d" "$num")
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
-  jq '.next_task_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-  echo "$new_id"
-}
-
-# Unlocked variant for migration (no concurrent access during first-time setup)
-_next_task_id_unlocked() {
-  local num
-  num=$(jq -r '.next_task_id' "$GLOBAL_STATE")
-  local new_id
-  new_id=$(printf "t-%03d" "$num")
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
-  jq '.next_task_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
-  echo "$new_id"
-}
-
-# ── tmux helpers ───────────────────────────────────────────────────────────────
-tmux_cmd() { tmux -L "$TMUX_SOCKET" "$@"; }
-
-tmux_session_exists() {
-  tmux_cmd has-session -t "board" 2>/dev/null
-}
-
-ensure_tmux_session() {
-  if ! tmux_session_exists; then
-    tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50
-    pin_dashboard_to_zero
-  fi
-  # Always refresh the prefix-b binding (handles upgrades from old static binding).
-  # Write a small helper script so run-shell doesn't need full cloard-board init.
-  local _helper="${GLOBAL_DIR}/dash-switch.sh"
-  cat > "$_helper" <<DASHEOF
-#!/bin/sh
-S=cloard-board
-tmux -L \$S select-window -t board:dashboard 2>/dev/null && exit 0
-tmux -L \$S new-window -t board -n dashboard
-tmux -L \$S respawn-window -k -t board:dashboard "exec '${SCRIPT_PATH}' _dash_loop"
-tmux -L \$S select-window -t board:dashboard 2>/dev/null
-DASHEOF
-  chmod +x "$_helper"
-  tmux_cmd bind-key -T prefix b run-shell "$_helper"
-}
-
-tmux_window_exists() {
-  local name="$1"
-  tmux_cmd list-windows -t "board" -F '#{window_name}' 2>/dev/null | grep -qx "$name"
-}
-
-tmux_create_window() {
-  local name="$1"
-  shift
-  tmux_cmd new-window -t "board" -n "$name" "$@"
-  pin_dashboard_to_zero
-}
-
-tmux_kill_window() {
-  local name="$1"
-  if tmux_window_exists "$name"; then
-    tmux_cmd kill-window -t "board:$name" 2>/dev/null || true
-  fi
-}
-
-tmux_select_window() {
-  local name="$1"
-  tmux_cmd select-window -t "board:$name" 2>/dev/null
-}
-
-pin_dashboard_to_zero() {
-  local dash_idx
-  dash_idx=$(tmux_cmd list-windows -t "board" -F '#{window_name} #{window_index}' 2>/dev/null \
-    | awk '$1 == "dashboard" { print $2 }')
-  if [[ -n "$dash_idx" && "$dash_idx" != "0" ]]; then
-    tmux_cmd swap-window -s "board:dashboard" -t "board:0" 2>/dev/null || true
-  fi
-}
-
-# ── Worktree helpers ───────────────────────────────────────────────────────────
-find_worktree_path() {
-  # Discover worktree path for a given branch/name from git worktree list
-  # Optional second argument: repo directory to search in
-  local id="$1"
-  local repo_dir="${2:-}"
-  local branch="worktree-${id}"
-  if [[ -n "$repo_dir" ]]; then
-    (cd "$repo_dir" && git worktree list --porcelain 2>/dev/null) | awk -v branch="refs/heads/$branch" '
-      /^worktree / { path = substr($0, 10) }
-      /^branch / { if ($2 == branch) print path }
-    '
-  else
-    git worktree list --porcelain 2>/dev/null | awk -v branch="refs/heads/$branch" '
-      /^worktree / { path = substr($0, 10) }
-      /^branch / { if ($2 == branch) print path }
-    '
-  fi
-}
-
-# ── Global state management ───────────────────────────────────────────────────
-ensure_global_state() {
-  mkdir -p "$GLOBAL_DIR"
-
-  if [[ ! -f "$GLOBAL_STATE" ]]; then
-    jq -n '{version: 3, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
-  else
-    # Check for schema migrations
-    local _ver
-    _ver=$(jq -r '.version // 0' "$GLOBAL_STATE" 2>/dev/null) || _ver=0
-    if [[ "$_ver" == "2" ]]; then
-      _migrate_v2_to_v3
-    fi
-  fi
-
-  # Install hooks if missing
-  if [[ ! -f "$HOOKS_DIR/on-stop.sh" || ! -f "$HOOKS_DIR/on-prompt.sh" ]]; then
-    _install_hook_scripts
-    _register_global_hooks
-  fi
-}
-
-_install_hook_scripts() {
-  mkdir -p "$HOOKS_DIR"
-
-  cat > "$HOOKS_DIR/on-stop.sh" <<'HOOK'
-#!/usr/bin/env bash
-# cloard-board hook: set task status to "waiting" when Claude stops
-[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
-cloard-board signal "$CLOARD_TASK_ID" waiting &>/dev/null &
-HOOK
-  chmod +x "$HOOKS_DIR/on-stop.sh"
-
-  cat > "$HOOKS_DIR/on-prompt.sh" <<'HOOK'
-#!/usr/bin/env bash
-# cloard-board hook: set task status to "working" when user submits a prompt
-[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
-cloard-board signal "$CLOARD_TASK_ID" working &>/dev/null &
-HOOK
-  chmod +x "$HOOKS_DIR/on-prompt.sh"
-}
-
-_register_global_hooks() {
-  local settings_dir="$HOME/.claude"
-  local settings_file="$settings_dir/settings.json"
-  mkdir -p "$settings_dir"
-
-  local new_hooks
-  new_hooks=$(jq -n --arg stop "$HOOKS_DIR/on-stop.sh" --arg prompt "$HOOKS_DIR/on-prompt.sh" '{
-    "Stop": [{"hooks": [{"type": "command", "command": $stop}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": $prompt}]}]
-  }')
-
-  if [[ -f "$settings_file" ]]; then
-    local tmp_settings
-    tmp_settings=$(mktemp "${GLOBAL_DIR}/.settings.XXXXXX")
-    # Merge hooks: remove any existing cloard-board entries, then append ours
-    jq --argjson new_hooks "$new_hooks" '
-      .hooks = ((.hooks // {}) |
-        reduce ($new_hooks | to_entries[]) as $entry (.;
-          .[$entry.key] = (
-            [(.[$entry.key] // [])[] |
-              select(.hooks | all(.command | test("cloard-board") | not))
-            ] + $entry.value
-          )
-        )
-      )
-    ' "$settings_file" > "$tmp_settings" \
-      && mv "$tmp_settings" "$settings_file"
-  else
-    jq -n --argjson hooks "$new_hooks" '{hooks: $hooks}' > "$settings_file"
-  fi
-}
-
-_migrate_v2_to_v3() {
-  info "migrating state schema v2 -> v3 (adding cron support)..."
-  _lock_state || return 1
-  local tmp
-  tmp=$(mktemp "${GLOBAL_DIR}/.migrate.XXXXXX")
-  jq '.version = 3
-    | .next_cron_id = (.next_cron_id // 1)
-    | .next_run_id = (.next_run_id // 1)
-    | .cron_jobs = (.cron_jobs // [])
-    | .cron_runs = (.cron_runs // [])' "$GLOBAL_STATE" > "$tmp" \
-    && mv "$tmp" "$GLOBAL_STATE"
-  _unlock_state
-  ok "state schema migrated to v3"
-}
-
-# Auto-migrate old per-repo state on first run from that directory
-check_and_migrate() {
-  local local_state=".cloard-board/tasks.json"
-  [[ -f "$local_state" ]] || return 0
-
-  # Check if it's v1 format
-  local version
-  version=$(jq -r '.version // 0' "$local_state" 2>/dev/null) || return 0
-  [[ "$version" == "1" ]] || return 0
-
-  # Check if this repo is already registered
-  local cwd_canonical
-  cwd_canonical=$(pwd -P)
-  local already_registered
-  already_registered=$(jq -r --arg p "$cwd_canonical" '[.repos[] | select(.path == $p)] | length' "$GLOBAL_STATE")
-  [[ "$already_registered" -eq 0 ]] || return 0
-
-  # Count tasks
-  local task_count
-  task_count=$(jq '.tasks | length' "$local_state")
-
-  # Skip migration prompt in non-interactive contexts
-  if [[ ! -t 0 ]]; then
-    return 0
-  fi
-
-  printf "${C_CYAN}Found local cloard-board state with ${task_count} tasks. Migrate to global dashboard? [Y/n] ${C_RESET}"
-  local answer
-  read -r answer
-  [[ "$answer" =~ ^[nN]$ ]] && return 0
-
-  # Register this repo
-  local repo_name
-  repo_name=$(basename "$cwd_canonical")
-  repo_name=$(_do_repo_add "$cwd_canonical" "$repo_name") || return 1
-
-  # Import tasks with new IDs
-  local old_tasks
-  old_tasks=$(jq -r '.tasks[] | [
-    .id, .title, .status,
-    (.worktree_mode // "worktree"),
-    (.claude_status // ""),
-    (.pr_url // ""),
-    (.branch // ""),
-    (.worktree // ""),
-    (.started_at // ""),
-    (.completed_at // "")
-  ] | join("\u001e")' "$local_state")
-
-  while IFS=$'\x1e' read -r old_id old_title old_status old_wm old_cs old_pr old_branch old_wt old_started old_completed; do
-    [[ -n "$old_id" ]] || continue
-    local new_id
-    new_id=$(_next_task_id_unlocked)
-    local tmp
-    tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
-    local now
-    now=$(now_iso)
-    jq --arg id "$new_id" --arg title "$old_title" --arg status "$old_status" \
-       --arg wm "$old_wm" --arg repo "$repo_name" --arg cs "$old_cs" \
-       --arg pr "$old_pr" --arg branch "$old_branch" --arg wt "$old_wt" \
-       --arg old_id "$old_id" --arg started "$old_started" --arg completed "$old_completed" \
-       --arg now "$now" \
-      '.tasks += [{
-        id: $id,
-        title: $title,
-        repo: $repo,
-        status: $status,
-        worktree_mode: $wm,
-        worktree: (if $wt == "" then null else $wt end),
-        branch: (if $branch == "" then null else $branch end),
-        claude_status: (if $cs == "" then null else $cs end),
-        pr_number: null,
-        pr_url: (if $pr == "" then null else $pr end),
-        created_at: $now,
-        started_at: (if $started == "" then null else $started end),
-        completed_at: (if $completed == "" then null else $completed end),
-        legacy_id: $old_id
-      }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
-  done <<< "$old_tasks"
-
-  # Rename old state directory (backup)
-  mv ".cloard-board" ".cloard-board.migrated"
-
-  # Clean up per-repo hook entries from local .claude/settings.json
-  if [[ -f ".claude/settings.json" ]]; then
-    local tmp_s
-    tmp_s=$(mktemp)
-    jq '
-      if .hooks then
-        .hooks |= with_entries(
-          .value = [.value[] | select(.hooks | all(.command | test("cloard-board") | not))]
-        )
-      else . end
-    ' ".claude/settings.json" > "$tmp_s" && mv "$tmp_s" ".claude/settings.json"
-  fi
-
-  ok "migrated ${task_count} tasks from local state; old state backed up to .cloard-board.migrated/"
-}
-
