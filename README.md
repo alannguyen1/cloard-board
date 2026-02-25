@@ -213,6 +213,10 @@ Task IDs are auto-generated (`t-001`, `t-002`, ...) and globally unique across a
 - **claude** ([Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code))
 - **gh** (GitHub CLI, only needed for `review` command)
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=alannguyen1/cloard-board&type=Date)](https://star-history.com/#alannguyen1/cloard-board&Date)
+
 ## License
 
 MIT
