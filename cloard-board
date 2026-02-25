@@ -8,7 +8,7 @@ setopt TYPESET_SILENT  # Prevent typeset/local from printing values on re-declar
 SCRIPT_PATH=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-readonly VERSION="0.2.0"
+readonly VERSION="0.3.0"
 readonly TMUX_SOCKET="cloard-board"
 readonly GLOBAL_DIR="$HOME/.cloard-board"
 readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
@@ -121,6 +121,92 @@ _swap_tasks_in_state() {
   _unlock_state
 }
 
+# ── Cron helpers ──────────────────────────────────────────────────────────────
+cron_job_exists() {
+  local id="$1"
+  [[ "$(jq -r --arg id "$id" '[.cron_jobs[] | select(.id == $id)] | length' "$GLOBAL_STATE")" -gt 0 ]]
+}
+
+cron_job_field() {
+  local id="$1" field="$2"
+  jq -r --arg id "$id" --arg f "$field" '.cron_jobs[] | select(.id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
+}
+
+update_cron_job_field() {
+  local id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$id" --arg f "$field" --arg v "$value" \
+    '(.cron_jobs[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+update_cron_job_field_raw() {
+  local id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$id" --arg f "$field" --argjson v "$value" \
+    '(.cron_jobs[] | select(.id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+cron_run_field() {
+  local run_id="$1" field="$2"
+  jq -r --arg id "$run_id" --arg f "$field" '.cron_runs[] | select(.run_id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
+}
+
+update_cron_run_field() {
+  local run_id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$run_id" --arg f "$field" --arg v "$value" \
+    '(.cron_runs[] | select(.run_id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+update_cron_run_field_raw() {
+  local run_id="$1" field="$2" value="$3"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$run_id" --arg f "$field" --argjson v "$value" \
+    '(.cron_runs[] | select(.run_id == $id))[$f] = $v' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+_next_cron_id() {
+  _lock_state || return 1
+  local num
+  num=$(jq -r '.next_cron_id' "$GLOBAL_STATE")
+  local new_id
+  new_id=$(printf "cj-%03d" "$num")
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq '.next_cron_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  echo "$new_id"
+}
+
+_next_run_id() {
+  _lock_state || return 1
+  local num
+  num=$(jq -r '.next_run_id' "$GLOBAL_STATE")
+  local new_id
+  new_id=$(printf "cr-%03d" "$num")
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq '.next_run_id += 1' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  echo "$new_id"
+}
+
 # ── Repo helpers ──────────────────────────────────────────────────────────────
 repo_exists() {
   local name="$1"
@@ -207,9 +293,21 @@ tmux_session_exists() {
 ensure_tmux_session() {
   if ! tmux_session_exists; then
     tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50
-    tmux_cmd bind-key -T prefix b select-window -t "board:dashboard"
     pin_dashboard_to_zero
   fi
+  # Always refresh the prefix-b binding (handles upgrades from old static binding).
+  # Write a small helper script so run-shell doesn't need full cloard-board init.
+  local _helper="${GLOBAL_DIR}/dash-switch.sh"
+  cat > "$_helper" <<DASHEOF
+#!/bin/sh
+S=cloard-board
+tmux -L \$S select-window -t board:dashboard 2>/dev/null && exit 0
+tmux -L \$S new-window -t board -n dashboard
+tmux -L \$S respawn-window -k -t board:dashboard "exec '${SCRIPT_PATH}' _dash_loop"
+tmux -L \$S select-window -t board:dashboard 2>/dev/null
+DASHEOF
+  chmod +x "$_helper"
+  tmux_cmd bind-key -T prefix b run-shell "$_helper"
 }
 
 tmux_window_exists() {
@@ -270,7 +368,14 @@ ensure_global_state() {
   mkdir -p "$GLOBAL_DIR"
 
   if [[ ! -f "$GLOBAL_STATE" ]]; then
-    jq -n '{version: 2, next_task_id: 1, repos: [], tasks: []}' > "$GLOBAL_STATE"
+    jq -n '{version: 3, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
+  else
+    # Check for schema migrations
+    local _ver
+    _ver=$(jq -r '.version // 0' "$GLOBAL_STATE" 2>/dev/null) || _ver=0
+    if [[ "$_ver" == "2" ]]; then
+      _migrate_v2_to_v3
+    fi
   fi
 
   # Install hooks if missing
@@ -330,6 +435,21 @@ _register_global_hooks() {
   else
     jq -n --argjson hooks "$new_hooks" '{hooks: $hooks}' > "$settings_file"
   fi
+}
+
+_migrate_v2_to_v3() {
+  info "migrating state schema v2 -> v3 (adding cron support)..."
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.migrate.XXXXXX")
+  jq '.version = 3
+    | .next_cron_id = (.next_cron_id // 1)
+    | .next_run_id = (.next_run_id // 1)
+    | .cron_jobs = (.cron_jobs // [])
+    | .cron_runs = (.cron_runs // [])' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  ok "state schema migrated to v3"
 }
 
 # Auto-migrate old per-repo state on first run from that directory
@@ -429,6 +549,731 @@ check_and_migrate() {
   fi
 
   ok "migrated ${task_count} tasks from local state; old state backed up to .cloard-board.migrated/"
+}
+
+# ── Cron: plist discovery ─────────────────────────────────────────────────────
+
+# Scan ~/Library/LaunchAgents for plists that invoke Claude.
+# Outputs record-separator delimited lines: label\x1epath\x1eworking_dir\x1eschedule_desc\x1eschedule_json
+_scan_launch_agents() {
+  local plist_dir="$HOME/Library/LaunchAgents"
+  [[ -d "$plist_dir" ]] || return 0
+
+  local plist
+  for plist in "$plist_dir"/*.plist; do
+    [[ -f "$plist" ]] || continue
+
+    local pjson
+    pjson=$(plutil -convert json -o - "$plist" 2>/dev/null) || continue
+
+    local label prog_args
+    label=$(echo "$pjson" | jq -r '.Label // ""')
+    prog_args=$(echo "$pjson" | jq -r '.ProgramArguments // [] | join(" ")')
+
+    # Check if ProgramArguments directly contains "claude"
+    local has_claude=false
+    if echo "$prog_args" | grep -qi 'claude'; then
+      has_claude=true
+    fi
+
+    # Level 2: if args invoke a shell script, check that script for "claude"
+    if ! $has_claude; then
+      local script_path
+      script_path=$(echo "$pjson" | jq -r '.ProgramArguments // [] | if length > 1 then .[1] else "" end')
+      if [[ -n "$script_path" && -f "$script_path" ]]; then
+        if grep -qi 'claude' "$script_path" 2>/dev/null; then
+          has_claude=true
+        fi
+      fi
+    fi
+
+    $has_claude || continue
+
+    # Skip plists already managed by cloard-board
+    if [[ "$label" == com.cloard-board.* ]]; then
+      continue
+    fi
+
+    local working_dir schedule_desc schedule_json
+    working_dir=$(echo "$pjson" | jq -r '.WorkingDirectory // ""')
+
+    # Parse schedule
+    local sci_type
+    sci_type=$(echo "$pjson" | jq -r '.StartCalendarInterval | type')
+    if [[ "$sci_type" == "object" ]]; then
+      local hour minute
+      hour=$(echo "$pjson" | jq -r '.StartCalendarInterval.Hour // "*"')
+      minute=$(echo "$pjson" | jq -r '.StartCalendarInterval.Minute // 0')
+      schedule_desc="Daily at $(printf '%02d:%02d' "$hour" "$minute")"
+      schedule_json=$(echo "$pjson" | jq -c '.StartCalendarInterval')
+    elif [[ "$sci_type" == "array" ]]; then
+      local count
+      count=$(echo "$pjson" | jq '.StartCalendarInterval | length')
+      local first_hour first_minute last_hour
+      first_hour=$(echo "$pjson" | jq -r '.StartCalendarInterval[0].Hour // "*"')
+      first_minute=$(echo "$pjson" | jq -r '.StartCalendarInterval[0].Minute // 0')
+      last_hour=$(echo "$pjson" | jq -r '.StartCalendarInterval[-1].Hour // "*"')
+      schedule_desc="Every hour ${first_hour}:$(printf '%02d' "$first_minute")-${last_hour}:$(printf '%02d' "$first_minute") (${count} slots)"
+      schedule_json=$(echo "$pjson" | jq -c '.StartCalendarInterval')
+    else
+      schedule_desc="Unknown"
+      schedule_json="null"
+    fi
+
+    printf '%s\x1e%s\x1e%s\x1e%s\x1e%s\n' "$label" "$plist" "$working_dir" "$schedule_desc" "$schedule_json"
+  done
+}
+
+# Archive cron runs older than 24h that are still needs_review
+_archive_stale_cron_runs() {
+  local cutoff
+  cutoff=$(date -u -v-24H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d '24 hours ago' +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || return 0
+
+  local stale_count
+  stale_count=$(jq -r --arg cutoff "$cutoff" '
+    [.cron_runs[] | select(.status == "needs_review" and .completed_at != null and .completed_at < $cutoff)] | length
+  ' "$GLOBAL_STATE" 2>/dev/null) || return 0
+  [[ "$stale_count" -gt 0 ]] || return 0
+
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg cutoff "$cutoff" '
+    .cron_runs = [.cron_runs[] |
+      if .status == "needs_review" and .completed_at != null and .completed_at < $cutoff then
+        .status = "archived"
+      else . end
+    ]
+  ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+# Install cloard-board binary to ~/.cloard-board/bin/ (outside TCC-protected dirs)
+# launchd jobs cannot access ~/Documents, ~/Desktop, ~/Downloads on macOS
+_install_cron_binary() {
+  local bin_dir="$GLOBAL_DIR/bin"
+  local installed="$bin_dir/cloard-board"
+  mkdir -p "$bin_dir"
+  if [[ ! -f "$installed" ]] || ! diff -q "$SCRIPT_PATH" "$installed" >/dev/null 2>&1; then
+    cp "$SCRIPT_PATH" "$installed"
+    chmod +x "$installed"
+    info "installed cloard-board to $installed"
+  fi
+  echo "$installed"
+}
+
+# Generate a launchd plist for a cron job
+_generate_plist() {
+  local cron_id="$1"
+  local job_name working_dir claude_cmd schedule_type schedule_raw env_json
+  job_name=$(cron_job_field "$cron_id" "name")
+  working_dir=$(cron_job_field "$cron_id" "working_dir")
+  claude_cmd=$(cron_job_field "$cron_id" "claude_command")
+  schedule_type=$(cron_job_field "$cron_id" "schedule_type")
+  schedule_raw=$(jq -r --arg id "$cron_id" '.cron_jobs[] | select(.id == $id) | .schedule_raw' "$GLOBAL_STATE")
+  env_json=$(jq -r --arg id "$cron_id" '.cron_jobs[] | select(.id == $id) | .env_vars // {}' "$GLOBAL_STATE")
+
+  local plist_label="com.cloard-board.${job_name}"
+  local plist_path="$HOME/Library/LaunchAgents/${plist_label}.plist"
+  local log_dir="$GLOBAL_DIR/logs"
+  mkdir -p "$log_dir"
+
+  # Install binary outside TCC-protected dirs for launchd access
+  local script_path
+  script_path=$(_install_cron_binary)
+
+  # Build environment variables XML
+  # Always include PATH (launchd uses minimal PATH) and HOME as defaults;
+  # user-provided env_vars override these if present
+  local launchd_path="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin"
+  local has_user_path=false has_user_home=false
+  if [[ "$env_json" != "{}" && "$env_json" != "null" ]]; then
+    echo "$env_json" | jq -e '.PATH' >/dev/null 2>&1 && has_user_path=true
+    echo "$env_json" | jq -e '.HOME' >/dev/null 2>&1 && has_user_home=true
+  fi
+
+  local env_xml="    <key>EnvironmentVariables</key>
+    <dict>"
+  # Add HOME default if user didn't provide one
+  if ! $has_user_home; then
+    env_xml="${env_xml}
+        <key>HOME</key>
+        <string>${HOME}</string>"
+  fi
+  # Add PATH default if user didn't provide one
+  if ! $has_user_path; then
+    env_xml="${env_xml}
+        <key>PATH</key>
+        <string>${launchd_path}</string>"
+  fi
+  # Add all user-provided env vars
+  if [[ "$env_json" != "{}" && "$env_json" != "null" ]]; then
+    while IFS=$'\x1e' read -r ekey eval; do
+      [[ -n "$ekey" ]] || continue
+      env_xml="${env_xml}
+        <key>${ekey}</key>
+        <string>${eval}</string>"
+    done < <(echo "$env_json" | jq -r 'to_entries[] | [.key, .value] | join("\u001e")')
+  fi
+  env_xml="${env_xml}
+    </dict>"
+
+  # Build schedule XML
+  local schedule_xml=""
+  local sci_type
+  sci_type=$(echo "$schedule_raw" | jq -r 'type' 2>/dev/null) || sci_type="null"
+  if [[ "$sci_type" == "object" ]]; then
+    schedule_xml="    <key>StartCalendarInterval</key>
+    <dict>"
+    while IFS=$'\x1e' read -r skey sval; do
+      [[ -n "$skey" ]] || continue
+      schedule_xml="${schedule_xml}
+        <key>${skey}</key>
+        <integer>${sval}</integer>"
+    done < <(echo "$schedule_raw" | jq -r 'to_entries[] | [.key, (.value | tostring)] | join("\u001e")')
+    schedule_xml="${schedule_xml}
+    </dict>"
+  elif [[ "$sci_type" == "array" ]]; then
+    schedule_xml="    <key>StartCalendarInterval</key>
+    <array>"
+    while IFS= read -r entry; do
+      schedule_xml="${schedule_xml}
+        <dict>"
+      while IFS=$'\x1e' read -r skey sval; do
+        [[ -n "$skey" ]] || continue
+        schedule_xml="${schedule_xml}
+            <key>${skey}</key>
+            <integer>${sval}</integer>"
+      done < <(echo "$entry" | jq -r 'to_entries[] | [.key, (.value | tostring)] | join("\u001e")')
+      schedule_xml="${schedule_xml}
+        </dict>"
+    done < <(echo "$schedule_raw" | jq -c '.[]')
+    schedule_xml="${schedule_xml}
+    </array>"
+  fi
+
+  cat > "$plist_path" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${plist_label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${script_path}</string>
+        <string>cron-exec</string>
+        <string>${cron_id}</string>
+    </array>
+
+${env_xml:+$env_xml
+
+}    <key>WorkingDirectory</key>
+    <string>${working_dir}</string>
+
+${schedule_xml}
+
+    <key>StandardOutPath</key>
+    <string>${log_dir}/${job_name}.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${log_dir}/${job_name}-error.log</string>
+</dict>
+</plist>
+PLIST
+
+  # Store plist path in state
+  update_cron_job_field "$cron_id" "plist_path" "$plist_path"
+  update_cron_job_field "$cron_id" "label" "$plist_label"
+  echo "$plist_path"
+}
+
+# ── Cron: exec wrapper (called by launchd) ────────────────────────────────────
+
+cmd_cron_exec() {
+  local cron_id="${1:-}"
+  [[ -n "$cron_id" ]] || die "usage: cloard-board cron-exec <cron-id>"
+  cron_job_exists "$cron_id" || die "cron job not found: ${cron_id}"
+
+  local enabled
+  enabled=$(cron_job_field "$cron_id" "enabled")
+  [[ "$enabled" == "true" ]] || { echo "cron job ${cron_id} is disabled; skipping"; exit 0; }
+
+  # Check for active runs (overlap prevention)
+  local active_count
+  active_count=$(jq -r --arg id "$cron_id" '[.cron_runs[] | select(.cron_job_id == $id and .status == "active")] | length' "$GLOBAL_STATE" 2>/dev/null) || active_count=0
+  if [[ "$active_count" -gt 0 ]]; then
+    echo "$(now_iso) SKIP: cron job ${cron_id} has an active run"
+    exit 0
+  fi
+
+  # Cleanup stale runs
+  _archive_stale_cron_runs
+
+  # Generate session ID
+  local session_id
+  session_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+
+  # Create run record
+  local run_id
+  run_id=$(_next_run_id)
+  local epoch
+  epoch=$(date +%s)
+  local tmux_win="cron-${cron_id}-${epoch}"
+
+  _lock_state || die "could not acquire lock"
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg rid "$run_id" --arg cid "$cron_id" --arg sid "$session_id" \
+    --arg win "$tmux_win" --arg now "$(now_iso)" '
+    .cron_runs += [{
+      run_id: $rid, cron_job_id: $cid, session_id: $sid,
+      tmux_window: $win, started_at: $now, completed_at: null,
+      exit_code: null, status: "active"
+    }]
+  ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+
+  # Read job config
+  local working_dir claude_cmd env_json
+  working_dir=$(cron_job_field "$cron_id" "working_dir")
+  claude_cmd=$(cron_job_field "$cron_id" "claude_command")
+  env_json=$(jq -c --arg id "$cron_id" '.cron_jobs[] | select(.id == $id) | .env_vars // {}' "$GLOBAL_STATE")
+
+  # Inject --session-id into the claude command
+  claude_cmd="${claude_cmd} --session-id ${session_id}"
+
+  # Build env export string
+  local env_exports=""
+  if [[ "$env_json" != "{}" && "$env_json" != "null" ]]; then
+    while IFS=$'\x1e' read -r ekey eval; do
+      [[ -n "$ekey" ]] || continue
+      env_exports="${env_exports}export ${ekey}=${(q)eval}; "
+    done < <(echo "$env_json" | jq -r 'to_entries[] | [.key, .value] | join("\u001e")')
+  fi
+
+  # Ensure tmux session exists and create window
+  ensure_tmux_session
+  local safe_script=${(q)SCRIPT_PATH}
+  local safe_working_dir=${(q)working_dir}
+  tmux_create_window "$tmux_win" "zsh" "-c" \
+    "${env_exports}cd ${safe_working_dir} && ${claude_cmd}; ${safe_script} _cron_complete ${run_id} \$?; exit"
+
+  # Block until the run completes (poll every 5s for launchd lifecycle)
+  while true; do
+    local rstatus
+    rstatus=$(cron_run_field "$run_id" "status") || break
+    [[ "$rstatus" == "active" ]] || break
+    sleep 5
+  done
+}
+
+cmd__cron_complete() {
+  local run_id="${1:-}" exit_code="${2:-0}"
+  [[ -n "$run_id" ]] || return 0
+
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg rid "$run_id" --arg code "$exit_code" --arg now "$(now_iso)" '
+    (.cron_runs[] | select(.run_id == $rid)) |=
+      (.status = "needs_review" | .exit_code = ($code | tonumber) | .completed_at = $now)
+  ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+# ── Cron commands ─────────────────────────────────────────────────────────────
+
+cmd_cron() {
+  local subcmd="${1:-}"
+  shift 2>/dev/null || true
+  case "$subcmd" in
+    scan)      cmd_cron_scan "$@" ;;
+    add)       cmd_cron_add "$@" ;;
+    list|ls)   cmd_cron_list "$@" ;;
+    runs)      cmd_cron_runs "$@" ;;
+    enable)    cmd_cron_enable "$@" ;;
+    disable)   cmd_cron_disable "$@" ;;
+    remove|rm) cmd_cron_remove "$@" ;;
+    review)    cmd_cron_review "$@" ;;
+    migrate)   cmd_cron_migrate "$@" ;;
+    *)         die "usage: cloard-board cron <scan|add|list|runs|enable|disable|remove|review|migrate>" ;;
+  esac
+}
+
+cmd_cron_scan() {
+  info "scanning ~/Library/LaunchAgents for Claude-invoking jobs..."
+  local found=0
+  while IFS=$'\x1e' read -r label ppath wdir sdesc sjson; do
+    [[ -n "$label" ]] || continue
+    found=$((found + 1))
+    echo ""
+    echo "  ${C_BOLD}${label}${C_RESET}"
+    echo "  plist: ${ppath}"
+    echo "  working dir: ${wdir}"
+    echo "  schedule: ${sdesc}"
+  done < <(_scan_launch_agents)
+
+  if [[ $found -eq 0 ]]; then
+    echo "  ${C_DIM}no Claude-invoking LaunchAgents found${C_RESET}"
+  else
+    echo ""
+    info "found ${found} job(s). Run 'cloard-board cron migrate' to import them."
+  fi
+}
+
+cmd_cron_add() {
+  # Interactive: working dir, schedule, Claude command, job name
+  local name="" working_dir="" claude_cmd="" schedule_type="" schedule_desc="" schedule_raw=""
+
+  # Working directory
+  printf "${C_CYAN}Working directory: ${C_RESET}"
+  read -r working_dir
+  working_dir="${working_dir%$'\r'}"
+  working_dir="${working_dir## }"
+  working_dir="${working_dir%% }"
+  working_dir="${(Q)working_dir}"
+  [[ -d "$working_dir" ]] || die "directory not found: ${working_dir}"
+
+  # Job name
+  printf "${C_CYAN}Job name (e.g. morning-routine): ${C_RESET}"
+  read -r name
+  name="${name%$'\r'}"
+  name="${name## }"
+  name="${name%% }"
+  [[ -n "$name" ]] || die "name is required"
+  # Sanitize: lowercase, hyphens only
+  name=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr ' _' '-' | tr -cd 'a-z0-9-')
+
+  # Schedule
+  echo "${C_CYAN}Schedule:${C_RESET}"
+  echo "  1) Daily at HH:MM"
+  echo "  2) Hourly (within a time range)"
+  echo "  3) Every N minutes (within a time range)"
+  printf "${C_CYAN}Choice [1-3]: ${C_RESET}"
+  local stype_choice=""
+  read -r stype_choice
+  case "$stype_choice" in
+    1)
+      schedule_type="daily"
+      printf "${C_CYAN}Time (HH:MM, 24h): ${C_RESET}"
+      local time_str=""
+      read -r time_str
+      local hour minute
+      hour=$(echo "$time_str" | cut -d: -f1 | sed 's/^0//')
+      minute=$(echo "$time_str" | cut -d: -f2 | sed 's/^0//')
+      schedule_desc="Daily at ${time_str}"
+      schedule_raw=$(jq -n --argjson h "$hour" --argjson m "$minute" '{Hour: $h, Minute: $m}')
+      ;;
+    2)
+      schedule_type="hourly"
+      printf "${C_CYAN}Start hour (0-23): ${C_RESET}"
+      local start_h="" end_h="" at_min=""
+      read -r start_h
+      printf "${C_CYAN}End hour (0-23): ${C_RESET}"
+      read -r end_h
+      printf "${C_CYAN}At minute (0-59) [0]: ${C_RESET}"
+      read -r at_min
+      [[ -n "$at_min" ]] || at_min=0
+      schedule_desc="Hourly ${start_h}:$(printf '%02d' "$at_min")-${end_h}:$(printf '%02d' "$at_min")"
+      schedule_raw="["
+      local h_sep=""
+      for (( h=start_h; h<=end_h; h++ )); do
+        schedule_raw="${schedule_raw}${h_sep}{\"Hour\":${h},\"Minute\":${at_min}}"
+        h_sep=","
+      done
+      schedule_raw="${schedule_raw}]"
+      ;;
+    3)
+      schedule_type="interval"
+      printf "${C_CYAN}Interval in minutes (e.g. 30): ${C_RESET}"
+      local interval="" start_h="" end_h=""
+      read -r interval
+      printf "${C_CYAN}Start hour (0-23): ${C_RESET}"
+      read -r start_h
+      printf "${C_CYAN}End hour (0-23): ${C_RESET}"
+      read -r end_h
+      schedule_desc="Every ${interval}m ${start_h}:00-${end_h}:00"
+      schedule_raw="["
+      local h_sep=""
+      for (( h=start_h; h<=end_h; h++ )); do
+        for (( m=0; m<60; m+=interval )); do
+          schedule_raw="${schedule_raw}${h_sep}{\"Hour\":${h},\"Minute\":${m}}"
+          h_sep=","
+        done
+      done
+      schedule_raw="${schedule_raw}]"
+      ;;
+    *)
+      die "invalid schedule choice"
+      ;;
+  esac
+
+  # Claude command
+  echo "${C_CYAN}Claude command (the full 'claude -p \"...\" --model ... --allowedTools ...' line):${C_RESET}"
+  printf "${C_CYAN}> ${C_RESET}"
+  read -r claude_cmd
+  [[ -n "$claude_cmd" ]] || die "claude command is required"
+
+  # Environment variables
+  local env_vars="{}"
+  printf "${C_CYAN}Copy environment from current shell? (CLAUDE_CODE_OAUTH_TOKEN, PATH) [Y/n]: ${C_RESET}"
+  local env_choice=""
+  read -r env_choice
+  if [[ ! "$env_choice" =~ ^[nN]$ ]]; then
+    env_vars=$(jq -n \
+      --arg token "${CLAUDE_CODE_OAUTH_TOKEN:-}" \
+      --arg home "$HOME" \
+      --arg path "$PATH" \
+      '{CLAUDE_CODE_OAUTH_TOKEN: $token, HOME: $home, PATH: $path} | with_entries(select(.value != ""))')
+  fi
+
+  # Create cron job in state
+  local cron_id
+  cron_id=$(_next_cron_id)
+
+  _lock_state || die "could not acquire lock"
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$cron_id" --arg name "$name" --arg wdir "$working_dir" \
+    --arg cmd "$claude_cmd" --arg stype "$schedule_type" --arg sdesc "$schedule_desc" \
+    --argjson sraw "$schedule_raw" --argjson env "$env_vars" --arg now "$(now_iso)" '
+    .cron_jobs += [{
+      id: $id, label: "", name: $name, plist_path: "",
+      working_dir: $wdir, claude_command: $cmd,
+      schedule_type: $stype, schedule_desc: $sdesc, schedule_raw: $sraw,
+      enabled: true, created_at: $now, env_vars: $env
+    }]
+  ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+
+  # Generate and load plist
+  local plist_path
+  plist_path=$(_generate_plist "$cron_id")
+  launchctl load "$plist_path" 2>/dev/null || warn "failed to load plist (may need manual load)"
+  ok "created cron job ${cron_id} '${name}' (${schedule_desc})"
+  info "plist: ${plist_path}"
+}
+
+cmd_cron_list() {
+  local jobs
+  jobs=$(jq -r '.cron_jobs[] | [.id, .name, .schedule_desc, (if .enabled then "enabled" else "disabled" end)] | join("\u001e")' "$GLOBAL_STATE" 2>/dev/null) || true
+
+  if [[ -z "$jobs" ]]; then
+    echo "  ${C_DIM}no cron jobs configured${C_RESET}"
+    return
+  fi
+
+  printf "${C_BOLD}%-10s %-25s %-35s %s${C_RESET}\n" "ID" "Name" "Schedule" "Status"
+  while IFS=$'\x1e' read -r cid cname cschedule cstatus; do
+    [[ -n "$cid" ]] || continue
+    local sc=""
+    [[ "$cstatus" == "enabled" ]] && sc="${C_GREEN}" || sc="${C_RED}"
+    printf "%-10s %-25s %-35s ${sc}%s${C_RESET}\n" "$cid" "$cname" "$cschedule" "$cstatus"
+  done <<< "$jobs"
+}
+
+cmd_cron_runs() {
+  local filter_id="${1:-}"
+  local runs
+  if [[ -n "$filter_id" ]]; then
+    runs=$(jq -r --arg id "$filter_id" '
+      .cron_runs[] | select(.cron_job_id == $id and (.status == "active" or .status == "needs_review")) |
+      [.run_id, .cron_job_id, .status, .started_at, (.exit_code | tostring)] | join("\u001e")
+    ' "$GLOBAL_STATE" 2>/dev/null) || true
+  else
+    runs=$(jq -r '
+      .cron_runs[] | select(.status == "active" or .status == "needs_review") |
+      [.run_id, .cron_job_id, .status, .started_at, (.exit_code | tostring)] | join("\u001e")
+    ' "$GLOBAL_STATE" 2>/dev/null) || true
+  fi
+
+  if [[ -z "$runs" ]]; then
+    echo "  ${C_DIM}no active or unreviewed runs${C_RESET}"
+    return
+  fi
+
+  printf "${C_BOLD}%-10s %-10s %-15s %-25s %s${C_RESET}\n" "Run ID" "Job ID" "Status" "Started" "Exit"
+  while IFS=$'\x1e' read -r rid cid rstatus started ecode; do
+    [[ -n "$rid" ]] || continue
+    local sc=""
+    [[ "$rstatus" == "active" ]] && sc="${C_GREEN}" || sc="${C_YELLOW}"
+    printf "%-10s %-10s ${sc}%-15s${C_RESET} %-25s %s\n" "$rid" "$cid" "$rstatus" "$started" "$ecode"
+  done <<< "$runs"
+}
+
+cmd_cron_enable() {
+  local cron_id="${1:-}"
+  [[ -n "$cron_id" ]] || die "usage: cloard-board cron enable <id>"
+  cron_job_exists "$cron_id" || die "cron job not found: ${cron_id}"
+
+  update_cron_job_field_raw "$cron_id" "enabled" "true"
+
+  local plist_path
+  plist_path=$(cron_job_field "$cron_id" "plist_path")
+  if [[ -n "$plist_path" && -f "$plist_path" ]]; then
+    launchctl load "$plist_path" 2>/dev/null || warn "failed to load plist"
+  fi
+  ok "enabled cron job ${cron_id}"
+}
+
+cmd_cron_disable() {
+  local cron_id="${1:-}"
+  [[ -n "$cron_id" ]] || die "usage: cloard-board cron disable <id>"
+  cron_job_exists "$cron_id" || die "cron job not found: ${cron_id}"
+
+  local plist_path
+  plist_path=$(cron_job_field "$cron_id" "plist_path")
+  if [[ -n "$plist_path" && -f "$plist_path" ]]; then
+    launchctl unload "$plist_path" 2>/dev/null || warn "failed to unload plist"
+  fi
+
+  update_cron_job_field_raw "$cron_id" "enabled" "false"
+  ok "disabled cron job ${cron_id}"
+}
+
+cmd_cron_remove() {
+  local cron_id="${1:-}"
+  [[ -n "$cron_id" ]] || die "usage: cloard-board cron remove <id>"
+  cron_job_exists "$cron_id" || die "cron job not found: ${cron_id}"
+
+  local name
+  name=$(cron_job_field "$cron_id" "name")
+
+  printf "${C_RED}Delete cron job '${name}' (${cron_id})? Type DELETE to confirm: ${C_RESET}"
+  local confirm=""
+  read -r confirm
+  [[ "$confirm" == "DELETE" ]] || { echo "cancelled"; return 0; }
+
+  # Unload plist
+  local plist_path
+  plist_path=$(cron_job_field "$cron_id" "plist_path")
+  if [[ -n "$plist_path" && -f "$plist_path" ]]; then
+    launchctl unload "$plist_path" 2>/dev/null || true
+    rm -f "$plist_path"
+  fi
+
+  # Remove from state
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+  jq --arg id "$cron_id" '
+    .cron_jobs = [.cron_jobs[] | select(.id != $id)] |
+    .cron_runs = [.cron_runs[] | select(.cron_job_id != $id)]
+  ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  ok "removed cron job ${cron_id} '${name}'"
+}
+
+cmd_cron_review() {
+  local run_id="${1:-}"
+  [[ -n "$run_id" ]] || die "usage: cloard-board cron review <run-id>"
+
+  local rstatus
+  rstatus=$(cron_run_field "$run_id" "status")
+  [[ -n "$rstatus" ]] || die "run not found: ${run_id}"
+  [[ "$rstatus" == "needs_review" ]] || die "run ${run_id} is not in needs_review status (current: ${rstatus})"
+
+  update_cron_run_field "$run_id" "status" "reviewed"
+  ok "marked run ${run_id} as reviewed"
+}
+
+cmd_cron_migrate() {
+  info "scanning for Claude-invoking LaunchAgents to migrate..."
+  local found=0
+  while IFS=$'\x1e' read -r label ppath wdir sdesc sjson; do
+    [[ -n "$label" ]] || continue
+    found=$((found + 1))
+
+    echo ""
+    echo "  ${C_BOLD}${label}${C_RESET}"
+    echo "  plist: ${ppath}"
+    echo "  schedule: ${sdesc}"
+
+    printf "  ${C_CYAN}Migrate this job? [Y/n]: ${C_RESET}"
+    local ans=""
+    read -r ans
+    [[ "$ans" =~ ^[nN]$ ]] && continue
+
+    # Extract name from label (last component)
+    local jname
+    jname=$(echo "$label" | sed 's/.*\.//')
+
+    # Extract Claude command from the referenced script
+    local pjson claude_cmd="" env_vars="{}"
+    pjson=$(plutil -convert json -o - "$ppath" 2>/dev/null) || continue
+    local script_path
+    script_path=$(echo "$pjson" | jq -r '.ProgramArguments // [] | if length > 1 then .[1] else "" end')
+    if [[ -n "$script_path" && -f "$script_path" ]]; then
+      # Find the claude command line in the script
+      claude_cmd=$(grep -E '^\s*(env [^|]*)?(\$CLAUDE_BIN|claude)\b' "$script_path" 2>/dev/null | head -1 | sed 's/^\s*//')
+      # Replace $CLAUDE_BIN with "claude"
+      claude_cmd=$(echo "$claude_cmd" | sed 's|\$CLAUDE_BIN|claude|g; s|env -u [A-Z_]* ||g; s|>> .*||; s|2>&1||; s|\s*$||')
+    fi
+
+    if [[ -z "$claude_cmd" ]]; then
+      printf "  ${C_CYAN}Could not auto-extract Claude command. Enter it manually: ${C_RESET}"
+      read -r claude_cmd
+      [[ -n "$claude_cmd" ]] || { warn "skipping (no command)"; continue; }
+    else
+      echo "  ${C_DIM}detected command: ${claude_cmd}${C_RESET}"
+    fi
+
+    # Extract env vars from plist
+    env_vars=$(echo "$pjson" | jq -c '.EnvironmentVariables // {}')
+
+    # Determine schedule type
+    local schedule_type="daily"
+    local sci_type
+    sci_type=$(echo "$sjson" | jq -r 'type' 2>/dev/null) || sci_type="null"
+    if [[ "$sci_type" == "array" ]]; then
+      local count
+      count=$(echo "$sjson" | jq 'length')
+      if [[ $count -gt 1 ]]; then
+        schedule_type="hourly"
+      fi
+    fi
+
+    # Create cron job in state
+    local cron_id
+    cron_id=$(_next_cron_id)
+
+    _lock_state || continue
+    local tmp
+    tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+    jq --arg id "$cron_id" --arg name "$jname" --arg wdir "$wdir" \
+      --arg cmd "$claude_cmd" --arg stype "$schedule_type" --arg sdesc "$sdesc" \
+      --argjson sraw "$sjson" --argjson env "$env_vars" --arg now "$(now_iso)" \
+      --arg old_label "$label" '
+      .cron_jobs += [{
+        id: $id, label: $old_label, name: $name, plist_path: "",
+        working_dir: $wdir, claude_command: $cmd,
+        schedule_type: $stype, schedule_desc: $sdesc, schedule_raw: $sraw,
+        enabled: true, created_at: $now, env_vars: $env
+      }]
+    ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+    _unlock_state
+
+    # Generate new plist
+    local new_plist
+    new_plist=$(_generate_plist "$cron_id")
+
+    # Unload old, load new
+    launchctl unload "$ppath" 2>/dev/null || true
+    launchctl load "$new_plist" 2>/dev/null || warn "failed to load new plist"
+
+    # Archive old plist
+    local date_suffix
+    date_suffix=$(date +%Y%m%d)
+    mv "$ppath" "${ppath}.migrated-${date_suffix}" 2>/dev/null || true
+
+    ok "migrated '${jname}' as ${cron_id} (old plist archived)"
+  done
+
+  if [[ $found -eq 0 ]]; then
+    echo "  ${C_DIM}no Claude-invoking LaunchAgents found to migrate${C_RESET}"
+  fi
 }
 
 # ── Repo commands ──────────────────────────────────────────────────────────────
@@ -872,7 +1717,6 @@ cmd_list() {
       paused)       color="$C_CYAN" ;;
       active)       color="$C_GREEN" ;;
       needs_review) color="$C_YELLOW" ;;
-      review)       color="$C_MAGENTA" ;;
       done)         color="$C_DIM" ;;
     esac
     local pr_display=""
@@ -1027,93 +1871,13 @@ cmd_advance() {
       ok "advanced '${id}': active -> needs_review"
       ;;
     needs_review)
-      info "advancing '${id}': needs_review -> review (pushing and creating PR)"
-      cmd_review "$id"
-      ;;
-    review)
-      info "advancing '${id}': review -> done"
+      info "advancing '${id}': needs_review -> done"
       cmd_done "$id"
       ;;
     done)
       warn "task '${id}' is already done"
       ;;
   esac
-}
-
-cmd_review() {
-  require_cmd gh
-  local id="${1:-}"
-  [[ -n "$id" ]] || die "usage: cloard-board review <id>"
-  task_exists "$id" || die "task '$id' not found"
-
-  local tsk_status
-  tsk_status=$(task_status "$id")
-  [[ "$tsk_status" == "needs_review" || "$tsk_status" == "active" ]] || \
-    die "task '$id' is '${tsk_status}'; must be 'needs_review' or 'active' to review"
-
-  # Look up repo
-  local repo_name
-  repo_name=$(task_repo "$id")
-  local rpath
-  rpath=$(repo_path "$repo_name")
-  local rtype
-  rtype=$(repo_type "$repo_name")
-
-  [[ "$rtype" == "git" ]] || die "review not available for non-git repos"
-  [[ -d "$rpath" ]] || die "repo path not found: $rpath"
-
-  local wt_mode
-  wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$GLOBAL_STATE")
-
-  local work_dir branch
-  if [[ "$wt_mode" == "none" ]]; then
-    work_dir="$rpath"
-    branch=$(cd "$rpath" && git rev-parse --abbrev-ref HEAD)
-  else
-    work_dir=$(find_worktree_path "$id" "$rpath")
-    if [[ -z "$work_dir" ]]; then
-      die "could not find worktree for task '${id}'"
-    fi
-    branch="worktree-${id}"
-  fi
-
-  local base_branch
-  base_branch=$(repo_base_branch "$repo_name")
-  local title
-  title=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .title' "$GLOBAL_STATE")
-
-  info "pushing branch '${branch}'..."
-  (cd "$work_dir" && git push -u origin "$branch") || die "git push failed"
-
-  # Check for existing PR
-  local pr_url
-  pr_url=$(cd "$work_dir" && gh pr view --json url -q '.url' 2>/dev/null || true)
-
-  if [[ -n "$pr_url" ]]; then
-    warn "PR already exists: ${pr_url}"
-  else
-    info "creating PR..."
-    pr_url=$(cd "$work_dir" && gh pr create \
-      --base "$base_branch" \
-      --head "$branch" \
-      --title "$title" \
-      --body "Task: \`${id}\`
-
-Created by cloard-board." 2>/dev/null) || die "gh pr create failed"
-  fi
-
-  local pr_number
-  pr_number=$(cd "$work_dir" && gh pr view --json number -q '.number' 2>/dev/null || true)
-
-  update_task_field "$id" "status" "review"
-  update_task_field_raw "$id" "claude_status" "null"
-  update_task_field "$id" "pr_url" "$pr_url"
-  if [[ -n "$pr_number" ]]; then
-    update_task_field_raw "$id" "pr_number" "$pr_number"
-  fi
-
-  ok "PR: ${pr_url}"
-  ok "task '${id}' is now in review"
 }
 
 cmd_done() {
@@ -1154,6 +1918,60 @@ cmd_done() {
   update_task_field_raw "$id" "claude_status" "null"
 
   ok "task '${id}' marked done; window and worktree cleaned up"
+}
+
+cmd_reopen() {
+  require_cmd claude
+
+  local id="${1:-}"
+  [[ -n "$id" ]] || die "usage: cloard-board reopen <id>"
+  task_exists "$id" || die "task '$id' not found"
+
+  local tsk_status
+  tsk_status=$(task_status "$id")
+  [[ "$tsk_status" == "done" ]] || die "task '$id' is '${tsk_status}'; only 'done' tasks can be reopened"
+
+  # Look up repo
+  local repo_name
+  repo_name=$(task_repo "$id")
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  [[ -d "$rpath" ]] || die "repo path not found: $rpath"
+
+  local safe_global_dir=${(q)GLOBAL_DIR}
+  local safe_repo_path=${(q)rpath}
+  local safe_work_dir=${(q)rpath}
+
+  ensure_tmux_session
+
+  if tmux_window_exists "$id"; then
+    info "window '${id}' already exists; switching to it"
+  else
+    # Worktree was removed by cmd_done, so always work from repo root
+    local reopen_prompt="${2:-}"
+    local dash_claude_cmd="claude --continue --dangerously-skip-permissions"
+    if [[ -n "$reopen_prompt" ]]; then
+      local escaped="${reopen_prompt//\'/\'\\\'\'}"
+      dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+    fi
+    tmux_create_window "$id" "zsh" "-c" \
+      "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+    info "reopened task '${id}' with claude --continue (from repo root)"
+  fi
+
+  # Update state: reactivate the task
+  update_task_field "$id" "status" "active"
+  update_task_field "$id" "worktree_mode" "none"
+  update_task_field_raw "$id" "branch" "null"
+  update_task_field_raw "$id" "completed_at" "null"
+
+  if [[ -z "${TMUX:-}" ]]; then
+    tmux_cmd attach -t "board:${id}"
+  else
+    tmux_select_window "$id"
+  fi
+
+  ok "task '${id}' reopened"
 }
 
 cmd_pause() {
@@ -1383,15 +2201,58 @@ cmd_doctor() {
     fi
   done < <(jq -r '.tasks[] | select(.status == "active") | .id' "$GLOBAL_STATE")
 
-  # Check for tmux windows with no matching task
+  # Check for tmux windows with no matching task (skip cron windows)
   if tmux_session_exists; then
     while read -r wname; do
       [[ -z "$wname" || "$wname" == "dashboard" ]] && continue
+      [[ "$wname" == cron-* || "$wname" == resume-* ]] && continue
       if ! task_exists "$wname"; then
         warn "orphaned tmux window: '${wname}' (no matching task)"
         issues=$((issues + 1))
       fi
     done < <(tmux_cmd list-windows -t "board" -F '#{window_name}' 2>/dev/null)
+  fi
+
+  # Check cron jobs health
+  local cron_count
+  cron_count=$(jq '.cron_jobs | length' "$GLOBAL_STATE" 2>/dev/null) || cron_count=0
+  if [[ "$cron_count" -gt 0 ]]; then
+    info "checking ${cron_count} cron job(s)..."
+
+    # Check for missing plist files
+    while IFS=$'\x1e' read -r cid cplist; do
+      [[ -n "$cid" ]] || continue
+      if [[ -n "$cplist" && ! -f "$cplist" ]]; then
+        warn "cron job '${cid}': plist not found (${cplist})"
+        issues=$((issues + 1))
+      fi
+    done < <(jq -r '.cron_jobs[] | [.id, .plist_path] | join("\u001e")' "$GLOBAL_STATE")
+
+    # Prune old archived/reviewed runs (older than 7 days)
+    local prune_cutoff
+    prune_cutoff=$(date -u -v-7d +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d '7 days ago' +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || true
+    if [[ -n "$prune_cutoff" ]]; then
+      local prune_count
+      prune_count=$(jq -r --arg cutoff "$prune_cutoff" '
+        [.cron_runs[] | select((.status == "archived" or .status == "reviewed") and .completed_at != null and .completed_at < $cutoff)] | length
+      ' "$GLOBAL_STATE" 2>/dev/null) || prune_count=0
+      if [[ "$prune_count" -gt 0 ]]; then
+        info "pruning ${prune_count} old cron run(s)..."
+        _lock_state || true
+        local tmp
+        tmp=$(mktemp "${GLOBAL_DIR}/.cron.XXXXXX")
+        jq --arg cutoff "$prune_cutoff" '
+          .cron_runs = [.cron_runs[] | select(
+            not((.status == "archived" or .status == "reviewed") and .completed_at != null and .completed_at < $cutoff)
+          )]
+        ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+        _unlock_state
+        ok "pruned ${prune_count} old run(s)"
+      fi
+    fi
+
+    # Archive stale needs_review runs
+    _archive_stale_cron_runs
   fi
 
   if [[ "$issues" -eq 0 ]]; then
@@ -1404,40 +2265,79 @@ cmd_doctor() {
 # ── Dashboard TUI ──────────────────────────────────────────────────────────────
 
 # Read a line from stdin; return 1 (cancelled) if user presses Esc.
+# Uses raw mode throughout so Esc is detected at any position (not just first char).
+# Manually echoes characters and handles backspace.
 # Usage: _read_or_esc varname  -> sets varname, returns 0; or returns 1 on Esc/Ctrl-C.
 _read_or_esc() {
   local _varname="$1"
   local _line=""
-  # Temporarily switch to raw mode to catch Esc as first char
   stty -echo raw
-  local _first_char=""
-  read -rk1 _first_char 2>/dev/null || { stty echo -raw; return 1; }
-  if [[ "$_first_char" == $'\e' || "$_first_char" == $'\x03' ]]; then
-    # Drain any buffered keypresses (user mashing Esc)
-    local _discard=""
-    while read -rk1 -t 0.05 _discard 2>/dev/null; do :; done
-    # Restore line mode but keep echo OFF so nothing leaks before handler cleanup
-    stty -raw
-    echo ""
-    eval "$_varname=''"
-    return 1
-  fi
-  stty echo -raw
-  # Got a normal char; read the rest of the line in cooked mode
-  if [[ "$_first_char" == $'\n' || "$_first_char" == $'\r' ]]; then
-    _line=""
-  else
-    local _rest=""
-    read -r _rest 2>/dev/null || true
-    _line="${_first_char}${_rest}"
-  fi
-  eval "$_varname=\${_line}"
-  return 0
+  local _char=""
+  while true; do
+    read -rk1 _char 2>/dev/null || { stty echo -raw; eval "$_varname=''"; return 1; }
+    case "$_char" in
+      $'\e'|$'\x03')
+        # Esc or Ctrl-C: drain buffered keys, cancel
+        local _discard=""
+        while read -rk1 -t 0.05 _discard 2>/dev/null; do :; done
+        stty echo -raw
+        echo ""
+        eval "$_varname=''"
+        return 1
+        ;;
+      $'\n'|$'\r')
+        # Enter: submit
+        stty echo -raw
+        echo ""
+        eval "$_varname=\${_line}"
+        return 0
+        ;;
+      $'\x7f'|$'\b')
+        # Backspace/Delete: remove last char
+        if [[ -n "$_line" ]]; then
+          _line="${_line%?}"
+          printf '\b \b'
+        fi
+        ;;
+      $'\x15')
+        # Ctrl-U: kill entire line
+        local _len=${#_line}
+        while [[ $_len -gt 0 ]]; do
+          printf '\b \b'
+          _len=$((_len - 1))
+        done
+        _line=""
+        ;;
+      $'\x17')
+        # Ctrl-W: kill last word (no EXTENDED_GLOB needed)
+        local _old_len=${#_line}
+        # Strip trailing spaces
+        while [[ "$_line" == *' ' ]]; do
+          _line="${_line% }"
+        done
+        # Strip the word (trailing non-spaces)
+        while [[ -n "$_line" ]] && [[ "$_line" != *' ' ]]; do
+          _line="${_line%?}"
+        done
+        local _erased=$((_old_len - ${#_line}))
+        while [[ $_erased -gt 0 ]]; do
+          printf '\b \b'
+          _erased=$((_erased - 1))
+        done
+        ;;
+      *)
+        # Normal char: accumulate and echo
+        _line="${_line}${_char}"
+        printf '%s' "$_char"
+        ;;
+    esac
+  done
 }
 
 # Column names and matching statuses
-readonly -a COL_NAMES=("Pending" "Active" "Needs Review" "In PR" "Done")
-readonly -a COL_STATUSES=("pending" "active" "needs_review" "review" "done")
+readonly -a COL_NAMES=("Pending" "Active" "Needs Review" "Done")
+readonly -a CRON_COL_NAMES=("Scheduled" "Active" "Needs Review" "Done")
+readonly -a COL_STATUSES=("pending" "active" "needs_review" "done")
 
 # Column colours
 col_color() {
@@ -1445,8 +2345,7 @@ col_color() {
     0) echo "$C_DIM" ;;       # pending
     1) echo "$C_GREEN" ;;     # active
     2) echo "$C_YELLOW" ;;    # needs_review
-    3) echo "$C_MAGENTA" ;;   # review
-    4) echo "$C_DIM" ;;       # done
+    3) echo "$C_DIM" ;;       # done
   esac
 }
 
@@ -1492,11 +2391,26 @@ _snapshot_tasks() {
   _active_count=0
   _review_count=0
 
+  # Cron data
+  _cron_jobs=()           # id -> name
+  _cron_job_enabled=()    # id -> true/false
+  _cron_job_schedule=()   # id -> schedule_desc
+  _cron_run_data=()       # run_id -> "cron_job_id\x1estatus\x1eexit_code\x1estarted_at\x1esession_id\x1etmux_window"
+  _cron_col_ids=()        # __cron:N -> space-separated IDs
+  _cron_col_cnt=()        # __cron:N -> count
+  _has_cron_data=false
+  for _ci in {0..3}; do
+    _cron_col_ids["__cron:${_ci}"]=""
+    _cron_col_cnt["__cron:${_ci}"]=0
+  done
+
   local _snap
   _snap=$(jq -r '
     ("H\u001e" + (.next_task_id | tostring) + "\u001e" + (.repos | length | tostring) + "\u001e" + (.tasks | length | tostring)),
     (.repos[] | "R\u001e" + .name + "\u001e" + .path + "\u001e" + (.type // "git") + "\u001e" + (if .archived == true then "1" else "0" end)),
-    (.tasks[] | "T\u001e" + .id + "\u001e" + .status + "\u001e" + (.title // "") + "\u001e" + (.pr_url // "") + "\u001e" + (.claude_status // "") + "\u001e" + (.worktree_mode // "worktree") + "\u001e" + (.repo // ""))
+    (.tasks[] | "T\u001e" + .id + "\u001e" + .status + "\u001e" + (.title // "") + "\u001e" + (.pr_url // "") + "\u001e" + (.claude_status // "") + "\u001e" + (.worktree_mode // "worktree") + "\u001e" + (.repo // "")),
+    (.cron_jobs[]? | "CJ\u001e" + .id + "\u001e" + .name + "\u001e" + (if .enabled then "true" else "false" end) + "\u001e" + (.schedule_desc // "")),
+    (.cron_runs[]? | select(.status == "active" or .status == "needs_review" or .status == "reviewed") | "CR\u001e" + .run_id + "\u001e" + .cron_job_id + "\u001e" + .status + "\u001e" + (.exit_code | tostring) + "\u001e" + (.started_at // "") + "\u001e" + (.session_id // "") + "\u001e" + (.tmux_window // ""))
   ' "$GLOBAL_STATE" 2>/dev/null) || return 0
 
   while IFS=$'\x1e' read -r _type _f1 _f2 _f3 _f4 _f5 _f6 _f7; do
@@ -1514,7 +2428,7 @@ _snapshot_tasks() {
             _repo_stale[$_f1]="1"
           fi
           _repo_task_count[$_f1]=0
-          for _ci in {0..4}; do
+          for _ci in {0..3}; do
             _repo_cols["${_f1}:${_ci}"]=""
             _repo_col_cnt["${_f1}:${_ci}"]=0
           done
@@ -1530,7 +2444,7 @@ _snapshot_tasks() {
         _task_repo[$_f1]="$_f7"
 
         [[ "$_f2" == "active" ]] && _active_count=$((_active_count + 1))
-        [[ "$_f2" == "review" || "$_f2" == "needs_review" ]] && _review_count=$((_review_count + 1))
+        [[ "$_f2" == "needs_review" ]] && _review_count=$((_review_count + 1))
 
         # Assign to repo column
         local _col_idx
@@ -1538,8 +2452,7 @@ _snapshot_tasks() {
           pending|paused) _col_idx=0 ;;
           active)         _col_idx=1 ;;
           needs_review)   _col_idx=2 ;;
-          review)         _col_idx=3 ;;
-          done)           _col_idx=4 ;;
+          done)           _col_idx=3 ;;
           *) continue ;;
         esac
 
@@ -1557,6 +2470,45 @@ _snapshot_tasks() {
         _repo_col_cnt[$_key]=$(( ${_repo_col_cnt[$_key]:-0} + 1 ))
         _repo_task_count[$_f7]=$(( ${_repo_task_count[$_f7]:-0} + 1 ))
         ;;
+      CJ)
+        # _f1=id, _f2=name, _f3=enabled, _f4=schedule_desc
+        _cron_jobs[$_f1]="$_f2"
+        _cron_job_enabled[$_f1]="$_f3"
+        _cron_job_schedule[$_f1]="$_f4"
+        _has_cron_data=true
+        # Enabled jobs go to col 0 (Scheduled)
+        if [[ "$_f3" == "true" ]]; then
+          local _ck="__cron:0"
+          if [[ -n "${_cron_col_ids[$_ck]:-}" ]]; then
+            _cron_col_ids[$_ck]="${_cron_col_ids[$_ck]} $_f1"
+          else
+            _cron_col_ids[$_ck]="$_f1"
+          fi
+          _cron_col_cnt[$_ck]=$(( ${_cron_col_cnt[$_ck]:-0} + 1 ))
+        fi
+        ;;
+      CR)
+        # _f1=run_id, _f2=cron_job_id, _f3=status, _f4=exit_code, _f5=started_at, _f6=session_id, _f7=tmux_window
+        _cron_run_data[$_f1]="${_f2}\x1e${_f3}\x1e${_f4}\x1e${_f5}\x1e${_f6}\x1e${_f7}"
+        _has_cron_data=true
+        local _cron_col
+        if [[ "$_f3" == "active" ]]; then
+          _cron_col=1
+        elif [[ "$_f3" == "needs_review" ]]; then
+          _cron_col=2
+        elif [[ "$_f3" == "reviewed" ]]; then
+          _cron_col=3
+        else
+          continue
+        fi
+        local _ck="__cron:${_cron_col}"
+        if [[ -n "${_cron_col_ids[$_ck]:-}" ]]; then
+          _cron_col_ids[$_ck]="${_cron_col_ids[$_ck]} $_f1"
+        else
+          _cron_col_ids[$_ck]="$_f1"
+        fi
+        _cron_col_cnt[$_ck]=$(( ${_cron_col_cnt[$_ck]:-0} + 1 ))
+        ;;
     esac
   done <<< "$_snap"
 }
@@ -1568,6 +2520,25 @@ _get_repo_task_at() {
   [[ -n "$ids_str" ]] || { _tid=""; return; }
   local -a ids_arr=(${(s: :)ids_str})
   _tid="${ids_arr[$row]:-}"
+}
+
+# Get cron item ID at a position within a cron column
+_get_cron_item_at() {
+  local col="$1" row="$2"
+  local ids_str="${_cron_col_ids[__cron:${col}]:-}"
+  [[ -n "$ids_str" ]] || { _tid=""; return; }
+  local -a ids_arr=(${(s: :)ids_str})
+  _tid="${ids_arr[$row]:-}"
+}
+
+# Get selected cron item ID for current navigation state
+_get_selected_cron_id() {
+  _tid=""
+  local cnt="${_cron_col_cnt[__cron:${cur_cron_col}]:-0}"
+  [[ $cnt -gt 0 ]] || return 1
+  local crow="${cur_cron_card_row[${cur_cron_col}]:-0}"
+  _get_cron_item_at "$cur_cron_col" "$crow"
+  [[ -n "$_tid" ]] || return 1
 }
 
 # Get selected task ID for current navigation state
@@ -1613,14 +2584,27 @@ cmd_dash() {
     return 1
   fi
 
-  # Already inside cloard-board tmux; just switch to dashboard
-  tmux_select_window "dashboard"
+  # Already inside cloard-board tmux; recreate dashboard if needed, then switch
+  cmd__dash_switch
+}
+
+# Switch to dashboard window, recreating it if closed
+cmd__dash_switch() {
+  ensure_tmux_session
+  if ! tmux_window_exists "dashboard"; then
+    tmux_cmd new-window -t "board" -n "dashboard"
+    local safe_script=${(q)SCRIPT_PATH}
+    tmux_cmd respawn-window -k -t "board:dashboard" "exec ${safe_script} _dash_loop"
+    pin_dashboard_to_zero
+  fi
+  tmux_cmd select-window -t "board:dashboard"
 }
 
 # The actual dashboard rendering loop (run inside tmux window)
 cmd__dash_loop() {
   set +x  # Disable any inherited trace mode
   set +e  # Prevent unguarded commands from killing the TUI loop
+  set +u  # Allow unset assoc-array keys (collapsed state, scroll offsets, etc.)
   setopt TYPESET_SILENT 2>/dev/null
 
   zmodload zsh/datetime 2>/dev/null || true
@@ -1630,12 +2614,21 @@ cmd__dash_loop() {
   local -i filter_idx=0    # 0=all, 1+=specific repo
   local nav_mode="repo"    # "repo" or "card"
   local -i cur_repo_idx=0  # selected repo in all view
+  local -i _viewport_start=0  # first expanded repo in sliding window
   local -i cur_col=0       # selected column (0-4)
+
+  # Cron navigation state
+  local -i cron_row_selected=0  # 1 when cron row is focused
+  local -i cur_cron_col=0       # selected cron column (0-2)
+  typeset -A cur_cron_card_row  # col -> row index within cron cards
+  local _last_archive_check=0   # epoch of last stale-run cleanup
 
   # Per-repo-per-column card cursor: keyed by "reponame:col" -> row index
   typeset -A cur_card_row
   # Per-repo scroll offset for card viewport
   typeset -A _scroll_top
+  # Per-repo collapsed state for accordion (1=collapsed, unset=expanded)
+  typeset -A _repo_collapsed
 
   # Declare snapshot arrays (persist across loop, modified by _snapshot_tasks via dynamic scope)
   typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo
@@ -1644,6 +2637,11 @@ cmd__dash_loop() {
   local -a _repo_names
   local _total_task_count=0 _active_count=0 _review_count=0
   local _tid=""  # scratch variable for _get_selected_id / _get_repo_task_at
+
+  # Cron snapshot arrays
+  typeset -A _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+  typeset -A _cron_col_ids _cron_col_cnt
+  local _has_cron_data=false
 
   # Trap to restore terminal on exit
   cleanup_dash() {
@@ -1667,7 +2665,7 @@ cmd__dash_loop() {
     # Terminal dimensions
     local cols=$(tput cols)
     local rows=$(tput lines)
-    local col_width=$(( (cols - 2) / 5 ))
+    local col_width=$(( (cols - 2) / 4 ))
     local card_inner=$(( col_width - 4 ))
 
     # Snapshot all data
@@ -1687,7 +2685,7 @@ cmd__dash_loop() {
 
     # Clamp card cursors for all repos
     for rn in "${_repo_names[@]}"; do
-      for ci in {0..4}; do
+      for ci in {0..3}; do
         local ckey="${rn}:${ci}"
         local ccnt="${_repo_col_cnt[$ckey]:-0}"
         local crow="${cur_card_row[$ckey]:-0}"
@@ -1718,7 +2716,7 @@ cmd__dash_loop() {
     # Title bar
     local title_str
     if [[ "$filter_mode" == "all" ]]; then
-      title_str="  cloard-board -- All repos (${_total_task_count} tasks: ${_active_count} active, ${_review_count} review)"
+      title_str="  cloard-board -- All repos (${_total_task_count} tasks: ${_active_count} active, ${_review_count} needs review)"
     else
       local ft_cnt="${_repo_task_count[$filter_mode]:-0}"
       title_str="  cloard-board -- ${filter_mode} (${ft_cnt} tasks)"
@@ -1731,22 +2729,64 @@ cmd__dash_loop() {
       _frame+=$'\n'
       _frame+="  ${C_DIM}No repos registered. Run: cloard-board repo add <path>${C_RESET}"$'\n'
     elif [[ "$filter_mode" == "all" ]]; then
-      # ── All-repos view ──
-      # Calculate max cards per repo based on available space
-      local visible_repos=${#_repo_names[@]}
-      local per_repo_rows=$(( (rows - 4) / (visible_repos > 0 ? visible_repos : 1) ))
-      local max_cards_global=$(( (per_repo_rows - 3) / 5 ))
+      # ── All-repos view (compact cards with accordion) ──
+      local total_repos=${#_repo_names[@]}
+      local MAX_EXPANDED=4
+      local cron_reserve=0
+      $_has_cron_data && cron_reserve=8
+
+      # Auto-initialize: collapse repos beyond MAX_EXPANDED on first render
+      local _init_exp=0
+      for rn in "${_repo_names[@]}"; do
+        if [[ -z "${_repo_collapsed[$rn]+x}" ]]; then
+          [[ $_init_exp -ge $MAX_EXPANDED ]] && _repo_collapsed[$rn]=1
+        fi
+        [[ "${_repo_collapsed[$rn]:-}" != "1" ]] && _init_exp=$((_init_exp + 1))
+      done
+
+      # Count expanded/collapsed repos
+      local expanded_count=0 collapsed_count=0
+      for rn in "${_repo_names[@]}"; do
+        if [[ "${_repo_collapsed[$rn]:-}" == "1" ]]; then
+          collapsed_count=$((collapsed_count + 1))
+        else
+          expanded_count=$((expanded_count + 1))
+        fi
+      done
+      [[ $expanded_count -lt 1 ]] && expanded_count=1
+
+      # Calculate max cards per expanded repo (compact: 3 lines/card)
+      local collapsed_lines=$collapsed_count
+      local available=$((rows - 2 - collapsed_lines - cron_reserve))
+      local per_expanded=$(( available / expanded_count ))
+      local max_cards_global=$(( (per_expanded - 2) / 3 ))
       [[ $max_cards_global -lt 1 ]] && max_cards_global=1
 
       local repo_idx=0
       for rname in "${_repo_names[@]}"; do
         local is_sel_repo=false
         [[ $repo_idx -eq $cur_repo_idx ]] && is_sel_repo=true
+        local is_expanded=false
+        [[ "${_repo_collapsed[$rname]:-}" != "1" ]] && is_expanded=true
 
         local tcnt="${_repo_task_count[$rname]:-0}"
         local stale_indicator=""
         [[ -n "${_repo_stale[$rname]:-}" ]] && stale_indicator=" ${C_RED}(path not found)${C_RESET}"
 
+        if ! $is_expanded; then
+          # ── Collapsed repo: header only ──
+          local repo_hdr="  [${rname}] (${tcnt} tasks)"
+          if $is_sel_repo && [[ "$nav_mode" == "repo" ]]; then
+            _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}> [${rname}] (${tcnt} tasks)%-$((cols - ${#repo_hdr}))s${C_RESET}" "")
+          else
+            _frame+=$(printf "${C_DIM}  [${rname}] (${tcnt} tasks)%-$((cols - ${#repo_hdr}))s${C_RESET}" "")
+          fi
+          _frame+=$'\n'
+          repo_idx=$((repo_idx + 1))
+          continue
+        fi
+
+        # ── Expanded repo ──
         # Repo header
         local repo_hdr="[${rname}]${stale_indicator} (${tcnt} tasks)"
         if $is_sel_repo && [[ "$nav_mode" == "repo" ]]; then
@@ -1756,7 +2796,7 @@ cmd__dash_loop() {
         fi
         _frame+=$'\n'
 
-        # Skip card rendering for collapsed repos (0 tasks, not selected)
+        # Skip card rendering for empty non-selected repos
         if [[ $tcnt -eq 0 ]] && ! $is_sel_repo; then
           repo_idx=$((repo_idx + 1))
           continue
@@ -1764,7 +2804,7 @@ cmd__dash_loop() {
 
         # Column headers
         local header_line=""
-        for i in {0..4}; do
+        for i in {0..3}; do
           local cc=$(col_color "$i")
           local cname="${COL_NAMES[$i]}"
           local ccnt="${_repo_col_cnt[${rname}:${i}]:-0}"
@@ -1780,7 +2820,7 @@ cmd__dash_loop() {
 
         # Cards: compute actual max and visible window with scrolling
         local actual_max=0
-        for i in {0..4}; do
+        for i in {0..3}; do
           local cnt="${_repo_col_cnt[${rname}:${i}]:-0}"
           [[ $cnt -gt $actual_max ]] && actual_max=$cnt
         done
@@ -1806,12 +2846,13 @@ cmd__dash_loop() {
             _frame+="  ${C_DIM}▲ ${scroll_off} more above${C_RESET}"$'\n'
           fi
 
+          # Render compact 3-line bordered cards
           local _rseq=()
           _rseq=($(seq $scroll_off $((scroll_off + visible_cards - 1))))
           for row_idx in "${_rseq[@]}"; do
-            for line_no in {0..4}; do
+            for line_no in {0..2}; do
               local output=""
-              for col_idx in {0..4}; do
+              for col_idx in {0..3}; do
                 local cc=$(col_color "$col_idx")
                 _get_repo_task_at "$rname" "$col_idx" "$row_idx"
                 local task_id="$_tid"
@@ -1843,48 +2884,51 @@ cmd__dash_loop() {
                   local cell=""
                   case $line_no in
                     0)
+                      # Top border with embedded ID: ┌ t-001 ─────┐
+                      local id_str=$(trunc "$task_id" $((card_inner - 2)))
+                      local id_fill_len=$((card_inner - ${#id_str} - 2))
+                      [[ $id_fill_len -lt 0 ]] && id_fill_len=0
+                      local id_fill="${_border_card:0:$id_fill_len}"
                       if $is_selected; then
-                        cell=$(printf "${sel_color}${sel_prefix}┌%s┐${C_RESET}" "$_border_card")
+                        cell=$(printf "${sel_color}%s┌ %s %s┐${C_RESET}" "$sel_prefix" "$id_str" "$id_fill")
                       else
-                        cell=$(printf "${cc} ┌%s┐${C_RESET}" "$_border_card")
+                        cell=$(printf "%s${cc}┌ ${C_BOLD}%s${C_RESET}${cc} %s┐${C_RESET}" " " "$id_str" "$id_fill")
                       fi
                       ;;
                     1)
-                      local id_str=$(trunc "$task_id" $((card_inner - 1)))
-                      if $is_selected; then
-                        cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${id_str}")
-                      else
-                        cell=$(printf "${cc} │${C_BOLD}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${id_str}")
-                      fi
-                      ;;
-                    2)
+                      # Title row: │ Fix login bug       │
                       local title_str=$(trunc "$title" $((card_inner - 1)))
                       if $is_selected; then
-                        cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                        cell=$(printf "${sel_color}${sel_prefix}│%-*s│${C_RESET}" "$card_inner" " ${title_str}")
                       else
                         cell=$(printf "${cc} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
                       fi
                       ;;
-                    3)
+                    2)
+                      # Bottom border with status: └ ● working ──┘
                       local cstatus="${_task_claude[$task_id]}"
                       local extra="" extra_color=""
                       [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
-                      [[ "$cstatus" == "waiting" ]] && { extra="○ waiting"; extra_color="${C_YELLOW}"; }
+                      # waiting status hidden (too noisy)
                       [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
-                      extra=$(trunc "$extra" $((card_inner - 1)))
-                      if $is_selected; then
-                        cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
-                      elif [[ -n "$extra_color" ]]; then
-                        cell=$(printf "${cc} │${extra_color}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${extra}")
+                      if [[ -n "$extra" ]]; then
+                        extra=$(trunc "$extra" $((card_inner - 2)))
+                        local st_fill_len=$((card_inner - ${#extra} - 2))
+                        [[ $st_fill_len -lt 0 ]] && st_fill_len=0
+                        local st_fill="${_border_card:0:$st_fill_len}"
+                        if $is_selected; then
+                          cell=$(printf "${sel_color}%s└ %s %s┘${C_RESET}" "$sel_prefix" "$extra" "$st_fill")
+                        elif [[ -n "$extra_color" ]]; then
+                          cell=$(printf "%s${cc}└ ${extra_color}%s${C_RESET}${cc} %s┘${C_RESET}" " " "$extra" "$st_fill")
+                        else
+                          cell=$(printf "%s${cc}${C_DIM}└ %s %s┘${C_RESET}" " " "$extra" "$st_fill")
+                        fi
                       else
-                        cell=$(printf "${cc}${C_DIM} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
-                      fi
-                      ;;
-                    4)
-                      if $is_selected; then
-                        cell=$(printf "${sel_color} └%s┘${C_RESET}" "$_border_card")
-                      else
-                        cell=$(printf "${cc} └%s┘${C_RESET}" "$_border_card")
+                        if $is_selected; then
+                          cell=$(printf "${sel_color}%s└%s┘${C_RESET}" "$sel_prefix" "$_border_card")
+                        else
+                          cell=$(printf "${cc} └%s┘${C_RESET}" "$_border_card")
+                        fi
                       fi
                       ;;
                   esac
@@ -1916,7 +2960,7 @@ cmd__dash_loop() {
 
       # Column headers
       local header_line=""
-      for i in {0..4}; do
+      for i in {0..3}; do
         local cc=$(col_color "$i")
         local cname="${COL_NAMES[$i]}"
         local ccnt="${_repo_col_cnt[${rname}:${i}]:-0}"
@@ -1931,7 +2975,7 @@ cmd__dash_loop() {
 
       # Cards: compute actual max and visible window with scrolling
       local actual_max=0
-      for i in {0..4}; do
+      for i in {0..3}; do
         local cnt="${_repo_col_cnt[${rname}:${i}]:-0}"
         [[ $cnt -gt $actual_max ]] && actual_max=$cnt
       done
@@ -1960,7 +3004,7 @@ cmd__dash_loop() {
         for row_idx in "${_rseq[@]}"; do
           for line_no in {0..4}; do
             local output=""
-            for col_idx in {0..4}; do
+            for col_idx in {0..3}; do
               local cc=$(col_color "$col_idx")
               _get_repo_task_at "$rname" "$col_idx" "$row_idx"
               local task_id="$_tid"
@@ -2052,19 +3096,176 @@ cmd__dash_loop() {
       fi
     fi
 
+    # ── Cron row (always visible when cron data exists) ──
+    if $_has_cron_data; then
+      local cron_total=$(( ${_cron_col_cnt[__cron:0]:-0} + ${_cron_col_cnt[__cron:1]:-0} + ${_cron_col_cnt[__cron:2]:-0} ))
+
+      # Cron section header
+      local cron_hdr="[cron jobs] (${cron_total} items)"
+      if [[ $cron_row_selected -eq 1 && "$nav_mode" == "repo" ]]; then
+        _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}> %-$((cols-2))s${C_RESET}" "$cron_hdr")
+      else
+        _frame+=$(printf "${C_BOLD}  %-$((cols-2))s${C_RESET}" "$cron_hdr")
+      fi
+      _frame+=$'\n'
+
+      # Cron column headers (3 columns, using the 5-col layout width)
+      local cron_col_w=$(( (cols - 2) / 4 ))
+      local cron_card_inner=$(( cron_col_w - 4 ))
+      local _cron_border=""
+      for (( _i=0; _i<cron_card_inner; _i++ )); do _cron_border+="─"; done
+
+      local cron_header_line=""
+      for ci in {0..3}; do
+        local ccc
+        case $ci in
+          0) ccc="$C_DIM" ;;
+          1) ccc="$C_GREEN" ;;
+          2) ccc="$C_YELLOW" ;;
+          3) ccc="$C_CYAN" ;;
+        esac
+        local ccnt="${_cron_col_cnt[__cron:${ci}]:-0}"
+        local chdr=$(printf "%s (%d)" "${CRON_COL_NAMES[$ci]}" "$ccnt")
+        chdr=$(trunc "$chdr" "$cron_col_w")
+        local chdr_sel=""
+        if [[ $cron_row_selected -eq 1 && $ci -eq $cur_cron_col ]]; then
+          chdr_sel="${C_BOLD}"
+        fi
+        cron_header_line+=$(printf "${chdr_sel}${ccc}%-${cron_col_w}s${C_RESET}" "$chdr")
+      done
+      _frame+="$cron_header_line"$'\n'
+
+      # Cron cards: render up to max rows
+      local cron_max=0
+      for ci in {0..3}; do
+        local cnt="${_cron_col_cnt[__cron:${ci}]:-0}"
+        [[ $cnt -gt $cron_max ]] && cron_max=$cnt
+      done
+      local cron_visible=$((cron_max < 3 ? cron_max : 3))
+      [[ $cron_visible -lt 1 ]] && cron_visible=0
+
+      if [[ $cron_visible -gt 0 ]]; then
+        for (( crow_idx=0; crow_idx<cron_visible; crow_idx++ )); do
+          for line_no in {0..4}; do
+            local output=""
+            for ci in {0..3}; do
+              local ccc
+              case $ci in
+                0) ccc="$C_DIM" ;;
+                1) ccc="$C_GREEN" ;;
+                2) ccc="$C_YELLOW" ;;
+                3) ccc="$C_CYAN" ;;
+              esac
+              _get_cron_item_at "$ci" "$crow_idx"
+              local item_id="$_tid"
+
+              if [[ -z "$item_id" ]]; then
+                output+=$(printf '%-*s' "$cron_col_w" "")
+              else
+                local is_selected=false
+                if [[ $cron_row_selected -eq 1 && "$nav_mode" == "card" ]]; then
+                  local ccrow="${cur_cron_card_row[${ci}]:-0}"
+                  [[ $ci -eq $cur_cron_col && $ccrow -eq $crow_idx ]] && is_selected=true
+                fi
+
+                local sel_prefix=" "
+                local sel_color=""
+                if $is_selected; then
+                  sel_prefix=">"
+                  sel_color="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+                fi
+
+                local cell=""
+                case $ci in
+                  0)  # Scheduled: show job info
+                    local jname="${_cron_jobs[$item_id]:-}"
+                    local jsched="${_cron_job_schedule[$item_id]:-}"
+                    case $line_no in
+                      0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
+                      1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
+                      2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$jname" $((cron_card_inner-1)))") ;;
+                      3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${C_DIM} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$jsched" $((cron_card_inner-1)))") ;;
+                      4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
+                    esac
+                    ;;
+                  1)  # Active: show run info
+                    local rdata="${_cron_run_data[$item_id]:-}"
+                    local rjob_id rstat recode rstart rsid rwin
+                    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                    local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
+                    case $line_no in
+                      0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
+                      1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
+                      2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$rjname" $((cron_card_inner-1)))") ;;
+                      3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_GREEN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "● running" $((cron_card_inner-1)))") ;;
+                      4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
+                    esac
+                    ;;
+                  2)  # Needs Review: show run info
+                    local rdata="${_cron_run_data[$item_id]:-}"
+                    local rjob_id rstat recode rstart rsid rwin
+                    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                    local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
+                    local exit_info="exit ${recode}"
+                    case $line_no in
+                      0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
+                      1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
+                      2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$rjname" $((cron_card_inner-1)))") ;;
+                      3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_YELLOW} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$exit_info" $((cron_card_inner-1)))") ;;
+                      4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
+                    esac
+                    ;;
+                  3)  # Done: show reviewed run info
+                    local rdata="${_cron_run_data[$item_id]:-}"
+                    local rjob_id rstat recode rstart rsid rwin
+                    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                    local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
+                    local exit_info="exit ${recode}"
+                    case $line_no in
+                      0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
+                      1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
+                      2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$rjname" $((cron_card_inner-1)))") ;;
+                      3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_CYAN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "✓ $exit_info" $((cron_card_inner-1)))") ;;
+                      4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
+                    esac
+                    ;;
+                esac
+
+                output+="$cell"
+                local cell_visual_len=$((cron_card_inner + 4))
+                local pad=$(( cron_col_w - cell_visual_len ))
+                [[ $pad -gt 0 ]] && output+=$(printf '%*s' "$pad" "")
+              fi
+            done
+            _frame+="$output"$'\n'
+          done
+        done
+      fi
+
+      # Throttled stale-run cleanup (every 60s)
+      local _now_epoch
+      _now_epoch=$(date +%s)
+      if [[ $((_now_epoch - _last_archive_check)) -ge 60 ]]; then
+        _archive_stale_cron_runs 2>/dev/null &
+        _last_archive_check=$_now_epoch
+      fi
+    fi
+
     # Output frame
     printf '\033[H%s\033[J' "$_frame"
 
     # Footer
     move_to "$((rows - 1))" 1
-    if [[ "$filter_mode" == "all" ]]; then
+    if [[ $cron_row_selected -eq 1 ]]; then
+      printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  o: new cron  D: delete  Esc: back  q: quit${C_RESET}"
+    elif [[ "$filter_mode" == "all" ]]; then
       if [[ "$nav_mode" == "repo" ]]; then
-        printf "${C_DIM}  Tab: filter  j/k: repos  Enter: zoom in  o: new session  S: import session  R: add repo  q: quit${C_RESET}"
+        printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  o: new  S: import  R: add repo  q: quit${C_RESET}"
       else
         printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  o: new  S: import  t: rename  R: add repo  q: quit${C_RESET}"
       fi
     else
-      printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  </> move  :/\" reorder  o: new  S: import  t: rename  s: shell  d: diff  q: quit${C_RESET}"
+      printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  o: new  t: rename  s: shell  d: diff  q: quit${C_RESET}"
     fi
 
     # Debug timing
@@ -2092,44 +3293,78 @@ cmd__dash_loop() {
     fi
 
     case "$key" in
-      h) # Left column: skip empty columns
-        local _h_target=$((cur_col - 1))
-        local _h_repo=""
-        if [[ "$filter_mode" != "all" ]]; then
-          _h_repo="$filter_mode"
-        elif [[ ${#_repo_names[@]} -gt 0 ]]; then
-          _h_repo="${_repo_names[$cur_repo_idx]:-}"
-        fi
-        if [[ -n "$_h_repo" ]]; then
-          while [[ $_h_target -ge 0 ]]; do
-            local _hcnt="${_repo_col_cnt[${_h_repo}:${_h_target}]:-0}"
-            [[ $_hcnt -gt 0 ]] && break
-            _h_target=$((_h_target - 1))
+      h) # Left column
+        if [[ $cron_row_selected -eq 1 ]]; then
+          # Cron: constrained to cols 0-3
+          local _ch_target=$((cur_cron_col - 1))
+          while [[ $_ch_target -ge 0 ]]; do
+            local _chcnt="${_cron_col_cnt[__cron:${_ch_target}]:-0}"
+            [[ $_chcnt -gt 0 ]] && break
+            _ch_target=$((_ch_target - 1))
           done
+          [[ $_ch_target -ge 0 ]] && cur_cron_col=$_ch_target
+        else
+          local _h_target=$((cur_col - 1))
+          local _h_repo=""
+          if [[ "$filter_mode" != "all" ]]; then
+            _h_repo="$filter_mode"
+          elif [[ ${#_repo_names[@]} -gt 0 ]]; then
+            _h_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          if [[ -n "$_h_repo" ]]; then
+            while [[ $_h_target -ge 0 ]]; do
+              local _hcnt="${_repo_col_cnt[${_h_repo}:${_h_target}]:-0}"
+              [[ $_hcnt -gt 0 ]] && break
+              _h_target=$((_h_target - 1))
+            done
+          fi
+          [[ $_h_target -ge 0 ]] && cur_col=$_h_target
         fi
-        [[ $_h_target -ge 0 ]] && cur_col=$_h_target
         ;;
-      l) # Right column: skip empty columns
-        local _l_target=$((cur_col + 1))
-        local _l_repo=""
-        if [[ "$filter_mode" != "all" ]]; then
-          _l_repo="$filter_mode"
-        elif [[ ${#_repo_names[@]} -gt 0 ]]; then
-          _l_repo="${_repo_names[$cur_repo_idx]:-}"
-        fi
-        if [[ -n "$_l_repo" ]]; then
-          while [[ $_l_target -le 4 ]]; do
-            local _lcnt="${_repo_col_cnt[${_l_repo}:${_l_target}]:-0}"
-            [[ $_lcnt -gt 0 ]] && break
-            _l_target=$((_l_target + 1))
+      l) # Right column
+        if [[ $cron_row_selected -eq 1 ]]; then
+          local _cl_target=$((cur_cron_col + 1))
+          while [[ $_cl_target -le 3 ]]; do
+            local _clcnt="${_cron_col_cnt[__cron:${_cl_target}]:-0}"
+            [[ $_clcnt -gt 0 ]] && break
+            _cl_target=$((_cl_target + 1))
           done
+          [[ $_cl_target -le 3 ]] && cur_cron_col=$_cl_target
+        else
+          local _l_target=$((cur_col + 1))
+          local _l_repo=""
+          if [[ "$filter_mode" != "all" ]]; then
+            _l_repo="$filter_mode"
+          elif [[ ${#_repo_names[@]} -gt 0 ]]; then
+            _l_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          if [[ -n "$_l_repo" ]]; then
+            while [[ $_l_target -le 3 ]]; do
+              local _lcnt="${_repo_col_cnt[${_l_repo}:${_l_target}]:-0}"
+              [[ $_lcnt -gt 0 ]] && break
+              _l_target=$((_l_target + 1))
+            done
+          fi
+          [[ $_l_target -le 3 ]] && cur_col=$_l_target
         fi
-        [[ $_l_target -le 4 ]] && cur_col=$_l_target
         ;;
       j) # Down
-        if [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
-          # Move between repo rows
-          [[ $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]] && cur_repo_idx=$((cur_repo_idx + 1))
+        if [[ $cron_row_selected -eq 1 ]]; then
+          # Move down within cron cards
+          local cck="__cron:${cur_cron_col}"
+          local cmax=$(( ${_cron_col_cnt[$cck]:-0} - 1 ))
+          local ccrow="${cur_cron_card_row[${cur_cron_col}]:-0}"
+          if [[ $ccrow -lt $cmax ]]; then
+            cur_cron_card_row[$cur_cron_col]=$((ccrow + 1))
+          fi
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          # Move between repo rows; cron is after the last repo
+          if [[ $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]]; then
+            cur_repo_idx=$((cur_repo_idx + 1))
+          elif $_has_cron_data; then
+            cron_row_selected=1
+            nav_mode="card"
+          fi
         else
           # Move between cards within the active repo
           local active_repo
@@ -2145,17 +3380,34 @@ cmd__dash_loop() {
             if [[ $crow -lt $max_idx ]]; then
               cur_card_row[$ckey]=$((crow + 1))
             elif [[ "$filter_mode" == "all" && $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]]; then
-              # Overflow to next repo
               cur_repo_idx=$((cur_repo_idx + 1))
+            elif [[ "$filter_mode" == "all" ]] && $_has_cron_data; then
+              # Overflow to cron row
+              cron_row_selected=1
+              nav_mode="card"
             fi
           elif [[ "$filter_mode" == "all" && $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]]; then
-            # Empty column; jump to next repo
             cur_repo_idx=$((cur_repo_idx + 1))
+          elif [[ "$filter_mode" == "all" ]] && $_has_cron_data; then
+            cron_row_selected=1
+            nav_mode="card"
           fi
         fi
         ;;
       k) # Up
-        if [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+        if [[ $cron_row_selected -eq 1 ]]; then
+          local ccrow="${cur_cron_card_row[${cur_cron_col}]:-0}"
+          if [[ $ccrow -gt 0 ]]; then
+            cur_cron_card_row[$cur_cron_col]=$((ccrow - 1))
+          else
+            # Move back to last repo
+            cron_row_selected=0
+            if [[ ${#_repo_names[@]} -gt 0 ]]; then
+              cur_repo_idx=$((${#_repo_names[@]} - 1))
+              nav_mode="repo"
+            fi
+          fi
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
           [[ $cur_repo_idx -gt 0 ]] && cur_repo_idx=$((cur_repo_idx - 1))
         else
           local active_repo
@@ -2170,11 +3422,9 @@ cmd__dash_loop() {
             if [[ $crow -gt 0 ]]; then
               cur_card_row[$ckey]=$((crow - 1))
             elif [[ "$filter_mode" == "all" && $cur_repo_idx -gt 0 ]]; then
-              # Overflow to previous repo
               cur_repo_idx=$((cur_repo_idx - 1))
             fi
           elif [[ "$filter_mode" == "all" && $cur_repo_idx -gt 0 ]]; then
-            # Empty column; jump to previous repo
             cur_repo_idx=$((cur_repo_idx - 1))
           fi
         fi
@@ -2203,14 +3453,89 @@ cmd__dash_loop() {
         fi
         ;;
       ESC) # Escape: zoom out to repo mode
-        if [[ "$filter_mode" == "all" && "$nav_mode" == "card" ]]; then
+        if [[ $cron_row_selected -eq 1 ]]; then
+          cron_row_selected=0
           nav_mode="repo"
+          if [[ ${#_repo_names[@]} -gt 0 ]]; then
+            cur_repo_idx=$((${#_repo_names[@]} - 1))
+          fi
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "card" ]]; then
+          nav_mode="repo"
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          # Collapse the selected repo
+          if [[ ${#_repo_names[@]} -gt 0 ]]; then
+            local _esc_rname="${_repo_names[$cur_repo_idx]:-}"
+            [[ -n "$_esc_rname" ]] && _repo_collapsed[$_esc_rname]=1
+          fi
         fi
         ;;
       $'\n'|$'\r') # Enter
-        if [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
-          # Zoom into selected repo (switch to card mode)
-          nav_mode="card"
+        if [[ $cron_row_selected -eq 1 ]]; then
+          # Handle cron row Enter
+          if [[ "$nav_mode" == "repo" ]]; then
+            nav_mode="card"
+          elif _get_selected_cron_id; then
+            local cron_item="$_tid"
+            case $cur_cron_col in
+              0)  # Scheduled: show job details
+                cursor_show
+                stty echo
+                echo ""
+                local jname="${_cron_jobs[$cron_item]:-}"
+                local jsched="${_cron_job_schedule[$cron_item]:-}"
+                local jenabled="${_cron_job_enabled[$cron_item]:-}"
+                echo "${C_BOLD}Cron Job: ${cron_item}${C_RESET}"
+                echo "  name: ${jname}"
+                echo "  schedule: ${jsched}"
+                echo "  enabled: ${jenabled}"
+                echo ""
+                echo "${C_DIM}Press any key to return...${C_RESET}"
+                read -rsk1 2>/dev/null || true
+                stty -echo
+                cursor_hide
+                ;;
+              1)  # Active: attach to tmux window
+                local rdata="${_cron_run_data[$cron_item]:-}"
+                local rjob_id rstat recode rstart rsid rwin
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                if [[ -n "$rwin" ]] && tmux_window_exists "$rwin"; then
+                  cursor_show
+                  tmux_select_window "$rwin"
+                  cursor_hide
+                fi
+                ;;
+              2|3)  # Needs Review / Done: resume session
+                local rdata="${_cron_run_data[$cron_item]:-}"
+                local rjob_id rstat recode rstart rsid rwin
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                if [[ -n "$rsid" ]]; then
+                  local resume_win="resume-${cron_item}"
+                  local cjob_wdir
+                  cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
+                  local safe_wdir=${(q)cjob_wdir}
+                  ensure_tmux_session
+                  tmux_create_window "$resume_win" "zsh" "-c" \
+                    "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                  cursor_show
+                  tmux_select_window "$resume_win"
+                  cursor_hide
+                fi
+                ;;
+            esac
+          fi
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          if [[ $cron_row_selected -eq 0 && ${#_repo_names[@]} -gt 0 ]]; then
+            local _toggle_rname="${_repo_names[$cur_repo_idx]:-}"
+            if [[ -n "$_toggle_rname" ]]; then
+              if [[ "${_repo_collapsed[$_toggle_rname]:-}" == "1" ]]; then
+                # Collapsed repo: expand it
+                unset '_repo_collapsed[$_toggle_rname]'
+              else
+                # Expanded repo: zoom into card mode
+                nav_mode="card"
+              fi
+            fi
+          fi
         elif _get_selected_id; then
           # Open/interact with selected task
           local sel_id="$_tid"
@@ -2295,7 +3620,7 @@ cmd__dash_loop() {
                 update_task_field "$sel_id" "status" "active"
                 tmux_select_window "$sel_id"
                 ;;
-              active|needs_review|review)
+              active|needs_review)
                 if ! tmux_window_exists "$sel_id"; then
                   local wt_mode_act="${_task_wtmode[$sel_id]}"
                   local safe_global_dir=${(q)GLOBAL_DIR}
@@ -2317,7 +3642,36 @@ cmd__dash_loop() {
                 tmux_select_window "$sel_id"
                 cursor_hide
                 ;;
-              done) ;; # No-op
+              done)
+                # Reopen: restart Claude session from repo root
+                cursor_show
+                stty echo
+                local task_title_done="${_task_title[$sel_id]}"
+                echo ""
+                echo "${C_CYAN}Reopening '${sel_id}': ${task_title_done}${C_RESET}"
+                printf "${C_CYAN}Prompt for Claude (or Enter to continue previous session): ${C_RESET}"
+                local reopen_prompt=""
+                read -r reopen_prompt
+                stty -echo
+                cursor_hide
+                local safe_global_dir=${(q)GLOBAL_DIR}
+                local safe_repo_path=${(q)sel_rpath}
+                local safe_work_dir=${(q)sel_rpath}
+                local dash_claude_cmd="claude --continue --dangerously-skip-permissions"
+                if [[ -n "$reopen_prompt" ]]; then
+                  local escaped="${reopen_prompt//\'/\'\\\'\'}"
+                  dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+                fi
+                tmux_create_window "$sel_id" "zsh" "-c" \
+                  "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                update_task_field "$sel_id" "status" "active"
+                update_task_field "$sel_id" "worktree_mode" "none"
+                update_task_field_raw "$sel_id" "branch" "null"
+                update_task_field_raw "$sel_id" "completed_at" "null"
+                cursor_show
+                tmux_select_window "$sel_id"
+                cursor_hide
+                ;;
             esac
           fi
         fi
@@ -2326,27 +3680,14 @@ cmd__dash_loop() {
         if _get_selected_id; then
           local sel_id="$_tid"
           local mv_status="${_task_status[$sel_id]}"
-          local -a status_order=("pending" "paused" "active" "needs_review" "review" "done")
+          local -a status_order=("pending" "paused" "active" "needs_review" "done")
           local mv_idx=-1
           for (( i=0; i<${#status_order[@]}; i++ )); do
             [[ "${status_order[$i]}" == "$mv_status" ]] && mv_idx=$i
           done
           if [[ $mv_idx -ge 0 && $mv_idx -lt $((${#status_order[@]} - 1)) ]]; then
             local next_status="${status_order[$((mv_idx + 1))]}"
-            if [[ "$mv_status" == "needs_review" && "$next_status" == "review" ]]; then
-              cursor_show
-              stty echo
-              echo ""
-              echo "${C_YELLOW}Review '${sel_id}': this will push the branch and create a PR.${C_RESET}"
-              printf "Proceed? [y/N] "
-              local confirm=""
-              read -r confirm
-              if [[ "$confirm" =~ ^[yY]$ ]]; then
-                (cmd_review "$sel_id") 2>&1 || true
-              fi
-              stty -echo
-              cursor_hide
-            elif [[ "$mv_status" == "review" && "$next_status" == "done" ]]; then
+            if [[ "$mv_status" == "needs_review" && "$next_status" == "done" ]]; then
               (cmd_done "$sel_id") 2>&1 || true
             else
               update_task_field "$sel_id" "status" "$next_status"
@@ -2358,7 +3699,7 @@ cmd__dash_loop() {
         if _get_selected_id; then
           local sel_id="$_tid"
           local mv_status="${_task_status[$sel_id]}"
-          local -a status_order=("pending" "paused" "active" "needs_review" "review" "done")
+          local -a status_order=("pending" "paused" "active" "needs_review" "done")
           local mv_idx=-1
           for (( i=0; i<${#status_order[@]}; i++ )); do
             [[ "${status_order[$i]}" == "$mv_status" ]] && mv_idx=$i
@@ -2414,7 +3755,17 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      o) # Quick-create and start a Claude session
+      o) # Quick-create and start a Claude session (or cron job)
+        if [[ $cron_row_selected -eq 1 ]]; then
+          cursor_show
+          stty echo
+          echo ""
+          echo "${C_CYAN}Creating new cron job...${C_RESET}"
+          (cmd_cron_add) 2>&1 || true
+          stty -echo
+          cursor_hide
+          continue
+        fi
         cursor_show
         stty echo
         echo ""
@@ -2444,10 +3795,18 @@ cmd__dash_loop() {
             printf "${C_CYAN}Choice: ${C_RESET}"
             local pchoice=""
             if ! _read_or_esc pchoice; then _cancelled=true; fi
-            if ! $_cancelled && [[ "$pchoice" =~ ^[0-9]+$ ]]; then
-              pchoice=$((pchoice - 1))
-              if [[ $pchoice -ge 0 && $pchoice -lt ${#picker_repos[@]} ]]; then
-                new_repo="${picker_repos[$pchoice]}"
+            if ! $_cancelled && [[ -n "$pchoice" ]]; then
+              if [[ "$pchoice" =~ ^[0-9]+$ ]]; then
+                pchoice=$((pchoice - 1))
+                if [[ $pchoice -ge 0 && $pchoice -lt ${#picker_repos[@]} ]]; then
+                  new_repo="${picker_repos[$pchoice]}"
+                else
+                  echo "${C_RED}Invalid choice (out of range)${C_RESET}"
+                  sleep 1
+                fi
+              else
+                echo "${C_RED}Invalid choice (not a number)${C_RESET}"
+                sleep 1
               fi
             fi
           fi
@@ -2473,7 +3832,7 @@ cmd__dash_loop() {
             if _read_or_esc new_prompt; then
               # Start the session immediately
               local start_output
-              start_output=$( (cmd_start "$new_id" $new_prompt) 2>&1 ) || true
+              start_output=$( (cmd_start "$new_id" "$new_prompt") 2>&1 ) || true
               if [[ -n "$start_output" ]]; then
                 echo "$start_output"
               fi
@@ -2483,8 +3842,36 @@ cmd__dash_loop() {
         stty -echo
         cursor_hide
         ;;
-      x) # Done/delete selected task
-        if _get_selected_id; then
+      x) # Done/delete selected task OR cron toggle/review
+        if [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
+          local cron_item="$_tid"
+          case $cur_cron_col in
+            0)  # Scheduled: toggle enable/disable
+              local is_enabled="${_cron_job_enabled[$cron_item]:-true}"
+              cursor_show
+              stty echo
+              if [[ "$is_enabled" == "true" ]]; then
+                printf "${C_YELLOW}Disable cron job ${cron_item}? [y/N]: ${C_RESET}"
+                local dconfirm=""
+                read -r dconfirm
+                [[ "$dconfirm" =~ ^[yY]$ ]] && (cmd_cron_disable "$cron_item") 2>&1 || true
+              else
+                printf "${C_CYAN}Enable cron job ${cron_item}? [Y/n]: ${C_RESET}"
+                local econfirm=""
+                read -r econfirm
+                [[ ! "$econfirm" =~ ^[nN]$ ]] && (cmd_cron_enable "$cron_item") 2>&1 || true
+              fi
+              stty -echo
+              cursor_hide
+              ;;
+            2)  # Needs Review: mark reviewed (moves to Done)
+              (cmd_cron_review "$cron_item") 2>&1 || true
+              ;;
+            3)  # Done: archive (remove from dashboard)
+              update_cron_run_field "$cron_item" "status" "archived"
+              ;;
+          esac
+        elif _get_selected_id; then
           local sel_id="$_tid"
           local sel_status="${_task_status[$sel_id]}"
           if [[ "$sel_status" == "done" ]]; then
@@ -2536,13 +3923,11 @@ cmd__dash_loop() {
         printf "${C_CYAN}Path to register (drag folder or Esc to cancel): ${C_RESET}"
         local new_repo_path=""
         if _read_or_esc new_repo_path; then
-          # Strip trailing whitespace and quotes (common when dragging folders into terminal)
-          new_repo_path="${new_repo_path## }"
-          new_repo_path="${new_repo_path%% }"
-          new_repo_path="${new_repo_path#\'}"
-          new_repo_path="${new_repo_path%\'}"
-          new_repo_path="${new_repo_path#\"}"
-          new_repo_path="${new_repo_path%\"}"
+          # Sanitize path: strip whitespace, CR, and dequote (handles drag-and-drop backslash paths)
+          new_repo_path="${new_repo_path%$'\r'}"    # strip trailing CR (Windows paste)
+          new_repo_path="${new_repo_path## }"       # strip leading space
+          new_repo_path="${new_repo_path%% }"       # strip trailing space
+          new_repo_path="${(Q)new_repo_path}"       # dequote: handles \" \' and backslash-escaped spaces
           if [[ -n "$new_repo_path" ]]; then
             local reg_output
             reg_output=$( (cmd_repo_add "$new_repo_path") 2>&1 ) || true
@@ -2645,6 +4030,63 @@ cmd__dash_loop() {
           fi
         fi
         ;;
+      r) # Reopen done task
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local r_status="${_task_status[$sel_id]}"
+          if [[ "$r_status" == "done" ]]; then
+            local sel_repo="${_task_repo[$sel_id]}"
+            local sel_rpath
+            sel_rpath=$(repo_path "$sel_repo")
+            if [[ -n "${_repo_stale[$sel_repo]:-}" ]]; then
+              cursor_show
+              stty echo
+              echo ""
+              echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${sel_repo} <new-path>${C_RESET}"
+              sleep 2
+              stty -echo
+              cursor_hide
+            else
+              cursor_show
+              stty echo
+              local task_title="${_task_title[$sel_id]}"
+              echo ""
+              echo "${C_CYAN}Reopening '${sel_id}': ${task_title}${C_RESET}"
+              printf "${C_CYAN}Prompt for Claude (or Enter to continue previous session): ${C_RESET}"
+              local reopen_prompt=""
+              read -r reopen_prompt
+              stty -echo
+              cursor_hide
+              local safe_global_dir=${(q)GLOBAL_DIR}
+              local safe_repo_path=${(q)sel_rpath}
+              local safe_work_dir=${(q)sel_rpath}
+              local dash_claude_cmd="claude --continue --dangerously-skip-permissions"
+              if [[ -n "$reopen_prompt" ]]; then
+                local escaped="${reopen_prompt//\'/\'\\\'\'}"
+                dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+              fi
+              tmux_create_window "$sel_id" "zsh" "-c" \
+                "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+              update_task_field "$sel_id" "status" "active"
+              update_task_field "$sel_id" "worktree_mode" "none"
+              update_task_field_raw "$sel_id" "branch" "null"
+              update_task_field_raw "$sel_id" "completed_at" "null"
+              tmux_select_window "$sel_id"
+            fi
+          fi
+        fi
+        ;;
+      D) # Delete cron job (from dashboard)
+        if [[ $cron_row_selected -eq 1 && $cur_cron_col -eq 0 ]] && _get_selected_cron_id; then
+          local cron_item="$_tid"
+          cursor_show
+          stty echo
+          echo ""
+          (cmd_cron_remove "$cron_item") 2>&1 || true
+          stty -echo
+          cursor_hide
+        fi
+        ;;
       q) # Quit / detach
         cursor_show
         tmux_cmd detach-client 2>/dev/null || exit 0
@@ -2681,13 +4123,24 @@ ${C_BOLD}TASK COMMANDS${C_RESET}
   pause <id>                   Pause a task (kill window, keep worktree)
   go <id>                      Switch to a task's tmux window
   resume <id>                  Reopen with claude --continue
+  reopen <id> [prompt]         Reopen a done task (restarts session)
   advance <id>                 Move task to next status
-  review <id>                  Push branch, create PR (status: review)
   done <id>                    Clean up worktree and window (status: done)
   rm <id>                      Remove a task entirely
   list [--repo name]           Print all tasks as a table
   status <id>                  Show task and Claude status
   signal <id> <status>         Set Claude status (working|waiting|clear)
+
+${C_BOLD}CRON JOBS${C_RESET}
+  cron scan                    Discover Claude-invoking LaunchAgents
+  cron add                     Create a new cron job (interactive)
+  cron list                    List all cron jobs
+  cron runs [job-id]           List active/unreviewed runs
+  cron enable <id>             Enable and load a cron job
+  cron disable <id>            Disable and unload a cron job
+  cron remove <id>             Delete a cron job (with confirmation)
+  cron review <run-id>         Mark a run as reviewed
+  cron migrate                 Import existing Claude LaunchAgents
 
 ${C_BOLD}DASHBOARD${C_RESET}
   dash                         Open the interactive kanban dashboard
@@ -2703,18 +4156,16 @@ ${C_BOLD}OPTIONS${C_RESET}
 
 ${C_BOLD}EXAMPLES${C_RESET}
   cloard-board repo add ~/code/my-api
-  cloard-board repo add ~/scripts
   cloard-board add --title "Fix auth bug" --repo my-api
-  cloard-board add --repo my-api --no-worktree
-  cloard-board session abc123-def4-5678 --repo my-api
-  cloard-board title t-001 "Better task name"
-  cloard-board start t-001 "Fix the auth redirect loop"
+  cloard-board cron scan
+  cloard-board cron migrate
+  cloard-board cron add
+  cloard-board cron list
   cloard-board dash
-  cloard-board repo list
 
 ${C_BOLD}DASHBOARD KEYS${C_RESET}
   All-repos view:
-    j/k         Move between repo rows
+    j/k         Move between repo rows (cron row at bottom)
     h/l         Move between columns
     Enter       Zoom into repo (card-level nav)
     Esc         Zoom out to repo-level nav
@@ -2729,6 +4180,7 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     S           Import an existing Claude session by UID
     t           Rename focused task
     p           Pause task
+    r           Reopen done task (restart session)
     x           Done/remove task
     </>         Move task left/right (change status)
     :/"         Reorder card up/down within column
@@ -2736,6 +4188,12 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     d           Show git diff
     R           Register a new repo
     q           Quit (detach)
+
+  Cron row:
+    Enter       Col 0: show details / Col 1: attach / Col 2: resume session
+    x           Col 0: toggle enable/disable / Col 2: mark reviewed
+    o           Create new cron job
+    D           Delete cron job (Col 0 only, with confirmation)
 EOF
 }
 
@@ -2754,6 +4212,12 @@ main() {
     help|-h|--help)        cmd_help ;;
     version|-v|--version)  cmd_version ;;
     signal)                cmd_signal "$@" ;;
+    cron-exec)
+      ensure_global_state
+      cmd_cron_exec "$@" ;;
+    _cron_complete)
+      ensure_global_state
+      cmd__cron_complete "$@" ;;
     # Standard commands (ensure global state first)
     *)
       ensure_global_state
@@ -2761,6 +4225,7 @@ main() {
       case "$cmd" in
         init)       cmd_init "$@" ;;
         repo)       cmd_repo "$@" ;;
+        cron)       cmd_cron "$@" ;;
         add)        cmd_add "$@" ;;
         title)      cmd_title "$@" ;;
         session)    cmd_session "$@" ;;
@@ -2770,14 +4235,15 @@ main() {
         dash)       cmd_dash "$@" ;;
         attach)     cmd_attach "$@" ;;
         advance)    cmd_advance "$@" ;;
-        review)     cmd_review "$@" ;;
         done)       cmd_done "$@" ;;
         pause)      cmd_pause "$@" ;;
         resume)     cmd_resume "$@" ;;
+        reopen)     cmd_reopen "$@" ;;
         rm|remove)  cmd_rm "$@" ;;
         status)     cmd_status "$@" ;;
         doctor)     cmd_doctor "$@" ;;
         _dash_loop) cmd__dash_loop "$@" ;;
+        _dash_switch) cmd__dash_switch "$@" ;;
         *)          die "unknown command: ${cmd}; run 'cloard-board help'" ;;
       esac
       ;;
