@@ -1,0 +1,1365 @@
+cmd_dash() {
+  ensure_tmux_session
+
+  # If we're not in the cloard-board tmux, launch dashboard in it
+  if [[ -z "${TMUX:-}" ]]; then
+    if ! tmux_window_exists "dashboard"; then
+      tmux_cmd new-window -t "board" -n "dashboard"
+    fi
+    local safe_script
+    safe_script=${(q)${SCRIPT_PATH}}
+    tmux_cmd respawn-window -k -t "board:dashboard" "exec ${safe_script} _dash_loop"
+    pin_dashboard_to_zero
+    tmux_cmd attach -t "board:dashboard"
+    return
+  fi
+
+  # If inside tmux but not in cloard-board socket, warn
+  if [[ "${TMUX:-}" != *"${TMUX_SOCKET}"* ]]; then
+    warn "you're in a different tmux; run outside tmux or inside cloard-board"
+    return 1
+  fi
+
+  # Already inside cloard-board tmux; recreate dashboard if needed, then switch
+  cmd__dash_switch
+}
+
+# Switch to dashboard window, recreating it if closed
+cmd__dash_switch() {
+  ensure_tmux_session
+  if ! tmux_window_exists "dashboard"; then
+    tmux_cmd new-window -t "board" -n "dashboard"
+    local safe_script=${(q)SCRIPT_PATH}
+    tmux_cmd respawn-window -k -t "board:dashboard" "exec ${safe_script} _dash_loop"
+    pin_dashboard_to_zero
+  fi
+  tmux_cmd select-window -t "board:dashboard"
+}
+
+# The actual dashboard rendering loop (run inside tmux window)
+cmd__dash_loop() {
+  set +x  # Disable any inherited trace mode
+  set +e  # Prevent unguarded commands from killing the TUI loop
+  set +u  # Allow unset assoc-array keys (collapsed state, scroll offsets, etc.)
+  setopt TYPESET_SILENT 2>/dev/null
+
+  zmodload zsh/datetime 2>/dev/null || true
+
+  # Navigation state
+  local filter_mode="all"  # "all" or a repo name
+  local -i filter_idx=0    # 0=all, 1+=specific repo
+  local nav_mode="repo"    # "repo" or "card"
+  local -i cur_repo_idx=0  # selected repo in all view
+  local -i _viewport_start=0  # first expanded repo in sliding window
+  local -i cur_col=0       # selected column (0-4)
+
+  # Cron navigation state
+  local -i cron_row_selected=0  # 1 when cron row is focused
+  local -i cur_cron_col=0       # selected cron column (0-2)
+  typeset -A cur_cron_card_row  # col -> row index within cron cards
+  local _last_archive_check=0   # epoch of last stale-run cleanup
+
+  # Per-repo-per-column card cursor: keyed by "reponame:col" -> row index
+  typeset -A cur_card_row
+  # Per-repo scroll offset for card viewport
+  typeset -A _scroll_top
+  # Per-repo collapsed state for accordion (1=collapsed, unset=expanded)
+  typeset -A _repo_collapsed
+
+  # Declare snapshot arrays (persist across loop, modified by _snapshot_tasks via dynamic scope)
+  typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo
+  typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
+  typeset -A _repo_cols _repo_col_cnt
+  local -a _repo_names
+  local _total_task_count=0 _active_count=0 _review_count=0
+  local _tid=""  # scratch variable for _get_selected_id / _get_repo_task_at
+
+  # Cron snapshot arrays
+  typeset -A _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+  typeset -A _cron_col_ids _cron_col_cnt
+  local _has_cron_data=false
+
+  # Trap to restore terminal on exit
+  cleanup_dash() {
+    cursor_show
+    stty echo 2>/dev/null
+    printf '\033[?1049l'
+  }
+  trap cleanup_dash EXIT INT TERM
+
+  printf '\033[?1049h'  # Enter alternate screen
+  cursor_hide
+  stty -echo 2>/dev/null
+
+  # Drain any pending terminal responses
+  while read -rsk1 -t 0.05 _discard 2>/dev/null; do :; done
+
+  while true; do
+    local _t0=""
+    [[ "${CLOARD_DEBUG:-}" == "1" ]] && _t0=${EPOCHREALTIME:-}
+
+    # Terminal dimensions
+    local cols=$(tput cols)
+    local rows=$(tput lines)
+    local col_width=$(( (cols - 2) / 4 ))
+    local card_inner=$(( col_width - 4 ))
+
+    # Snapshot all data
+    _snapshot_tasks
+
+    # Pre-compute border strings
+    local _border_card="" _border_full="" _i
+    for (( _i=0; _i<card_inner; _i++ )); do _border_card+="─"; done
+    for (( _i=0; _i<cols; _i++ )); do _border_full+="─"; done
+
+    # Clamp navigation indices
+    if [[ ${#_repo_names[@]} -gt 0 ]]; then
+      [[ $cur_repo_idx -ge ${#_repo_names[@]} ]] && cur_repo_idx=$((${#_repo_names[@]} - 1))
+    else
+      cur_repo_idx=0
+    fi
+
+    # Clamp card cursors for all repos
+    for rn in "${_repo_names[@]}"; do
+      for ci in {0..3}; do
+        local ckey="${rn}:${ci}"
+        local ccnt="${_repo_col_cnt[$ckey]:-0}"
+        local crow="${cur_card_row[$ckey]:-0}"
+        if [[ $crow -ge $ccnt ]] && [[ $ccnt -gt 0 ]]; then
+          cur_card_row[$ckey]=$((ccnt - 1))
+        elif [[ $ccnt -eq 0 ]]; then
+          cur_card_row[$ckey]=0
+        fi
+      done
+    done
+
+    # Validate filter_mode still exists
+    if [[ "$filter_mode" != "all" ]]; then
+      local _filter_valid=false
+      for rn in "${_repo_names[@]}"; do
+        [[ "$rn" == "$filter_mode" ]] && _filter_valid=true
+      done
+      if ! $_filter_valid; then
+        filter_mode="all"
+        filter_idx=0
+        nav_mode="repo"
+      fi
+    fi
+
+    # Begin frame buffer
+    local _frame=""
+
+    # Title bar
+    _render_status_bar
+
+    if [[ ${#_repo_names[@]} -eq 0 ]]; then
+      # No repos registered
+      _frame+=$'\n'
+      _frame+="  ${C_DIM}No repos registered. Run: cloard-board repo add <path>${C_RESET}"$'\n'
+    elif [[ "$filter_mode" == "all" ]]; then
+      # ── All-repos view (compact cards with accordion) ──
+      local total_repos=${#_repo_names[@]}
+      local MAX_EXPANDED=4
+      local cron_reserve=0
+      $_has_cron_data && cron_reserve=8
+
+      # Auto-initialize: collapse repos beyond MAX_EXPANDED on first render
+      local _init_exp=0
+      for rn in "${_repo_names[@]}"; do
+        if [[ -z "${_repo_collapsed[$rn]+x}" ]]; then
+          [[ $_init_exp -ge $MAX_EXPANDED ]] && _repo_collapsed[$rn]=1
+        fi
+        [[ "${_repo_collapsed[$rn]:-}" != "1" ]] && _init_exp=$((_init_exp + 1))
+      done
+
+      # Count expanded/collapsed repos
+      local expanded_count=0 collapsed_count=0
+      for rn in "${_repo_names[@]}"; do
+        if [[ "${_repo_collapsed[$rn]:-}" == "1" ]]; then
+          collapsed_count=$((collapsed_count + 1))
+        else
+          expanded_count=$((expanded_count + 1))
+        fi
+      done
+      [[ $expanded_count -lt 1 ]] && expanded_count=1
+
+      # Calculate max cards per expanded repo (compact: 3 lines/card)
+      local collapsed_lines=$collapsed_count
+      local available=$((rows - 2 - collapsed_lines - cron_reserve))
+      local per_expanded=$(( available / expanded_count ))
+      local max_cards_global=$(( (per_expanded - 2) / 3 ))
+      [[ $max_cards_global -lt 1 ]] && max_cards_global=1
+
+      local repo_idx=0
+      for rname in "${_repo_names[@]}"; do
+        local is_sel_repo=false
+        [[ $repo_idx -eq $cur_repo_idx ]] && is_sel_repo=true
+        local is_expanded=false
+        [[ "${_repo_collapsed[$rname]:-}" != "1" ]] && is_expanded=true
+
+        local tcnt="${_repo_task_count[$rname]:-0}"
+        local stale_indicator=""
+        [[ -n "${_repo_stale[$rname]:-}" ]] && stale_indicator=" ${C_RED}(path not found)${C_RESET}"
+
+        if ! $is_expanded; then
+          # ── Collapsed repo: header only ──
+          local repo_hdr="  [${rname}] (${tcnt} tasks)"
+          if $is_sel_repo && [[ "$nav_mode" == "repo" ]]; then
+            _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}> [${rname}] (${tcnt} tasks)%-$((cols - ${#repo_hdr}))s${C_RESET}" "")
+          else
+            _frame+=$(printf "${C_DIM}  [${rname}] (${tcnt} tasks)%-$((cols - ${#repo_hdr}))s${C_RESET}" "")
+          fi
+          _frame+=$'\n'
+          repo_idx=$((repo_idx + 1))
+          continue
+        fi
+
+        # ── Expanded repo ──
+        # Repo header
+        local repo_hdr="[${rname}]${stale_indicator} (${tcnt} tasks)"
+        if $is_sel_repo && [[ "$nav_mode" == "repo" ]]; then
+          _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}> %-$((cols-2))s${C_RESET}" "$repo_hdr")
+        else
+          _frame+=$(printf "${C_BOLD}  %-$((cols-2))s${C_RESET}" "$repo_hdr")
+        fi
+        _frame+=$'\n'
+
+        # Skip card rendering for empty non-selected repos
+        if [[ $tcnt -eq 0 ]] && ! $is_sel_repo; then
+          repo_idx=$((repo_idx + 1))
+          continue
+        fi
+
+        # Column headers
+        local header_line=""
+        for i in {0..3}; do
+          local cc=$(col_color "$i")
+          local cname="${COL_NAMES[$i]}"
+          local ccnt="${_repo_col_cnt[${rname}:${i}]:-0}"
+          local hdr=$(printf "%s (%d)" "$cname" "$ccnt")
+          hdr=$(trunc "$hdr" "$col_width")
+          local hdr_sel=""
+          if $is_sel_repo && [[ $i -eq $cur_col ]]; then
+            hdr_sel="${C_BOLD}"
+          fi
+          header_line+=$(printf "${hdr_sel}${cc}%-${col_width}s${C_RESET}" "$hdr")
+        done
+        _frame+="$header_line"$'\n'
+
+        # Cards: compute actual max and visible window with scrolling
+        local actual_max=0
+        for i in {0..3}; do
+          local cnt="${_repo_col_cnt[${rname}:${i}]:-0}"
+          [[ $cnt -gt $actual_max ]] && actual_max=$cnt
+        done
+        local visible_cards=$max_cards_global
+        [[ $visible_cards -gt $actual_max ]] && visible_cards=$actual_max
+
+        # Compute scroll offset for selected repo in card mode
+        local scroll_off="${_scroll_top[$rname]:-0}"
+        if $is_sel_repo && [[ "$nav_mode" == "card" ]]; then
+          local focused_row="${cur_card_row[${rname}:${cur_col}]:-0}"
+          if [[ $focused_row -ge $((scroll_off + visible_cards)) ]]; then
+            scroll_off=$((focused_row - visible_cards + 1))
+          fi
+          if [[ $focused_row -lt $scroll_off ]]; then
+            scroll_off=$focused_row
+          fi
+          _scroll_top[$rname]=$scroll_off
+        fi
+
+        if [[ $visible_cards -gt 0 ]]; then
+          # Scroll-up indicator
+          if [[ $scroll_off -gt 0 ]]; then
+            _frame+="  ${C_DIM}▲ ${scroll_off} more above${C_RESET}"$'\n'
+          fi
+
+          # Render compact 3-line bordered cards
+          local _rseq=()
+          _rseq=($(seq $scroll_off $((scroll_off + visible_cards - 1))))
+          for row_idx in "${_rseq[@]}"; do
+            for line_no in {0..2}; do
+              local output=""
+              for col_idx in {0..3}; do
+                local cc=$(col_color "$col_idx")
+                _get_repo_task_at "$rname" "$col_idx" "$row_idx"
+                local task_id="$_tid"
+
+                if [[ -z "$task_id" ]]; then
+                  output+=$(printf '%-*s' "$col_width" "")
+                else
+                  # Paused override
+                  [[ $col_idx -eq 0 && "${_task_status[$task_id]}" == "paused" ]] && cc="$C_CYAN"
+
+                  local is_selected=false
+                  if $is_sel_repo && [[ "$nav_mode" == "card" ]]; then
+                    local crow="${cur_card_row[${rname}:${col_idx}]:-0}"
+                    [[ $col_idx -eq $cur_col && $crow -eq $row_idx ]] && is_selected=true
+                  fi
+
+                  local title="${_task_title[$task_id]}"
+                  local pr="${_task_pr[$task_id]}"
+                  local pr_short=""
+                  [[ -n "$pr" ]] && pr_short=$(echo "$pr" | grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
+
+                  local sel_prefix=" "
+                  local sel_color=""
+                  if $is_selected; then
+                    sel_prefix=">"
+                    sel_color="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+                  fi
+
+                  local cell=""
+                  case $line_no in
+                    0)
+                      # Top border with embedded ID: ┌ t-001 ─────┐
+                      local id_str=$(trunc "$task_id" $((card_inner - 2)))
+                      local id_fill_len=$((card_inner - ${#id_str} - 2))
+                      [[ $id_fill_len -lt 0 ]] && id_fill_len=0
+                      local id_fill="${_border_card:0:$id_fill_len}"
+                      if $is_selected; then
+                        cell=$(printf "${sel_color}%s┌ %s %s┐${C_RESET}" "$sel_prefix" "$id_str" "$id_fill")
+                      else
+                        cell=$(printf "%s${cc}┌ ${C_BOLD}%s${C_RESET}${cc} %s┐${C_RESET}" " " "$id_str" "$id_fill")
+                      fi
+                      ;;
+                    1)
+                      # Title row: │ Fix login bug       │
+                      local title_str=$(trunc "$title" $((card_inner - 1)))
+                      if $is_selected; then
+                        cell=$(printf "${sel_color}${sel_prefix}│%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                      else
+                        cell=$(printf "${cc} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                      fi
+                      ;;
+                    2)
+                      # Bottom border with status: └ ● working ──┘
+                      local cstatus="${_task_claude[$task_id]}"
+                      local extra="" extra_color=""
+                      [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
+                      # waiting status hidden (too noisy)
+                      [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
+                      if [[ -n "$extra" ]]; then
+                        extra=$(trunc "$extra" $((card_inner - 2)))
+                        local st_fill_len=$((card_inner - ${#extra} - 2))
+                        [[ $st_fill_len -lt 0 ]] && st_fill_len=0
+                        local st_fill="${_border_card:0:$st_fill_len}"
+                        if $is_selected; then
+                          cell=$(printf "${sel_color}%s└ %s %s┘${C_RESET}" "$sel_prefix" "$extra" "$st_fill")
+                        elif [[ -n "$extra_color" ]]; then
+                          cell=$(printf "%s${cc}└ ${extra_color}%s${C_RESET}${cc} %s┘${C_RESET}" " " "$extra" "$st_fill")
+                        else
+                          cell=$(printf "%s${cc}${C_DIM}└ %s %s┘${C_RESET}" " " "$extra" "$st_fill")
+                        fi
+                      else
+                        if $is_selected; then
+                          cell=$(printf "${sel_color}%s└%s┘${C_RESET}" "$sel_prefix" "$_border_card")
+                        else
+                          cell=$(printf "${cc} └%s┘${C_RESET}" "$_border_card")
+                        fi
+                      fi
+                      ;;
+                  esac
+                  output+="$cell"
+                  local cell_visual_len=$((card_inner + 4))
+                  local pad=$(( col_width - cell_visual_len ))
+                  [[ $pad -gt 0 ]] && output+=$(printf '%*s' "$pad" "")
+                fi
+              done
+              _frame+="$output"$'\n'
+            done
+          done
+
+          # Scroll-down indicator
+          local below=$((actual_max - scroll_off - visible_cards))
+          if [[ $below -gt 0 ]]; then
+            _frame+="  ${C_DIM}▼ ${below} more below${C_RESET}"$'\n'
+          fi
+        fi
+
+        repo_idx=$((repo_idx + 1))
+      done
+
+    else
+      # ── Filtered single-repo view ──
+      local rname="$filter_mode"
+      local max_visible_rows=$(( (rows - 5) / 5 ))
+      [[ $max_visible_rows -lt 1 ]] && max_visible_rows=1
+
+      # Column headers
+      local header_line=""
+      for i in {0..3}; do
+        local cc=$(col_color "$i")
+        local cname="${COL_NAMES[$i]}"
+        local ccnt="${_repo_col_cnt[${rname}:${i}]:-0}"
+        local selected=""
+        [[ $i -eq $cur_col ]] && selected="${C_BOLD}"
+        local hdr=$(printf "%s (%d)" "$cname" "$ccnt")
+        hdr=$(trunc "$hdr" "$col_width")
+        header_line+=$(printf "${selected}${cc}%-${col_width}s${C_RESET}" "$hdr")
+      done
+      _frame+="$header_line"$'\n'
+      _frame+="$_border_full"$'\n'
+
+      # Cards: compute actual max and visible window with scrolling
+      local actual_max=0
+      for i in {0..3}; do
+        local cnt="${_repo_col_cnt[${rname}:${i}]:-0}"
+        [[ $cnt -gt $actual_max ]] && actual_max=$cnt
+      done
+      local visible_cards=$max_visible_rows
+      [[ $visible_cards -gt $actual_max ]] && visible_cards=$actual_max
+
+      # Compute scroll offset
+      local scroll_off="${_scroll_top[$rname]:-0}"
+      local focused_row="${cur_card_row[${rname}:${cur_col}]:-0}"
+      if [[ $focused_row -ge $((scroll_off + visible_cards)) ]]; then
+        scroll_off=$((focused_row - visible_cards + 1))
+      fi
+      if [[ $focused_row -lt $scroll_off ]]; then
+        scroll_off=$focused_row
+      fi
+      _scroll_top[$rname]=$scroll_off
+
+      if [[ $visible_cards -gt 0 ]]; then
+        # Scroll-up indicator
+        if [[ $scroll_off -gt 0 ]]; then
+          _frame+="  ${C_DIM}▲ ${scroll_off} more above${C_RESET}"$'\n'
+        fi
+
+        local _rseq=()
+        _rseq=($(seq $scroll_off $((scroll_off + visible_cards - 1))))
+        for row_idx in "${_rseq[@]}"; do
+          for line_no in {0..4}; do
+            local output=""
+            for col_idx in {0..3}; do
+              local cc=$(col_color "$col_idx")
+              _get_repo_task_at "$rname" "$col_idx" "$row_idx"
+              local task_id="$_tid"
+
+              if [[ -z "$task_id" ]]; then
+                output+=$(printf '%-*s' "$col_width" "")
+              else
+                [[ $col_idx -eq 0 && "${_task_status[$task_id]}" == "paused" ]] && cc="$C_CYAN"
+
+                local is_selected=false
+                local crow="${cur_card_row[${rname}:${col_idx}]:-0}"
+                [[ $col_idx -eq $cur_col && $crow -eq $row_idx ]] && is_selected=true
+
+                local title="${_task_title[$task_id]}"
+                local pr="${_task_pr[$task_id]}"
+                local pr_short=""
+                [[ -n "$pr" ]] && pr_short=$(echo "$pr" | grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
+
+                local sel_prefix=" "
+                local sel_color=""
+                if $is_selected; then
+                  sel_prefix=">"
+                  sel_color="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+                fi
+
+                local cell=""
+                case $line_no in
+                  0)
+                    if $is_selected; then
+                      cell=$(printf "${sel_color}${sel_prefix}┌%s┐${C_RESET}" "$_border_card")
+                    else
+                      cell=$(printf "${cc} ┌%s┐${C_RESET}" "$_border_card")
+                    fi
+                    ;;
+                  1)
+                    local id_str=$(trunc "$task_id" $((card_inner - 1)))
+                    if $is_selected; then
+                      cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${id_str}")
+                    else
+                      cell=$(printf "${cc} │${C_BOLD}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${id_str}")
+                    fi
+                    ;;
+                  2)
+                    local title_str=$(trunc "$title" $((card_inner - 1)))
+                    if $is_selected; then
+                      cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                    else
+                      cell=$(printf "${cc} │%-*s│${C_RESET}" "$card_inner" " ${title_str}")
+                    fi
+                    ;;
+                  3)
+                    local cstatus="${_task_claude[$task_id]}"
+                    local extra="" extra_color=""
+                    [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
+                    [[ "$cstatus" == "waiting" ]] && { extra="○ waiting"; extra_color="${C_YELLOW}"; }
+                    [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
+                    extra=$(trunc "$extra" $((card_inner - 1)))
+                    if $is_selected; then
+                      cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
+                    elif [[ -n "$extra_color" ]]; then
+                      cell=$(printf "${cc} │${extra_color}%-*s${C_RESET}${cc}│${C_RESET}" "$card_inner" " ${extra}")
+                    else
+                      cell=$(printf "${cc}${C_DIM} │%-*s│${C_RESET}" "$card_inner" " ${extra}")
+                    fi
+                    ;;
+                  4)
+                    if $is_selected; then
+                      cell=$(printf "${sel_color} └%s┘${C_RESET}" "$_border_card")
+                    else
+                      cell=$(printf "${cc} └%s┘${C_RESET}" "$_border_card")
+                    fi
+                    ;;
+                esac
+                output+="$cell"
+                local cell_visual_len=$((card_inner + 4))
+                local pad=$(( col_width - cell_visual_len ))
+                [[ $pad -gt 0 ]] && output+=$(printf '%*s' "$pad" "")
+              fi
+            done
+            _frame+="$output"$'\n'
+          done
+        done
+
+        # Scroll-down indicator
+        local below=$((actual_max - scroll_off - visible_cards))
+        if [[ $below -gt 0 ]]; then
+          _frame+="  ${C_DIM}▼ ${below} more below${C_RESET}"$'\n'
+        fi
+      fi
+    fi
+
+    # ── Cron row (always visible when cron data exists) ──
+    if $_has_cron_data; then
+      _render_cron_row
+    fi
+
+    # Output frame
+    printf '\033[H%s\033[J' "$_frame"
+
+    # Footer
+    _render_footer
+
+    # Debug timing
+    if [[ -n "${_t0:-}" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
+      local _elapsed=$(( (EPOCHREALTIME - _t0) * 1000 ))
+      printf '%s frame: %.1fms\n' "$(date +%T)" "$_elapsed" >> /tmp/cloard-perf.log
+    fi
+
+    # Read key with timeout
+    local key=""
+    read -rsk1 -t "$DASH_REFRESH" key 2>/dev/null || true
+
+    # Handle escape sequences
+    if [[ "$key" == $'\e' ]]; then
+      local seq=""
+      read -rsk2 -t 0.1 seq 2>/dev/null || true
+      case "$seq" in
+        '[A') key='k' ;;     # up
+        '[B') key='j' ;;     # down
+        '[C') key='l' ;;     # right
+        '[D') key='h' ;;     # left
+        '[Z') key='SHIFT_TAB' ;;  # shift-tab
+        *)    key='ESC' ;;   # plain Esc
+      esac
+    fi
+
+    case "$key" in
+      h) # Left column
+        if [[ $cron_row_selected -eq 1 ]]; then
+          # Cron: constrained to cols 0-3
+          local _ch_target=$((cur_cron_col - 1))
+          while [[ $_ch_target -ge 0 ]]; do
+            local _chcnt="${_cron_col_cnt[__cron:${_ch_target}]:-0}"
+            [[ $_chcnt -gt 0 ]] && break
+            _ch_target=$((_ch_target - 1))
+          done
+          [[ $_ch_target -ge 0 ]] && cur_cron_col=$_ch_target
+        else
+          local _h_target=$((cur_col - 1))
+          local _h_repo=""
+          if [[ "$filter_mode" != "all" ]]; then
+            _h_repo="$filter_mode"
+          elif [[ ${#_repo_names[@]} -gt 0 ]]; then
+            _h_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          if [[ -n "$_h_repo" ]]; then
+            while [[ $_h_target -ge 0 ]]; do
+              local _hcnt="${_repo_col_cnt[${_h_repo}:${_h_target}]:-0}"
+              [[ $_hcnt -gt 0 ]] && break
+              _h_target=$((_h_target - 1))
+            done
+          fi
+          [[ $_h_target -ge 0 ]] && cur_col=$_h_target
+        fi
+        ;;
+      l) # Right column
+        if [[ $cron_row_selected -eq 1 ]]; then
+          local _cl_target=$((cur_cron_col + 1))
+          while [[ $_cl_target -le 3 ]]; do
+            local _clcnt="${_cron_col_cnt[__cron:${_cl_target}]:-0}"
+            [[ $_clcnt -gt 0 ]] && break
+            _cl_target=$((_cl_target + 1))
+          done
+          [[ $_cl_target -le 3 ]] && cur_cron_col=$_cl_target
+        else
+          local _l_target=$((cur_col + 1))
+          local _l_repo=""
+          if [[ "$filter_mode" != "all" ]]; then
+            _l_repo="$filter_mode"
+          elif [[ ${#_repo_names[@]} -gt 0 ]]; then
+            _l_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          if [[ -n "$_l_repo" ]]; then
+            while [[ $_l_target -le 3 ]]; do
+              local _lcnt="${_repo_col_cnt[${_l_repo}:${_l_target}]:-0}"
+              [[ $_lcnt -gt 0 ]] && break
+              _l_target=$((_l_target + 1))
+            done
+          fi
+          [[ $_l_target -le 3 ]] && cur_col=$_l_target
+        fi
+        ;;
+      j) # Down
+        if [[ $cron_row_selected -eq 1 ]]; then
+          # Move down within cron cards
+          local cck="__cron:${cur_cron_col}"
+          local cmax=$(( ${_cron_col_cnt[$cck]:-0} - 1 ))
+          local ccrow="${cur_cron_card_row[${cur_cron_col}]:-0}"
+          if [[ $ccrow -lt $cmax ]]; then
+            cur_cron_card_row[$cur_cron_col]=$((ccrow + 1))
+          fi
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          # Move between repo rows; cron is after the last repo
+          if [[ $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]]; then
+            cur_repo_idx=$((cur_repo_idx + 1))
+          elif $_has_cron_data; then
+            cron_row_selected=1
+            nav_mode="card"
+          fi
+        else
+          # Move between cards within the active repo
+          local active_repo
+          if [[ "$filter_mode" != "all" ]]; then
+            active_repo="$filter_mode"
+          else
+            active_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          if [[ -n "$active_repo" ]]; then
+            local ckey="${active_repo}:${cur_col}"
+            local max_idx=$(( ${_repo_col_cnt[$ckey]:-0} - 1 ))
+            local crow="${cur_card_row[$ckey]:-0}"
+            if [[ $crow -lt $max_idx ]]; then
+              cur_card_row[$ckey]=$((crow + 1))
+            elif [[ "$filter_mode" == "all" && $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]]; then
+              cur_repo_idx=$((cur_repo_idx + 1))
+            elif [[ "$filter_mode" == "all" ]] && $_has_cron_data; then
+              # Overflow to cron row
+              cron_row_selected=1
+              nav_mode="card"
+            fi
+          elif [[ "$filter_mode" == "all" && $cur_repo_idx -lt $((${#_repo_names[@]} - 1)) ]]; then
+            cur_repo_idx=$((cur_repo_idx + 1))
+          elif [[ "$filter_mode" == "all" ]] && $_has_cron_data; then
+            cron_row_selected=1
+            nav_mode="card"
+          fi
+        fi
+        ;;
+      k) # Up
+        if [[ $cron_row_selected -eq 1 ]]; then
+          local ccrow="${cur_cron_card_row[${cur_cron_col}]:-0}"
+          if [[ $ccrow -gt 0 ]]; then
+            cur_cron_card_row[$cur_cron_col]=$((ccrow - 1))
+          else
+            # Move back to last repo
+            cron_row_selected=0
+            if [[ ${#_repo_names[@]} -gt 0 ]]; then
+              cur_repo_idx=$((${#_repo_names[@]} - 1))
+              nav_mode="repo"
+            fi
+          fi
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          [[ $cur_repo_idx -gt 0 ]] && cur_repo_idx=$((cur_repo_idx - 1))
+        else
+          local active_repo
+          if [[ "$filter_mode" != "all" ]]; then
+            active_repo="$filter_mode"
+          else
+            active_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          if [[ -n "$active_repo" ]]; then
+            local ckey="${active_repo}:${cur_col}"
+            local crow="${cur_card_row[$ckey]:-0}"
+            if [[ $crow -gt 0 ]]; then
+              cur_card_row[$ckey]=$((crow - 1))
+            elif [[ "$filter_mode" == "all" && $cur_repo_idx -gt 0 ]]; then
+              cur_repo_idx=$((cur_repo_idx - 1))
+            fi
+          elif [[ "$filter_mode" == "all" && $cur_repo_idx -gt 0 ]]; then
+            cur_repo_idx=$((cur_repo_idx - 1))
+          fi
+        fi
+        ;;
+      '') ;; # Timeout: just refresh
+      $'\t') # Tab: next filter
+        local total_filters=$(( ${#_repo_names[@]} + 1 ))
+        filter_idx=$(( (filter_idx + 1) % total_filters ))
+        if [[ $filter_idx -eq 0 ]]; then
+          filter_mode="all"
+          nav_mode="repo"
+        else
+          filter_mode="${_repo_names[$((filter_idx - 1))]}"
+          nav_mode="card"
+        fi
+        ;;
+      SHIFT_TAB) # Shift-Tab: previous filter
+        local total_filters=$(( ${#_repo_names[@]} + 1 ))
+        filter_idx=$(( (filter_idx - 1 + total_filters) % total_filters ))
+        if [[ $filter_idx -eq 0 ]]; then
+          filter_mode="all"
+          nav_mode="repo"
+        else
+          filter_mode="${_repo_names[$((filter_idx - 1))]}"
+          nav_mode="card"
+        fi
+        ;;
+      ESC) # Escape: zoom out to repo mode
+        if [[ $cron_row_selected -eq 1 ]]; then
+          cron_row_selected=0
+          nav_mode="repo"
+          if [[ ${#_repo_names[@]} -gt 0 ]]; then
+            cur_repo_idx=$((${#_repo_names[@]} - 1))
+          fi
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "card" ]]; then
+          nav_mode="repo"
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          # Collapse the selected repo
+          if [[ ${#_repo_names[@]} -gt 0 ]]; then
+            local _esc_rname="${_repo_names[$cur_repo_idx]:-}"
+            [[ -n "$_esc_rname" ]] && _repo_collapsed[$_esc_rname]=1
+          fi
+        fi
+        ;;
+      $'\n'|$'\r') # Enter
+        if [[ $cron_row_selected -eq 1 ]]; then
+          # Handle cron row Enter
+          if [[ "$nav_mode" == "repo" ]]; then
+            nav_mode="card"
+          elif _get_selected_cron_id; then
+            local cron_item="$_tid"
+            case $cur_cron_col in
+              0)  # Scheduled: show job details
+                cursor_show
+                stty echo
+                echo ""
+                local jname="${_cron_jobs[$cron_item]:-}"
+                local jsched="${_cron_job_schedule[$cron_item]:-}"
+                local jenabled="${_cron_job_enabled[$cron_item]:-}"
+                echo "${C_BOLD}Cron Job: ${cron_item}${C_RESET}"
+                echo "  name: ${jname}"
+                echo "  schedule: ${jsched}"
+                echo "  enabled: ${jenabled}"
+                echo ""
+                echo "${C_DIM}Press any key to return...${C_RESET}"
+                read -rsk1 2>/dev/null || true
+                stty -echo
+                cursor_hide
+                ;;
+              1)  # Active: attach to tmux window
+                local rdata="${_cron_run_data[$cron_item]:-}"
+                local rjob_id rstat recode rstart rsid rwin
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                if [[ -n "$rwin" ]] && tmux_window_exists "$rwin"; then
+                  cursor_show
+                  tmux_select_window "$rwin"
+                  cursor_hide
+                fi
+                ;;
+              2|3)  # Needs Review / Done: resume session
+                local rdata="${_cron_run_data[$cron_item]:-}"
+                local rjob_id rstat recode rstart rsid rwin
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                if [[ -n "$rsid" ]]; then
+                  local resume_win="resume-${cron_item}"
+                  local cjob_wdir
+                  cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
+                  local safe_wdir=${(q)cjob_wdir}
+                  ensure_tmux_session
+                  tmux_create_window "$resume_win" "zsh" "-c" \
+                    "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                  cursor_show
+                  tmux_select_window "$resume_win"
+                  cursor_hide
+                fi
+                ;;
+            esac
+          fi
+        elif [[ "$filter_mode" == "all" && "$nav_mode" == "repo" ]]; then
+          if [[ $cron_row_selected -eq 0 && ${#_repo_names[@]} -gt 0 ]]; then
+            local _toggle_rname="${_repo_names[$cur_repo_idx]:-}"
+            if [[ -n "$_toggle_rname" ]]; then
+              if [[ "${_repo_collapsed[$_toggle_rname]:-}" == "1" ]]; then
+                # Collapsed repo: expand it
+                unset '_repo_collapsed[$_toggle_rname]'
+              else
+                # Expanded repo: zoom into card mode
+                nav_mode="card"
+              fi
+            fi
+          fi
+        elif _get_selected_id; then
+          # Open/interact with selected task
+          local sel_id="$_tid"
+          local cur_status="${_task_status[$sel_id]}"
+          local sel_repo="${_task_repo[$sel_id]}"
+          local sel_rpath
+          sel_rpath=$(repo_path "$sel_repo")
+
+          # Check for stale repo
+          if [[ -n "${_repo_stale[$sel_repo]:-}" ]]; then
+            cursor_show
+            stty echo
+            echo ""
+            echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${sel_repo} <new-path>${C_RESET}"
+            sleep 2
+            stty -echo
+            cursor_hide
+          else
+            case "$cur_status" in
+              pending)
+                cursor_show
+                stty echo
+                local task_title="${_task_title[$sel_id]}"
+                echo ""
+                echo "${C_CYAN}Starting task '${sel_id}': ${task_title}${C_RESET}"
+                printf "${C_CYAN}Prompt for Claude (or Enter to skip): ${C_RESET}"
+                local task_prompt=""
+                read -r task_prompt
+                local dash_wt_mode="${_task_wtmode[$sel_id]}"
+                local rtype="${_repo_types[$sel_repo]:-git}"
+                if [[ "$rtype" == "dir" ]]; then
+                  dash_wt_mode="none"
+                elif [[ "$dash_wt_mode" != "none" ]]; then
+                  printf "${C_CYAN}Use worktree? [Y/n]: ${C_RESET}"
+                  local wt_choice=""
+                  read -r wt_choice
+                  if [[ "$wt_choice" =~ ^[nN]$ ]]; then
+                    dash_wt_mode="none"
+                    update_task_field "$sel_id" "worktree_mode" "none"
+                    update_task_field_raw "$sel_id" "branch" "null"
+                  fi
+                fi
+                stty -echo
+                cursor_hide
+                local safe_global_dir=${(q)GLOBAL_DIR}
+                local safe_repo_path=${(q)sel_rpath}
+                local safe_work_dir=${(q)sel_rpath}
+                local dash_claude_cmd
+                if [[ "$dash_wt_mode" == "none" ]]; then
+                  dash_claude_cmd="claude --dangerously-skip-permissions"
+                else
+                  dash_claude_cmd="claude --worktree ${sel_id} --dangerously-skip-permissions"
+                fi
+                if [[ -n "$task_prompt" ]]; then
+                  local escaped="${task_prompt//\'/\'\\\'\'}"
+                  dash_claude_cmd="${dash_claude_cmd} '${escaped}'"
+                fi
+                tmux_create_window "$sel_id" "zsh" "-c" \
+                  "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                update_task_field "$sel_id" "status" "active"
+                update_task_field "$sel_id" "started_at" "$(now_iso)"
+                tmux_select_window "$sel_id"
+                ;;
+              paused)
+                local wt_mode_paused="${_task_wtmode[$sel_id]}"
+                if ! tmux_window_exists "$sel_id"; then
+                  local safe_global_dir=${(q)GLOBAL_DIR}
+                  local safe_repo_path=${(q)sel_rpath}
+                  if [[ "$wt_mode_paused" == "none" ]]; then
+                    local safe_work_dir=${(q)sel_rpath}
+                    tmux_create_window "$sel_id" "zsh" "-c" \
+                      "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                  else
+                    local wt_p=$(find_worktree_path "$sel_id" "$sel_rpath")
+                    if [[ -n "$wt_p" ]]; then
+                      local safe_wt_p=${(q)wt_p}
+                      tmux_create_window "$sel_id" "zsh" "-c" \
+                        "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_wt_p} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                    fi
+                  fi
+                fi
+                update_task_field "$sel_id" "status" "active"
+                tmux_select_window "$sel_id"
+                ;;
+              active|needs_review)
+                if ! tmux_window_exists "$sel_id"; then
+                  local wt_mode_act="${_task_wtmode[$sel_id]}"
+                  local safe_global_dir=${(q)GLOBAL_DIR}
+                  local safe_repo_path=${(q)sel_rpath}
+                  if [[ "$wt_mode_act" == "none" ]]; then
+                    local safe_work_dir=${(q)sel_rpath}
+                    tmux_create_window "$sel_id" "zsh" "-c" \
+                      "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                  else
+                    local wt_a=$(find_worktree_path "$sel_id" "$sel_rpath")
+                    if [[ -n "$wt_a" ]]; then
+                      local safe_wt_a=${(q)wt_a}
+                      tmux_create_window "$sel_id" "zsh" "-c" \
+                        "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_wt_a} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                    fi
+                  fi
+                fi
+                cursor_show
+                tmux_select_window "$sel_id"
+                cursor_hide
+                ;;
+              done)
+                # Reopen: restart Claude session from repo root
+                cursor_show
+                stty echo
+                local task_title_done="${_task_title[$sel_id]}"
+                echo ""
+                echo "${C_CYAN}Reopening '${sel_id}': ${task_title_done}${C_RESET}"
+                printf "${C_CYAN}Prompt for Claude (or Enter to continue previous session): ${C_RESET}"
+                local reopen_prompt=""
+                read -r reopen_prompt
+                stty -echo
+                cursor_hide
+                local safe_global_dir=${(q)GLOBAL_DIR}
+                local safe_repo_path=${(q)sel_rpath}
+                local safe_work_dir=${(q)sel_rpath}
+                local dash_claude_cmd="claude --continue --dangerously-skip-permissions"
+                if [[ -n "$reopen_prompt" ]]; then
+                  local escaped="${reopen_prompt//\'/\'\\\'\'}"
+                  dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+                fi
+                tmux_create_window "$sel_id" "zsh" "-c" \
+                  "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                update_task_field "$sel_id" "status" "active"
+                update_task_field "$sel_id" "worktree_mode" "none"
+                update_task_field_raw "$sel_id" "branch" "null"
+                update_task_field_raw "$sel_id" "completed_at" "null"
+                cursor_show
+                tmux_select_window "$sel_id"
+                cursor_hide
+                ;;
+            esac
+          fi
+        fi
+        ;;
+      '>'|'.') # Move task right
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local mv_status="${_task_status[$sel_id]}"
+          local -a status_order=("pending" "paused" "active" "needs_review" "done")
+          local mv_idx=-1
+          for (( i=0; i<${#status_order[@]}; i++ )); do
+            [[ "${status_order[$i]}" == "$mv_status" ]] && mv_idx=$i
+          done
+          if [[ $mv_idx -ge 0 && $mv_idx -lt $((${#status_order[@]} - 1)) ]]; then
+            local next_status="${status_order[$((mv_idx + 1))]}"
+            if [[ "$mv_status" == "needs_review" && "$next_status" == "done" ]]; then
+              (cmd_done "$sel_id") 2>&1 || true
+            else
+              update_task_field "$sel_id" "status" "$next_status"
+            fi
+          fi
+        fi
+        ;;
+      '<'|',') # Move task left
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local mv_status="${_task_status[$sel_id]}"
+          local -a status_order=("pending" "paused" "active" "needs_review" "done")
+          local mv_idx=-1
+          for (( i=0; i<${#status_order[@]}; i++ )); do
+            [[ "${status_order[$i]}" == "$mv_status" ]] && mv_idx=$i
+          done
+          if [[ $mv_idx -gt 0 ]]; then
+            local prev_status="${status_order[$((mv_idx - 1))]}"
+            update_task_field "$sel_id" "status" "$prev_status"
+          fi
+        fi
+        ;;
+      ':') # Move card up in column
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local active_repo
+          if [[ "$filter_mode" != "all" ]]; then
+            active_repo="$filter_mode"
+          else
+            active_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          local ckey="${active_repo}:${cur_col}"
+          local crow="${cur_card_row[$ckey]:-0}"
+          if [[ $crow -gt 0 ]]; then
+            # Get the task above
+            _get_repo_task_at "$active_repo" "$cur_col" "$((crow - 1))"
+            local above_id="$_tid"
+            if [[ -n "$above_id" ]]; then
+              _swap_tasks_in_state "$sel_id" "$above_id"
+              cur_card_row[$ckey]=$((crow - 1))
+            fi
+          fi
+        fi
+        ;;
+      '"') # Move card down in column
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local active_repo
+          if [[ "$filter_mode" != "all" ]]; then
+            active_repo="$filter_mode"
+          else
+            active_repo="${_repo_names[$cur_repo_idx]:-}"
+          fi
+          local ckey="${active_repo}:${cur_col}"
+          local crow="${cur_card_row[$ckey]:-0}"
+          local max_idx=$(( ${_repo_col_cnt[$ckey]:-0} - 1 ))
+          if [[ $crow -lt $max_idx ]]; then
+            # Get the task below
+            _get_repo_task_at "$active_repo" "$cur_col" "$((crow + 1))"
+            local below_id="$_tid"
+            if [[ -n "$below_id" ]]; then
+              _swap_tasks_in_state "$sel_id" "$below_id"
+              cur_card_row[$ckey]=$((crow + 1))
+            fi
+          fi
+        fi
+        ;;
+      o) # Quick-create and start a Claude session (or cron job)
+        if [[ $cron_row_selected -eq 1 ]]; then
+          cursor_show
+          stty echo
+          echo ""
+          echo "${C_CYAN}Creating new cron job...${C_RESET}"
+          (cmd_cron_add) 2>&1 || true
+          stty -echo
+          cursor_hide
+          continue
+        fi
+        cursor_show
+        stty echo
+        echo ""
+        local new_repo="" _cancelled=false
+        if [[ "$filter_mode" != "all" ]]; then
+          new_repo="$filter_mode"
+        else
+          # Show repo picker
+          echo "${C_CYAN}Select repo (Esc to cancel):${C_RESET}"
+          local -a picker_repos=()
+          local picker_idx=1
+          for rn in "${_repo_names[@]}"; do
+            [[ -n "${_repo_stale[$rn]:-}" ]] && continue
+            picker_repos+=("$rn")
+            echo "  ${picker_idx}) ${rn}"
+            picker_idx=$((picker_idx + 1))
+          done
+          if [[ ${#picker_repos[@]} -eq 0 ]]; then
+            echo "${C_RED}No repos available${C_RESET}"
+            sleep 1
+            stty -echo
+            cursor_hide
+            continue
+          elif [[ ${#picker_repos[@]} -eq 1 ]]; then
+            new_repo="${picker_repos[0]}"
+          else
+            printf "${C_CYAN}Choice: ${C_RESET}"
+            local pchoice=""
+            if ! _read_or_esc pchoice; then _cancelled=true; fi
+            if ! $_cancelled && [[ -n "$pchoice" ]]; then
+              if [[ "$pchoice" =~ ^[0-9]+$ ]]; then
+                pchoice=$((pchoice - 1))
+                if [[ $pchoice -ge 0 && $pchoice -lt ${#picker_repos[@]} ]]; then
+                  new_repo="${picker_repos[$pchoice]}"
+                else
+                  echo "${C_RED}Invalid choice (out of range)${C_RESET}"
+                  sleep 1
+                fi
+              else
+                echo "${C_RED}Invalid choice (not a number)${C_RESET}"
+                sleep 1
+              fi
+            fi
+          fi
+        fi
+        if ! $_cancelled && [[ -n "$new_repo" ]]; then
+          printf "${C_CYAN}Title (Enter to skip, Esc to cancel): ${C_RESET}"
+          local new_title=""
+          if ! _read_or_esc new_title; then _cancelled=true; fi
+        fi
+        if ! $_cancelled && [[ -n "$new_repo" ]]; then
+          # Create task with --no-worktree, title optional
+          local add_output
+          add_output=$( (cmd_add --title "$new_title" --repo "$new_repo" --no-worktree) 2>&1 ) || true
+          if [[ -n "$add_output" ]]; then
+            echo "$add_output"
+          fi
+          # Extract the task ID from the output (format: "✓ created t-NNN ...")
+          local new_id=""
+          new_id=$(echo "$add_output" | grep -oE 't-[0-9]+' | head -1)
+          if [[ -n "$new_id" ]]; then
+            printf "${C_CYAN}Prompt (Enter to skip, Esc to cancel): ${C_RESET}"
+            local new_prompt=""
+            if _read_or_esc new_prompt; then
+              # Start the session immediately
+              local start_output
+              start_output=$( (cmd_start "$new_id" "$new_prompt") 2>&1 ) || true
+              if [[ -n "$start_output" ]]; then
+                echo "$start_output"
+              fi
+            fi
+          fi
+        fi
+        stty -echo
+        cursor_hide
+        ;;
+      x) # Done/delete selected task OR cron toggle/review
+        if [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
+          local cron_item="$_tid"
+          case $cur_cron_col in
+            0)  # Scheduled: toggle enable/disable
+              local is_enabled="${_cron_job_enabled[$cron_item]:-true}"
+              cursor_show
+              stty echo
+              if [[ "$is_enabled" == "true" ]]; then
+                printf "${C_YELLOW}Disable cron job ${cron_item}? [y/N]: ${C_RESET}"
+                local dconfirm=""
+                read -r dconfirm
+                [[ "$dconfirm" =~ ^[yY]$ ]] && (cmd_cron_disable "$cron_item") 2>&1 || true
+              else
+                printf "${C_CYAN}Enable cron job ${cron_item}? [Y/n]: ${C_RESET}"
+                local econfirm=""
+                read -r econfirm
+                [[ ! "$econfirm" =~ ^[nN]$ ]] && (cmd_cron_enable "$cron_item") 2>&1 || true
+              fi
+              stty -echo
+              cursor_hide
+              ;;
+            2)  # Needs Review: mark reviewed (moves to Done)
+              (cmd_cron_review "$cron_item") 2>&1 || true
+              ;;
+            3)  # Done: archive (remove from dashboard)
+              update_cron_run_field "$cron_item" "status" "archived"
+              ;;
+          esac
+        elif _get_selected_id; then
+          local sel_id="$_tid"
+          local sel_status="${_task_status[$sel_id]}"
+          if [[ "$sel_status" == "done" ]]; then
+            (cmd_rm "$sel_id") 2>&1 || true
+          else
+            (cmd_done "$sel_id") 2>&1 || true
+          fi
+        fi
+        ;;
+      d) # Show diff
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local sel_repo="${_task_repo[$sel_id]}"
+          local sel_rpath
+          sel_rpath=$(repo_path "$sel_repo")
+          local diff_dir=""
+          if [[ "${_task_wtmode[$sel_id]}" == "none" ]]; then
+            diff_dir="$sel_rpath"
+          else
+            diff_dir=$(find_worktree_path "$sel_id" "$sel_rpath")
+          fi
+          if [[ -n "$diff_dir" && -d "$diff_dir" ]]; then
+            cursor_show
+            stty echo
+            (cd "$diff_dir" && git diff --stat && echo "" && git diff) | less
+            stty -echo
+            cursor_hide
+          fi
+        fi
+        ;;
+      s) # Shell popup
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          if tmux_window_exists "$sel_id"; then
+            cursor_show
+            stty echo
+            local pane_content
+            pane_content=$(tmux_cmd capture-pane -t "board:${sel_id}" -p -S -500 2>/dev/null || echo "(no output)")
+            echo "$pane_content" | less -R +G
+            stty -echo
+            cursor_hide
+          fi
+        fi
+        ;;
+      R) # Register a new repo
+        cursor_show
+        stty echo
+        echo ""
+        printf "${C_CYAN}Path to register (drag folder or Esc to cancel): ${C_RESET}"
+        local new_repo_path=""
+        if _read_or_esc new_repo_path; then
+          # Sanitize path: strip whitespace, CR, and dequote (handles drag-and-drop backslash paths)
+          new_repo_path="${new_repo_path%$'\r'}"    # strip trailing CR (Windows paste)
+          new_repo_path="${new_repo_path## }"       # strip leading space
+          new_repo_path="${new_repo_path%% }"       # strip trailing space
+          new_repo_path="${(Q)new_repo_path}"       # dequote: handles \" \' and backslash-escaped spaces
+          if [[ -n "$new_repo_path" ]]; then
+            local reg_output
+            reg_output=$( (cmd_repo_add "$new_repo_path") 2>&1 ) || true
+            if [[ -n "$reg_output" ]]; then
+              echo "$reg_output"
+              sleep 1.5
+            fi
+          fi
+        fi
+        stty -echo
+        cursor_hide
+        ;;
+      S) # Import an existing Claude session
+        cursor_show
+        stty echo
+        echo ""
+        local session_uid="" _s_cancelled=false
+        printf "${C_CYAN}Claude session UID (Esc to cancel): ${C_RESET}"
+        if ! _read_or_esc session_uid; then _s_cancelled=true; fi
+        session_uid="${session_uid## }"
+        session_uid="${session_uid%% }"
+        if ! $_s_cancelled && [[ -n "$session_uid" ]]; then
+          # Auto-detect repo
+          local sess_repo=""
+          sess_repo=$(_find_session_repo "$session_uid") || true
+          if [[ -z "$sess_repo" ]]; then
+            # Fallback: use filtered repo or picker
+            if [[ "$filter_mode" != "all" ]]; then
+              sess_repo="$filter_mode"
+              echo "${C_DIM}Session not found in Claude projects; using filtered repo '${sess_repo}'${C_RESET}"
+            else
+              echo "${C_YELLOW}Could not auto-detect repo. Select one (Esc to cancel):${C_RESET}"
+              local -a sp_repos=()
+              local sp_idx=1
+              for rn in "${_repo_names[@]}"; do
+                [[ -n "${_repo_stale[$rn]:-}" ]] && continue
+                sp_repos+=("$rn")
+                echo "  ${sp_idx}) ${rn}"
+                sp_idx=$((sp_idx + 1))
+              done
+              if [[ ${#sp_repos[@]} -eq 1 ]]; then
+                sess_repo="${sp_repos[0]}"
+              elif [[ ${#sp_repos[@]} -gt 1 ]]; then
+                printf "${C_CYAN}Choice: ${C_RESET}"
+                local sp_choice=""
+                if ! _read_or_esc sp_choice; then _s_cancelled=true; fi
+                if ! $_s_cancelled && [[ "$sp_choice" =~ ^[0-9]+$ ]]; then
+                  sp_choice=$((sp_choice - 1))
+                  if [[ $sp_choice -ge 0 && $sp_choice -lt ${#sp_repos[@]} ]]; then
+                    sess_repo="${sp_repos[$sp_choice]}"
+                  fi
+                fi
+              fi
+            fi
+          else
+            echo "${C_GREEN}Detected repo: ${sess_repo}${C_RESET}"
+          fi
+          if ! $_s_cancelled && [[ -n "$sess_repo" ]]; then
+            printf "${C_CYAN}Title (Enter to skip, Esc to cancel): ${C_RESET}"
+            local sess_title=""
+            if ! _read_or_esc sess_title; then _s_cancelled=true; fi
+            if ! $_s_cancelled; then
+              local sess_output
+              local sess_args=("$session_uid" --repo "$sess_repo")
+              [[ -n "$sess_title" ]] && sess_args+=(--title "$sess_title")
+              sess_output=$( (cmd_session "${sess_args[@]}") 2>&1 ) || true
+              if [[ -n "$sess_output" ]]; then
+                echo "$sess_output"
+              fi
+            fi
+          fi
+        fi
+        stty -echo
+        cursor_hide
+        ;;
+      t) # Rename focused task
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local cur_title="${_task_title[$sel_id]}"
+          cursor_show
+          stty echo
+          echo ""
+          printf "${C_CYAN}Rename '${sel_id}' [${cur_title}] (Esc to cancel): ${C_RESET}"
+          local rename_input=""
+          if _read_or_esc rename_input && [[ -n "$rename_input" ]]; then
+            update_task_field "$sel_id" "title" "$rename_input"
+          fi
+          stty -echo
+          cursor_hide
+        fi
+        ;;
+      p) # Pause active task
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local p_status="${_task_status[$sel_id]}"
+          if [[ "$p_status" == "active" || "$p_status" == "needs_review" ]]; then
+            tmux_kill_window "$sel_id"
+            update_task_field "$sel_id" "status" "paused"
+            update_task_field_raw "$sel_id" "claude_status" "null"
+          fi
+        fi
+        ;;
+      r) # Reopen done task
+        if _get_selected_id; then
+          local sel_id="$_tid"
+          local r_status="${_task_status[$sel_id]}"
+          if [[ "$r_status" == "done" ]]; then
+            local sel_repo="${_task_repo[$sel_id]}"
+            local sel_rpath
+            sel_rpath=$(repo_path "$sel_repo")
+            if [[ -n "${_repo_stale[$sel_repo]:-}" ]]; then
+              cursor_show
+              stty echo
+              echo ""
+              echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${sel_repo} <new-path>${C_RESET}"
+              sleep 2
+              stty -echo
+              cursor_hide
+            else
+              cursor_show
+              stty echo
+              local task_title="${_task_title[$sel_id]}"
+              echo ""
+              echo "${C_CYAN}Reopening '${sel_id}': ${task_title}${C_RESET}"
+              printf "${C_CYAN}Prompt for Claude (or Enter to continue previous session): ${C_RESET}"
+              local reopen_prompt=""
+              read -r reopen_prompt
+              stty -echo
+              cursor_hide
+              local safe_global_dir=${(q)GLOBAL_DIR}
+              local safe_repo_path=${(q)sel_rpath}
+              local safe_work_dir=${(q)sel_rpath}
+              local dash_claude_cmd="claude --continue --dangerously-skip-permissions"
+              if [[ -n "$reopen_prompt" ]]; then
+                local escaped="${reopen_prompt//\'/\'\\\'\'}"
+                dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+              fi
+              tmux_create_window "$sel_id" "zsh" "-c" \
+                "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+              update_task_field "$sel_id" "status" "active"
+              update_task_field "$sel_id" "worktree_mode" "none"
+              update_task_field_raw "$sel_id" "branch" "null"
+              update_task_field_raw "$sel_id" "completed_at" "null"
+              tmux_select_window "$sel_id"
+            fi
+          fi
+        fi
+        ;;
+      D) # Delete cron job (from dashboard)
+        if [[ $cron_row_selected -eq 1 && $cur_cron_col -eq 0 ]] && _get_selected_cron_id; then
+          local cron_item="$_tid"
+          cursor_show
+          stty echo
+          echo ""
+          (cmd_cron_remove "$cron_item") 2>&1 || true
+          stty -echo
+          cursor_hide
+        fi
+        ;;
+      q) # Quit / detach
+        cursor_show
+        tmux_cmd detach-client 2>/dev/null || exit 0
+        exit 0
+        ;;
+    esac
+  done
+}
+
