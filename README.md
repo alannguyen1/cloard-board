@@ -4,6 +4,8 @@ A multi-repo tmux kanban dashboard for managing parallel [Claude Code](https://d
 
 Run multiple Claude agents across different repositories in isolated git worktrees, track their progress on an interactive terminal board, and advance tasks through a kanban workflow: pending, active, needs review, in PR, done.
 
+![cloard-board dashboard](assets/dashboard-screenshot.png)
+
 ## Install
 
 **Option A: Clone and install**
