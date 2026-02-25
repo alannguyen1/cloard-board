@@ -2,7 +2,7 @@
 
 A multi-repo tmux kanban dashboard for managing parallel [Claude Code](https://docs.anthropic.com/en/docs/claude-code) worktree sessions.
 
-Run multiple Claude agents across different repositories in isolated git worktrees, track their progress on an interactive terminal board, and advance tasks through a kanban workflow: pending, active, needs review, in PR, done.
+Run multiple Claude agents across different repositories in isolated git worktrees, track their progress on an interactive terminal board, and advance tasks through a kanban workflow: pending, active, needs review, done.
 
 ![cloard-board dashboard](assets/dashboard-screenshot.png)
 
@@ -11,7 +11,7 @@ Run multiple Claude agents across different repositories in isolated git worktre
 **Option A: Clone and install**
 
 ```sh
-git clone https://github.com/yourusername/cloard-board.git
+git clone https://github.com/alannguyen1/cloard-board.git
 cd cloard-board
 ./install.sh
 ```
@@ -19,7 +19,7 @@ cd cloard-board
 **Option B: Manual**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yourusername/cloard-board/main/cloard-board -o ~/.local/bin/cloard-board
+curl -fsSL https://raw.githubusercontent.com/alannguyen1/cloard-board/main/cloard-board -o ~/.local/bin/cloard-board
 chmod +x ~/.local/bin/cloard-board
 ```
 
@@ -65,18 +65,36 @@ If you have an existing `.cloard-board/` directory from v0.1, run any command fr
 
 | Command | Description |
 |---|---|
-| `add --title "..." [--repo name]` | Add a task with auto-generated ID. Use `--no-worktree` to skip branch isolation |
+| `add [--title "..."] [--repo name]` | Add a task with auto-generated ID. Use `--no-worktree` to skip branch isolation |
+| `session <uid> [--repo] [--title]` | Import an existing Claude session by UID |
+| `title <id> <new-title>` | Rename a task |
 | `start <id> [prompt]` | Launch Claude in a new worktree; task becomes active |
 | `pause <id>` | Pause a task: kill tmux window but keep worktree |
 | `go <id>` | Switch to a task's tmux window |
 | `resume <id>` | Reopen a task with `claude --continue` |
+| `reopen <id> [prompt]` | Reopen a done task (restarts the session) |
 | `advance <id>` | Move task to the next status in the pipeline |
-| `review <id>` | Push branch, create a GitHub PR; task becomes "in review" |
 | `done <id>` | Clean up worktree, branch, and tmux window |
 | `rm <id>` | Remove a task entirely (cleans up resources) |
 | `list [--repo name]` | Print all tasks (optionally filtered by repo) |
 | `status <id>` | Show task details and Claude status |
 | `signal <id> <status>` | Set Claude status: `working`, `waiting`, or `clear` |
+
+### Cron jobs
+
+Schedule and manage recurring Claude Code tasks via macOS LaunchAgents.
+
+| Command | Description |
+|---|---|
+| `cron scan` | Discover Claude-invoking LaunchAgents on this machine |
+| `cron add` | Create a new cron job (interactive) |
+| `cron list` | List all cron jobs |
+| `cron runs [job-id]` | List active and unreviewed runs |
+| `cron enable <id>` | Enable and load a cron job |
+| `cron disable <id>` | Disable and unload a cron job |
+| `cron remove <id>` | Delete a cron job (with confirmation) |
+| `cron review <run-id>` | Mark a run as reviewed |
+| `cron migrate` | Import existing Claude LaunchAgents |
 
 ### Dashboard and utilities
 
@@ -93,7 +111,7 @@ If you have an existing `.cloard-board/` directory from v0.1, run any command fr
 
 | Key | Action |
 |---|---|
-| `j` / `k` (or arrows) | Move between repo rows |
+| `j` / `k` (or arrows) | Move between repo rows (cron row at bottom) |
 | `h` / `l` (or arrows) | Move between columns |
 | `Enter` | Zoom into selected repo (card-level navigation) |
 | `Esc` | Zoom back out to repo-level navigation |
@@ -107,20 +125,34 @@ If you have an existing `.cloard-board/` directory from v0.1, run any command fr
 | `j` / `k` (or arrows) | Move between cards in a column |
 | `h` / `l` (or arrows) | Move between columns |
 | `Enter` | Open/start/attach to the selected task |
-| `o` | Create a new task interactively |
+| `o` | Quick-create and start a Claude session |
+| `S` | Import an existing Claude session by UID |
+| `t` | Rename the focused task |
 | `p` | Pause: kill the tmux window but keep the worktree |
+| `r` | Reopen a done task (restart session) |
 | `x` | Mark task as done (or remove if already done) |
 | `>` / `.` | Move task to the next status |
 | `<` / `,` | Move task to the previous status |
+| `:` / `"` | Reorder card up/down within a column |
 | `d` | Show git diff for the selected task's worktree |
 | `s` | Shell popup: view the task's terminal output |
+| `R` | Register a new repo |
 | `q` | Quit (detach from tmux) |
+
+### Cron row
+
+| Key | Action |
+|---|---|
+| `Enter` | Col 0: show job details / Col 1: attach to run / Col 2: resume session |
+| `x` | Col 0: toggle enable/disable / Col 2: mark run as reviewed |
+| `o` | Create a new cron job |
+| `D` | Delete cron job (Col 0 only, with confirmation) |
 
 ## Task lifecycle
 
 ```
-pending  -->  active  -->  needs_review  -->  review (PR)  -->  done
-   add()      start()        advance()        review()        done()
+pending  -->  active  -->  needs_review  -->  done
+   add()      start()        advance()       done()
                  \              |
                   <-- paused <--
                       pause()     resume()
@@ -145,7 +177,7 @@ Register any directory, even without git:
 cloard-board repo add ~/scripts    # type: "dir"
 ```
 
-Non-git repos always use `--no-worktree` mode. The `review` command is disabled for non-git repos since there's no branch to push.
+Non-git repos always use `--no-worktree` mode. Claude sessions run directly in the registered directory.
 
 ### Stale repo handling
 
@@ -155,16 +187,45 @@ If a registered repo's path no longer exists (e.g., you moved the directory), th
 cloard-board repo update-path my-api ~/new/location/my-api
 ```
 
-### Pausing tasks
+### Pausing and reopening tasks
 
 Use `pause` to temporarily free a tmux window without losing work. The worktree and branch remain intact. Resume later with `resume` or press `Enter` on a paused card in the dashboard. Paused tasks appear in the Pending column with cyan coloring.
+
+Use `reopen` to restart a session on a task that's already been marked done. This is useful when you need to revisit completed work.
+
+## Cron jobs
+
+cloard-board can schedule and manage recurring Claude Code sessions via macOS LaunchAgents.
+
+### Discovering existing jobs
+
+```sh
+cloard-board cron scan      # find Claude-invoking LaunchAgents
+cloard-board cron migrate   # import them into cloard-board
+```
+
+### Creating new jobs
+
+```sh
+cloard-board cron add       # interactive: set schedule, command, and working directory
+```
+
+### Dashboard integration
+
+The cron row appears at the bottom of the dashboard with three columns:
+
+- **Scheduled**: all registered cron jobs (enabled/disabled)
+- **Active**: currently running cron sessions
+- **Needs Review**: completed runs awaiting review
+
+Runs in "Needs Review" older than 24 hours are auto-archived. The `doctor` command prunes archived runs older than 7 days.
 
 ## Claude status indicators
 
 cloard-board tracks whether each Claude session is actively working or waiting for user input:
 
-- **● working** (green): Claude is actively processing
-- **○ waiting** (yellow): Claude has stopped and is waiting for a prompt
+- **working** (green): Claude is actively processing
+- **waiting** (yellow): Claude has stopped and is waiting for a prompt
 
 ### How it works
 
@@ -183,7 +244,7 @@ cloard-board signal t-001 waiting
 cloard-board signal t-001 clear    # remove the indicator
 ```
 
-Status is automatically cleared when tasks are paused, marked done, or sent to review.
+Status is automatically cleared when tasks are paused or marked done.
 
 ## Data model
 
@@ -191,18 +252,22 @@ All state is stored globally at `~/.cloard-board/state.json`:
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "next_task_id": 4,
+  "next_cron_id": 1,
+  "next_run_id": 1,
   "repos": [
     { "name": "my-api", "path": "/Users/you/code/my-api", "type": "git", "base_branch": "main" }
   ],
   "tasks": [
-    { "id": "t-001", "title": "Fix auth bug", "repo": "my-api", "status": "active", ... }
-  ]
+    { "id": "t-001", "title": "Fix auth bug", "repo": "my-api", "status": "active" }
+  ],
+  "cron_jobs": [],
+  "cron_runs": []
 }
 ```
 
-Task IDs are auto-generated (`t-001`, `t-002`, ...) and globally unique across all repos.
+Task IDs are auto-generated (`t-001`, `t-002`, ...) and globally unique across all repos. Cron job IDs follow the same pattern (`cj-001`, `cj-002`, ...) with run IDs as `cr-001`, `cr-002`, etc.
 
 ## Dependencies
 
@@ -211,7 +276,6 @@ Task IDs are auto-generated (`t-001`, `t-002`, ...) and globally unique across a
 - **jq** (JSON state file manipulation)
 - **git** (worktree management; optional if only using non-git repos)
 - **claude** ([Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code))
-- **gh** (GitHub CLI, only needed for `review` command)
 
 ## Star History
 
