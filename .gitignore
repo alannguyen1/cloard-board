@@ -1,0 +1,14 @@
+
+# FewWord context plugin
+.fewword/scratch/
+.fewword/index/
+.cloard-board/
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Reviews
+reviews/

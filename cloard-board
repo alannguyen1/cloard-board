@@ -39,6 +39,15 @@ require_cmd() {
   command -v "$1" &>/dev/null || die "'$1' is required but not found"
 }
 
+# Escape XML special characters for plist generation
+_xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  echo "$s"
+}
+
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 # ── Lock helpers (mkdir-based, portable to macOS) ─────────────────────────────
@@ -698,21 +707,25 @@ _generate_plist() {
   if ! $has_user_home; then
     env_xml="${env_xml}
         <key>HOME</key>
-        <string>${HOME}</string>"
+        <string>$(_xml_escape "$HOME")</string>"
   fi
   # Add PATH default if user didn't provide one
   if ! $has_user_path; then
     env_xml="${env_xml}
         <key>PATH</key>
-        <string>${launchd_path}</string>"
+        <string>$(_xml_escape "$launchd_path")</string>"
   fi
   # Add all user-provided env vars
   if [[ "$env_json" != "{}" && "$env_json" != "null" ]]; then
     while IFS=$'\x1e' read -r ekey eval; do
       [[ -n "$ekey" ]] || continue
+      if [[ ! "$ekey" =~ ^[A-Za-z_][A-Za-z_0-9]*$ ]]; then
+        warn "skipping invalid env var name: ${ekey}"
+        continue
+      fi
       env_xml="${env_xml}
-        <key>${ekey}</key>
-        <string>${eval}</string>"
+        <key>$(_xml_escape "$ekey")</key>
+        <string>$(_xml_escape "$eval")</string>"
     done < <(echo "$env_json" | jq -r 'to_entries[] | [.key, .value] | join("\u001e")')
   fi
   env_xml="${env_xml}
@@ -727,8 +740,12 @@ _generate_plist() {
     <dict>"
     while IFS=$'\x1e' read -r skey sval; do
       [[ -n "$skey" ]] || continue
+      if [[ ! "$sval" =~ ^[0-9]+$ ]]; then
+        warn "skipping non-integer schedule value: ${skey}=${sval}"
+        continue
+      fi
       schedule_xml="${schedule_xml}
-        <key>${skey}</key>
+        <key>$(_xml_escape "$skey")</key>
         <integer>${sval}</integer>"
     done < <(echo "$schedule_raw" | jq -r 'to_entries[] | [.key, (.value | tostring)] | join("\u001e")')
     schedule_xml="${schedule_xml}
@@ -741,8 +758,12 @@ _generate_plist() {
         <dict>"
       while IFS=$'\x1e' read -r skey sval; do
         [[ -n "$skey" ]] || continue
+        if [[ ! "$sval" =~ ^[0-9]+$ ]]; then
+          warn "skipping non-integer schedule value: ${skey}=${sval}"
+          continue
+        fi
         schedule_xml="${schedule_xml}
-            <key>${skey}</key>
+            <key>$(_xml_escape "$skey")</key>
             <integer>${sval}</integer>"
       done < <(echo "$entry" | jq -r 'to_entries[] | [.key, (.value | tostring)] | join("\u001e")')
       schedule_xml="${schedule_xml}
@@ -752,33 +773,42 @@ _generate_plist() {
     </array>"
   fi
 
+  # Pre-escape values for XML interpolation in the plist
+  local esc_label esc_script esc_cron_id esc_working_dir esc_log_dir esc_job_name
+  esc_label=$(_xml_escape "$plist_label")
+  esc_script=$(_xml_escape "$script_path")
+  esc_cron_id=$(_xml_escape "$cron_id")
+  esc_working_dir=$(_xml_escape "$working_dir")
+  esc_log_dir=$(_xml_escape "$log_dir")
+  esc_job_name=$(_xml_escape "$job_name")
+
   cat > "$plist_path" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${plist_label}</string>
+    <string>${esc_label}</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>${script_path}</string>
+        <string>${esc_script}</string>
         <string>cron-exec</string>
-        <string>${cron_id}</string>
+        <string>${esc_cron_id}</string>
     </array>
 
 ${env_xml:+$env_xml
 
 }    <key>WorkingDirectory</key>
-    <string>${working_dir}</string>
+    <string>${esc_working_dir}</string>
 
 ${schedule_xml}
 
     <key>StandardOutPath</key>
-    <string>${log_dir}/${job_name}.log</string>
+    <string>${esc_log_dir}/${esc_job_name}.log</string>
 
     <key>StandardErrorPath</key>
-    <string>${log_dir}/${job_name}-error.log</string>
+    <string>${esc_log_dir}/${esc_job_name}-error.log</string>
 </dict>
 </plist>
 PLIST
@@ -849,6 +879,10 @@ cmd_cron_exec() {
   if [[ "$env_json" != "{}" && "$env_json" != "null" ]]; then
     while IFS=$'\x1e' read -r ekey eval; do
       [[ -n "$ekey" ]] || continue
+      if [[ ! "$ekey" =~ ^[A-Za-z_][A-Za-z_0-9]*$ ]]; then
+        warn "skipping invalid env var name: ${ekey}"
+        continue
+      fi
       env_exports="${env_exports}export ${ekey}=${(q)eval}; "
     done < <(echo "$env_json" | jq -r 'to_entries[] | [.key, .value] | join("\u001e")')
   fi
@@ -1018,10 +1052,10 @@ cmd_cron_add() {
 
   # Environment variables
   local env_vars="{}"
-  printf "${C_CYAN}Copy environment from current shell? (CLAUDE_CODE_OAUTH_TOKEN, PATH) [Y/n]: ${C_RESET}"
+  printf "${C_CYAN}Copy environment from current shell? (CLAUDE_CODE_OAUTH_TOKEN, PATH) [y/N]: ${C_RESET}"
   local env_choice=""
   read -r env_choice
-  if [[ ! "$env_choice" =~ ^[nN]$ ]]; then
+  if [[ "$env_choice" =~ ^[yY]$ ]]; then
     env_vars=$(jq -n \
       --arg token "${CLAUDE_CODE_OAUTH_TOKEN:-}" \
       --arg home "$HOME" \
@@ -2476,16 +2510,14 @@ _snapshot_tasks() {
         _cron_job_enabled[$_f1]="$_f3"
         _cron_job_schedule[$_f1]="$_f4"
         _has_cron_data=true
-        # Enabled jobs go to col 0 (Scheduled)
-        if [[ "$_f3" == "true" ]]; then
-          local _ck="__cron:0"
-          if [[ -n "${_cron_col_ids[$_ck]:-}" ]]; then
-            _cron_col_ids[$_ck]="${_cron_col_ids[$_ck]} $_f1"
-          else
-            _cron_col_ids[$_ck]="$_f1"
-          fi
-          _cron_col_cnt[$_ck]=$(( ${_cron_col_cnt[$_ck]:-0} + 1 ))
+        # All jobs go to col 0 (Scheduled), regardless of enabled state
+        local _ck="__cron:0"
+        if [[ -n "${_cron_col_ids[$_ck]:-}" ]]; then
+          _cron_col_ids[$_ck]="${_cron_col_ids[$_ck]} $_f1"
+        else
+          _cron_col_ids[$_ck]="$_f1"
         fi
+        _cron_col_cnt[$_ck]=$(( ${_cron_col_cnt[$_ck]:-0} + 1 ))
         ;;
       CR)
         # _f1=run_id, _f2=cron_job_id, _f3=status, _f4=exit_code, _f5=started_at, _f6=session_id, _f7=tmux_window
@@ -3180,11 +3212,18 @@ cmd__dash_loop() {
                   0)  # Scheduled: show job info
                     local jname="${_cron_jobs[$item_id]:-}"
                     local jsched="${_cron_job_schedule[$item_id]:-}"
+                    local jenabled="${_cron_job_enabled[$item_id]:-true}"
+                    local sched_line="$jsched"
+                    local sched_color="${ccc}${C_DIM}"
+                    if [[ "$jenabled" != "true" ]]; then
+                      sched_line="disabled"
+                      sched_color="${C_RED}"
+                    fi
                     case $line_no in
                       0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
                       1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
                       2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$jname" $((cron_card_inner-1)))") ;;
-                      3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${C_DIM} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$jsched" $((cron_card_inner-1)))") ;;
+                      3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${sched_color} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$sched_line" $((cron_card_inner-1)))") ;;
                       4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
                     esac
                     ;;
