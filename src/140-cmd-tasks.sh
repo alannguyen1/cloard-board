@@ -1,5 +1,51 @@
 # ── Commands ───────────────────────────────────────────────────────────────────
 
+# Build the right Claude resume command for a task.
+# Uses --resume <session_uid> if available, falls back to --continue.
+_build_claude_resume_cmd() {
+  local id="$1"
+  local session_uid
+  session_uid=$(task_field "$id" "session_uid")
+  if [[ -n "$session_uid" && "$session_uid" != "null" ]]; then
+    echo "claude --resume ${session_uid} --dangerously-skip-permissions"
+  else
+    echo "claude --continue --dangerously-skip-permissions"
+  fi
+}
+
+# Capture session_uid for a task by finding the most recent session file.
+# Called from the on-prompt hook as a backup for tasks started without session_uid.
+cmd__capture_session_uid() {
+  [[ -f "$GLOBAL_STATE" ]] || return 0
+  local id="${1:-}"
+  [[ -n "$id" ]] || return 0
+  task_exists "$id" || return 0
+
+  local existing
+  existing=$(task_field "$id" "session_uid")
+  [[ -z "$existing" || "$existing" == "null" ]] || return 0  # already set
+
+  local repo_name
+  repo_name=$(task_repo "$id")
+  [[ -n "$repo_name" ]] || return 0
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  [[ -n "$rpath" ]] || return 0
+
+  local encoded="${rpath//\//-}"
+  encoded="${encoded// /-}"
+  local proj_dir="$HOME/.claude/projects/${encoded}"
+  [[ -d "$proj_dir" ]] || return 0
+
+  local latest
+  latest=$(command ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+  [[ -n "$latest" ]] || return 0
+
+  local uid
+  uid=$(basename "$latest" .jsonl)
+  update_task_field "$id" "session_uid" "$uid"
+}
+
 cmd_init() {
   ensure_global_state
   check_and_migrate
@@ -192,11 +238,7 @@ cmd_session() {
   # Start in tmux with claude --continue
   ensure_tmux_session
 
-  local safe_repo_path=${(q)rpath}
-  local safe_global_dir=${(q)GLOBAL_DIR}
-
-  tmux_create_window "$id" "zsh" "-c" \
-    "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_repo_path} && claude --resume ${session_uid} --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+  _tmux_launch_claude "$id" "$rpath" "claude --resume ${session_uid} --dangerously-skip-permissions"
 
   ok "tracking session '${session_uid:0:8}...' as ${id} in ${repo_name}"
 
@@ -300,16 +342,16 @@ cmd_start() {
     # Force no-worktree for non-git repos
     [[ "$rtype" == "dir" ]] && wt_mode="none"
 
-    local claude_cmd work_dir
-    local safe_repo_path=${(q)rpath}
-    local safe_global_dir=${(q)GLOBAL_DIR}
+    # Generate session ID for reliable resumption
+    local session_uid
+    session_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+
+    local claude_cmd
 
     if [[ "$wt_mode" == "none" ]]; then
-      claude_cmd="claude --dangerously-skip-permissions"
-      work_dir="$rpath"
+      claude_cmd="claude --session-id ${session_uid} --dangerously-skip-permissions"
     else
-      claude_cmd="claude --worktree ${id} --dangerously-skip-permissions"
-      work_dir="$rpath"
+      claude_cmd="claude --worktree ${id} --session-id ${session_uid} --dangerously-skip-permissions"
     fi
 
     if [[ -n "$prompt" ]]; then
@@ -317,9 +359,7 @@ cmd_start() {
       claude_cmd="${claude_cmd} '${escaped_prompt}'"
     fi
 
-    local safe_work_dir=${(q)work_dir}
-    tmux_create_window "$id" "zsh" "-c" \
-      "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+    _tmux_launch_claude "$id" "$rpath" "$claude_cmd"
 
     if [[ "$wt_mode" == "none" ]]; then
       info "created tmux window '${id}' with claude (no worktree) in ${repo_name}"
@@ -331,6 +371,7 @@ cmd_start() {
   # Update state
   update_task_field "$id" "status" "active"
   update_task_field "$id" "started_at" "$(now_iso)"
+  update_task_field "$id" "session_uid" "$session_uid"
 
   # Try to discover worktree path
   local wt_path
@@ -479,14 +520,15 @@ cmd_reopen() {
   else
     # Worktree was removed by cmd_done, so always work from repo root
     local reopen_prompt="${2:-}"
-    local dash_claude_cmd="claude --continue --dangerously-skip-permissions"
+    local dash_claude_cmd
     if [[ -n "$reopen_prompt" ]]; then
       local escaped="${reopen_prompt//\'/\'\\\'\'}"
       dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+    else
+      dash_claude_cmd=$(_build_claude_resume_cmd "$id")
     fi
-    tmux_create_window "$id" "zsh" "-c" \
-      "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-    info "reopened task '${id}' with claude --continue (from repo root)"
+    _tmux_launch_claude "$id" "$rpath" "$dash_claude_cmd"
+    info "reopened task '${id}' with claude resume (from repo root)"
   fi
 
   # Update state: reactivate the task
@@ -547,24 +589,27 @@ cmd_resume() {
 
   ensure_tmux_session
 
-  if tmux_window_exists "$id"; then
+  # Kill dead windows (Claude exited, bare zsh running)
+  if tmux_window_exists "$id" && ! _tmux_claude_alive "$id"; then
+    tmux_kill_window "$id"
+  fi
+
+  if _tmux_claude_alive "$id"; then
     info "window '${id}' already exists; switching to it"
   else
+    local resume_cmd
+    resume_cmd=$(_build_claude_resume_cmd "$id")
     if [[ "$wt_mode" == "none" ]]; then
-      local safe_work_dir=${(q)rpath}
-      tmux_create_window "$id" "zsh" "-c" \
-        "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-      info "created tmux window '${id}' with claude --continue (no worktree)"
+      _tmux_launch_claude "$id" "$rpath" "$resume_cmd"
+      info "created tmux window '${id}' with claude resume (no worktree)"
     else
       local wt_path
       wt_path=$(find_worktree_path "$id" "$rpath")
       if [[ -z "$wt_path" ]]; then
         die "no worktree found for '${id}'; use 'cloard-board start' instead"
       fi
-      local safe_wt_path=${(q)wt_path}
-      tmux_create_window "$id" "zsh" "-c" \
-        "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_wt_path} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-      info "created tmux window '${id}' with claude --continue"
+      _tmux_launch_claude "$id" "$wt_path" "$resume_cmd"
+      info "created tmux window '${id}' with claude resume"
     fi
   fi
 

@@ -36,6 +36,7 @@ HOOK
 # cloard-board hook: set task status to "working" when user submits a prompt
 [[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
 cloard-board signal "$CLOARD_TASK_ID" working &>/dev/null &
+cloard-board _capture-session-uid "$CLOARD_TASK_ID" &>/dev/null &
 HOOK
   chmod +x "$HOOKS_DIR/on-prompt.sh"
 }

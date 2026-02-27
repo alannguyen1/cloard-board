@@ -29,7 +29,7 @@ calc_accordion() {
   local expanded_count=$1 collapsed_count=$2 rows=$3 has_cron=$4
 
   local cron_reserve=0
-  [[ "$has_cron" == "true" ]] && cron_reserve=8
+  [[ "$has_cron" == "true" ]] && cron_reserve=8  # 1 visible * 5 lines + 3 (header+colhdr+gap)
 
   [[ $expanded_count -lt 1 ]] && expanded_count=1
   local collapsed_lines=$collapsed_count

@@ -11,6 +11,7 @@ main() {
     help|-h|--help)        cmd_help ;;
     version|-v|--version)  cmd_version ;;
     signal)                cmd_signal "$@" ;;
+    _capture-session-uid)  cmd__capture_session_uid "$@" ;;
     cron-exec)
       ensure_global_state
       cmd_cron_exec "$@" ;;

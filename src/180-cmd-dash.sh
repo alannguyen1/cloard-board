@@ -161,7 +161,16 @@ cmd__dash_loop() {
       local total_repos=${#_repo_names[@]}
       local MAX_EXPANDED=4
       local cron_reserve=0
-      $_has_cron_data && cron_reserve=8
+      if $_has_cron_data; then
+        local _cr_max=0
+        for _ci in {0..3}; do
+          local _cr_cnt="${_cron_col_cnt[__cron:${_ci}]:-0}"
+          [[ $_cr_cnt -gt $_cr_max ]] && _cr_max=$_cr_cnt
+        done
+        local _cr_vis=$((_cr_max < 3 ? _cr_max : 3))
+        [[ $_cr_vis -lt 1 ]] && _cr_vis=1
+        cron_reserve=$((_cr_vis * 5 + 3))  # cards + header + col headers + gap
+      fi
 
       # Auto-initialize: collapse repos beyond MAX_EXPANDED on first render
       local _init_exp=0
@@ -383,7 +392,18 @@ cmd__dash_loop() {
     else
       # ── Filtered single-repo view ──
       local rname="$filter_mode"
-      local max_visible_rows=$(( (rows - 5) / 5 ))
+      local filt_cron_reserve=0
+      if $_has_cron_data; then
+        local _fcr_max=0
+        for _ci in {0..3}; do
+          local _fcr_cnt="${_cron_col_cnt[__cron:${_ci}]:-0}"
+          [[ $_fcr_cnt -gt $_fcr_max ]] && _fcr_max=$_fcr_cnt
+        done
+        local _fcr_vis=$((_fcr_max < 3 ? _fcr_max : 3))
+        [[ $_fcr_vis -lt 1 ]] && _fcr_vis=1
+        filt_cron_reserve=$((_fcr_vis * 5 + 3))
+      fi
+      local max_visible_rows=$(( (rows - 5 - filt_cron_reserve) / 5 ))
       [[ $max_visible_rows -lt 1 ]] && max_visible_rows=1
 
       # Column headers
@@ -527,6 +547,15 @@ cmd__dash_loop() {
     # ── Cron row (always visible when cron data exists) ──
     if $_has_cron_data; then
       _render_cron_row
+    fi
+
+    # Clip frame to terminal height (header always visible; reserve 1 for footer)
+    local _max_lines=$((rows - 1))
+    local -a _flines
+    _flines=("${(@f)_frame}")
+    if [[ ${#_flines[@]} -gt $_max_lines ]]; then
+      _flines=("${_flines[@]:0:$_max_lines}")
+      _frame="${(pj:\n:)_flines}"$'\n'
     fi
 
     # Output frame
@@ -847,62 +876,58 @@ cmd__dash_loop() {
                 fi
                 stty -echo
                 cursor_hide
-                local safe_global_dir=${(q)GLOBAL_DIR}
-                local safe_repo_path=${(q)sel_rpath}
-                local safe_work_dir=${(q)sel_rpath}
+                # Generate session ID for reliable resumption
+                local dash_session_uid
+                dash_session_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
                 local dash_claude_cmd
                 if [[ "$dash_wt_mode" == "none" ]]; then
-                  dash_claude_cmd="claude --dangerously-skip-permissions"
+                  dash_claude_cmd="claude --session-id ${dash_session_uid} --dangerously-skip-permissions"
                 else
-                  dash_claude_cmd="claude --worktree ${sel_id} --dangerously-skip-permissions"
+                  dash_claude_cmd="claude --worktree ${sel_id} --session-id ${dash_session_uid} --dangerously-skip-permissions"
                 fi
                 if [[ -n "$task_prompt" ]]; then
                   local escaped="${task_prompt//\'/\'\\\'\'}"
                   dash_claude_cmd="${dash_claude_cmd} '${escaped}'"
                 fi
-                tmux_create_window "$sel_id" "zsh" "-c" \
-                  "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
                 update_task_field "$sel_id" "status" "active"
                 update_task_field "$sel_id" "started_at" "$(now_iso)"
+                update_task_field "$sel_id" "session_uid" "$dash_session_uid"
                 tmux_select_window "$sel_id"
                 ;;
               paused)
-                local wt_mode_paused="${_task_wtmode[$sel_id]}"
+                # Kill dead windows (Claude exited, bare zsh running)
+                if tmux_window_exists "$sel_id" && ! _tmux_claude_alive "$sel_id"; then
+                  tmux_kill_window "$sel_id"
+                fi
                 if ! tmux_window_exists "$sel_id"; then
-                  local safe_global_dir=${(q)GLOBAL_DIR}
-                  local safe_repo_path=${(q)sel_rpath}
+                  local wt_mode_paused="${_task_wtmode[$sel_id]}"
+                  local resume_cmd
+                  resume_cmd=$(_build_claude_resume_cmd "$sel_id")
                   if [[ "$wt_mode_paused" == "none" ]]; then
-                    local safe_work_dir=${(q)sel_rpath}
-                    tmux_create_window "$sel_id" "zsh" "-c" \
-                      "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                    _tmux_launch_claude "$sel_id" "$sel_rpath" "$resume_cmd"
                   else
                     local wt_p=$(find_worktree_path "$sel_id" "$sel_rpath")
-                    if [[ -n "$wt_p" ]]; then
-                      local safe_wt_p=${(q)wt_p}
-                      tmux_create_window "$sel_id" "zsh" "-c" \
-                        "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_wt_p} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-                    fi
+                    [[ -n "$wt_p" ]] && _tmux_launch_claude "$sel_id" "$wt_p" "$resume_cmd"
                   fi
                 fi
                 update_task_field "$sel_id" "status" "active"
                 tmux_select_window "$sel_id"
                 ;;
               active|needs_review)
+                # Kill dead windows (Claude exited, bare zsh running)
+                if tmux_window_exists "$sel_id" && ! _tmux_claude_alive "$sel_id"; then
+                  tmux_kill_window "$sel_id"
+                fi
                 if ! tmux_window_exists "$sel_id"; then
                   local wt_mode_act="${_task_wtmode[$sel_id]}"
-                  local safe_global_dir=${(q)GLOBAL_DIR}
-                  local safe_repo_path=${(q)sel_rpath}
+                  local resume_cmd
+                  resume_cmd=$(_build_claude_resume_cmd "$sel_id")
                   if [[ "$wt_mode_act" == "none" ]]; then
-                    local safe_work_dir=${(q)sel_rpath}
-                    tmux_create_window "$sel_id" "zsh" "-c" \
-                      "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                    _tmux_launch_claude "$sel_id" "$sel_rpath" "$resume_cmd"
                   else
                     local wt_a=$(find_worktree_path "$sel_id" "$sel_rpath")
-                    if [[ -n "$wt_a" ]]; then
-                      local safe_wt_a=${(q)wt_a}
-                      tmux_create_window "$sel_id" "zsh" "-c" \
-                        "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_wt_a} && claude --continue --dangerously-skip-permissions; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-                    fi
+                    [[ -n "$wt_a" ]] && _tmux_launch_claude "$sel_id" "$wt_a" "$resume_cmd"
                   fi
                 fi
                 cursor_show
@@ -921,16 +946,14 @@ cmd__dash_loop() {
                 read -r reopen_prompt
                 stty -echo
                 cursor_hide
-                local safe_global_dir=${(q)GLOBAL_DIR}
-                local safe_repo_path=${(q)sel_rpath}
-                local safe_work_dir=${(q)sel_rpath}
-                local dash_claude_cmd="claude --continue --dangerously-skip-permissions"
+                local dash_claude_cmd
                 if [[ -n "$reopen_prompt" ]]; then
                   local escaped="${reopen_prompt//\'/\'\\\'\'}"
                   dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+                else
+                  dash_claude_cmd=$(_build_claude_resume_cmd "$sel_id")
                 fi
-                tmux_create_window "$sel_id" "zsh" "-c" \
-                  "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+                _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
                 update_task_field "$sel_id" "status" "active"
                 update_task_field "$sel_id" "worktree_mode" "none"
                 update_task_field_raw "$sel_id" "branch" "null"
@@ -1022,7 +1045,7 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      o) # Quick-create and start a Claude session (or cron job)
+      c) # Create new task (modal) or cron job
         if [[ $cron_row_selected -eq 1 ]]; then
           cursor_show
           stty echo
@@ -1033,81 +1056,105 @@ cmd__dash_loop() {
           cursor_hide
           continue
         fi
-        cursor_show
-        stty echo
-        echo ""
-        local new_repo="" _cancelled=false
-        if [[ "$filter_mode" != "all" ]]; then
-          new_repo="$filter_mode"
-        else
-          # Show repo picker
-          echo "${C_CYAN}Select repo (Esc to cancel):${C_RESET}"
-          local -a picker_repos=()
-          local picker_idx=1
-          for rn in "${_repo_names[@]}"; do
-            [[ -n "${_repo_stale[$rn]:-}" ]] && continue
-            picker_repos+=("$rn")
-            echo "  ${picker_idx}) ${rn}"
-            picker_idx=$((picker_idx + 1))
-          done
-          if [[ ${#picker_repos[@]} -eq 0 ]]; then
-            echo "${C_RED}No repos available${C_RESET}"
-            sleep 1
-            stty -echo
-            cursor_hide
-            continue
-          elif [[ ${#picker_repos[@]} -eq 1 ]]; then
-            new_repo="${picker_repos[0]}"
+
+        # Small terminal fallback (< 40 cols): sequential prompts
+        local _c_cols
+        _c_cols=$(tput cols)
+        if [[ $_c_cols -lt 40 ]]; then
+          cursor_show
+          stty echo
+          echo ""
+          local new_repo="" _cancelled=false
+          if [[ "$filter_mode" != "all" ]]; then
+            new_repo="$filter_mode"
           else
-            printf "${C_CYAN}Choice: ${C_RESET}"
-            local pchoice=""
-            if ! _read_or_esc pchoice; then _cancelled=true; fi
-            if ! $_cancelled && [[ -n "$pchoice" ]]; then
-              if [[ "$pchoice" =~ ^[0-9]+$ ]]; then
-                pchoice=$((pchoice - 1))
-                if [[ $pchoice -ge 0 && $pchoice -lt ${#picker_repos[@]} ]]; then
-                  new_repo="${picker_repos[$pchoice]}"
+            echo "${C_CYAN}Select repo (Esc to cancel):${C_RESET}"
+            local -a picker_repos=()
+            local picker_idx=1
+            for rn in "${_repo_names[@]}"; do
+              [[ -n "${_repo_stale[$rn]:-}" ]] && continue
+              picker_repos+=("$rn")
+              echo "  ${picker_idx}) ${rn}"
+              picker_idx=$((picker_idx + 1))
+            done
+            if [[ ${#picker_repos[@]} -eq 0 ]]; then
+              echo "${C_RED}No repos available${C_RESET}"
+              sleep 1
+              stty -echo
+              cursor_hide
+              continue
+            elif [[ ${#picker_repos[@]} -eq 1 ]]; then
+              new_repo="${picker_repos[0]}"
+            else
+              printf "${C_CYAN}Choice: ${C_RESET}"
+              local pchoice=""
+              if ! _read_or_esc pchoice; then _cancelled=true; fi
+              if ! $_cancelled && [[ -n "$pchoice" ]]; then
+                if [[ "$pchoice" =~ ^[0-9]+$ ]]; then
+                  pchoice=$((pchoice - 1))
+                  if [[ $pchoice -ge 0 && $pchoice -lt ${#picker_repos[@]} ]]; then
+                    new_repo="${picker_repos[$pchoice]}"
+                  else
+                    echo "${C_RED}Invalid choice (out of range)${C_RESET}"
+                    sleep 1
+                  fi
                 else
-                  echo "${C_RED}Invalid choice (out of range)${C_RESET}"
+                  echo "${C_RED}Invalid choice (not a number)${C_RESET}"
                   sleep 1
                 fi
-              else
-                echo "${C_RED}Invalid choice (not a number)${C_RESET}"
-                sleep 1
               fi
             fi
           fi
-        fi
-        if ! $_cancelled && [[ -n "$new_repo" ]]; then
-          printf "${C_CYAN}Title (Enter to skip, Esc to cancel): ${C_RESET}"
-          local new_title=""
-          if ! _read_or_esc new_title; then _cancelled=true; fi
-        fi
-        if ! $_cancelled && [[ -n "$new_repo" ]]; then
-          # Create task with --no-worktree, title optional
-          local add_output
-          add_output=$( (cmd_add --title "$new_title" --repo "$new_repo" --no-worktree) 2>&1 ) || true
-          if [[ -n "$add_output" ]]; then
-            echo "$add_output"
+          if ! $_cancelled && [[ -n "$new_repo" ]]; then
+            printf "${C_CYAN}Title (Enter to skip, Esc to cancel): ${C_RESET}"
+            local new_title=""
+            if ! _read_or_esc new_title; then _cancelled=true; fi
           fi
-          # Extract the task ID from the output (format: "✓ created t-NNN ...")
+          if ! $_cancelled && [[ -n "$new_repo" ]]; then
+            local add_output
+            add_output=$( (cmd_add --title "$new_title" --repo "$new_repo" --no-worktree) 2>&1 ) || true
+            [[ -n "$add_output" ]] && echo "$add_output"
+            local new_id=""
+            new_id=$(echo "$add_output" | grep -oE 't-[0-9]+' | head -1)
+            if [[ -n "$new_id" ]]; then
+              printf "${C_CYAN}Prompt (Enter to skip, Esc to cancel): ${C_RESET}"
+              local new_prompt=""
+              if _read_or_esc new_prompt; then
+                local start_output
+                start_output=$( (cmd_start "$new_id" "$new_prompt") 2>&1 ) || true
+                [[ -n "$start_output" ]] && echo "$start_output"
+              fi
+            fi
+          fi
+          stty -echo
+          cursor_hide
+          continue
+        fi
+
+        # Modal state (set by _modal_open, read after return)
+        local _mf_repo="" _mf_title="" _mf_prompt="" _mf_repo_hint=""
+        local -i _mf_worktree=0 _mf_focus=0
+        local -i _mf_repo_readonly=0 _mf_wt_locked=0
+        local -i _mf_dropdown_open=0 _mf_dropdown_idx=0
+        local -i _mf_prev_top=0 _mf_prev_height=0
+        local -a _mf_repo_list=()
+
+        if _modal_open; then
+          local add_args=(--title "$_mf_title" --repo "$_mf_repo")
+          [[ $_mf_worktree -eq 0 ]] && add_args+=(--no-worktree)
+
+          local add_output
+          add_output=$( (cmd_add "${add_args[@]}") 2>&1 ) || true
           local new_id=""
           new_id=$(echo "$add_output" | grep -oE 't-[0-9]+' | head -1)
+
           if [[ -n "$new_id" ]]; then
-            printf "${C_CYAN}Prompt (Enter to skip, Esc to cancel): ${C_RESET}"
-            local new_prompt=""
-            if _read_or_esc new_prompt; then
-              # Start the session immediately
-              local start_output
-              start_output=$( (cmd_start "$new_id" "$new_prompt") 2>&1 ) || true
-              if [[ -n "$start_output" ]]; then
-                echo "$start_output"
-              fi
-            fi
+            _modal_render_success "$new_id"
+            sleep 1
+            local start_output
+            start_output=$( (cmd_start "$new_id" "$_mf_prompt") 2>&1 ) || true
           fi
         fi
-        stty -echo
-        cursor_hide
         ;;
       x) # Done/delete selected task OR cron toggle/review
         if [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
@@ -1324,16 +1371,17 @@ cmd__dash_loop() {
               read -r reopen_prompt
               stty -echo
               cursor_hide
-              local safe_global_dir=${(q)GLOBAL_DIR}
-              local safe_repo_path=${(q)sel_rpath}
-              local safe_work_dir=${(q)sel_rpath}
-              local dash_claude_cmd="claude --continue --dangerously-skip-permissions"
+              local dash_claude_cmd
               if [[ -n "$reopen_prompt" ]]; then
                 local escaped="${reopen_prompt//\'/\'\\\'\'}"
-                dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+                local new_uid
+                new_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+                dash_claude_cmd="claude --session-id ${new_uid} --dangerously-skip-permissions '${escaped}'"
+                update_task_field "$sel_id" "session_uid" "$new_uid"
+              else
+                dash_claude_cmd=$(_build_claude_resume_cmd "$sel_id")
               fi
-              tmux_create_window "$sel_id" "zsh" "-c" \
-                "export CLOARD_TASK_ID=${sel_id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${dash_claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+              _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
               update_task_field "$sel_id" "status" "active"
               update_task_field "$sel_id" "worktree_mode" "none"
               update_task_field_raw "$sel_id" "branch" "null"

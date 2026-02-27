@@ -49,6 +49,26 @@ tmux_select_window() {
   tmux_cmd select-window -t "board:$name" 2>/dev/null
 }
 
+# Check if Claude is still running in a task's tmux window (vs dead zsh fallback)
+_tmux_claude_alive() {
+  local name="$1"
+  tmux_window_exists "$name" || return 1
+  local pane_cmd
+  pane_cmd=$(tmux_cmd list-panes -t "board:${name}" -F '#{pane_current_command}' 2>/dev/null | head -1)
+  [[ "$pane_cmd" == *claude* || "$pane_cmd" == *node* ]]
+}
+
+# Launch a Claude session in a new tmux window with standard env vars.
+# Usage: _tmux_launch_claude <task_id> <work_dir> <claude_cmd>
+_tmux_launch_claude() {
+  local id="$1" work_dir="$2" claude_cmd="$3"
+  local safe_global_dir=${(q)GLOBAL_DIR}
+  local safe_repo_path=${(q)work_dir}
+  local safe_work_dir=${(q)work_dir}
+  tmux_create_window "$id" "zsh" "-c" \
+    "export CLOARD_TASK_ID=${id} CLOARD_BOARD_DIR=${safe_global_dir} CLOARD_REPO_PATH=${safe_repo_path} && cd ${safe_work_dir} && ${claude_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+}
+
 pin_dashboard_to_zero() {
   local dash_idx
   dash_idx=$(tmux_cmd list-windows -t "board" -F '#{window_name} #{window_index}' 2>/dev/null \
