@@ -125,7 +125,7 @@ Schedule and manage recurring Claude Code tasks via macOS LaunchAgents.
 | `j` / `k` (or arrows) | Move between cards in a column |
 | `h` / `l` (or arrows) | Move between columns |
 | `Enter` | Open/start/attach to the selected task |
-| `o` | Quick-create and start a Claude session |
+| `c` | Open new task modal (repo, title, worktree, prompt) |
 | `S` | Import an existing Claude session by UID |
 | `t` | Rename the focused task |
 | `p` | Pause: kill the tmux window but keep the worktree |
@@ -145,7 +145,7 @@ Schedule and manage recurring Claude Code tasks via macOS LaunchAgents.
 |---|---|
 | `Enter` | Col 0: show job details / Col 1: attach to run / Col 2: resume session |
 | `x` | Col 0: toggle enable/disable / Col 2: mark run as reviewed |
-| `o` | Create a new cron job |
+| `c` | Create a new cron job |
 | `D` | Delete cron job (Col 0 only, with confirmation) |
 
 ## Task lifecycle
@@ -192,6 +192,21 @@ cloard-board repo update-path my-api ~/new/location/my-api
 Use `pause` to temporarily free a tmux window without losing work. The worktree and branch remain intact. Resume later with `resume` or press `Enter` on a paused card in the dashboard. Paused tasks appear in the Pending column with cyan coloring.
 
 Use `reopen` to restart a session on a task that's already been marked done. This is useful when you need to revisit completed work.
+
+### Task creation modal
+
+Press `c` in the dashboard to open a centered modal overlay for creating tasks. The modal includes:
+
+- **Repo selector**: dropdown with arrow-key navigation (auto-filled when filtering a single repo)
+- **Title**: free-text field
+- **Worktree toggle**: on/off radio (locked to "No" for non-git repos)
+- **Prompt**: auto-expanding text field (up to 4 lines)
+
+Navigate fields with `Tab`/`Shift-Tab`. Press `Enter` to create and immediately start the task. On terminals narrower than 40 columns, the modal falls back to sequential prompts.
+
+### Session tracking
+
+Each task stores a session UID so that `resume` uses `claude --resume <uid>` instead of the less precise `--continue`. Sessions are captured automatically via hooks. If a tmux window dies (e.g., Claude exits), the dashboard detects it and cleans up the window on the next interaction.
 
 ## Cron jobs
 
