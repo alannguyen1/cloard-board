@@ -14,6 +14,7 @@ readonly GLOBAL_DIR="$HOME/.cloard-board"
 readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
 readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
+readonly HOOK_VERSION="2"
 
 # ── Colours (ANSI) ────────────────────────────────────────────────────────────
 readonly C_RESET=$'\e[0m'
@@ -347,9 +348,16 @@ tmux_select_window() {
 _tmux_claude_alive() {
   local name="$1"
   tmux_window_exists "$name" || return 1
+  # Fast path: check pane_current_command directly
   local pane_cmd
   pane_cmd=$(tmux_cmd list-panes -t "board:${name}" -F '#{pane_current_command}' 2>/dev/null | head -1)
-  [[ "$pane_cmd" == *claude* || "$pane_cmd" == *node* ]]
+  [[ "$pane_cmd" == *claude* || "$pane_cmd" == *node* ]] && return 0
+  # Fallback: pane_current_command reports "zsh" when launched via zsh -c wrapper;
+  # check child processes of the pane's PID for claude or node
+  local pane_pid
+  pane_pid=$(tmux_cmd list-panes -t "board:${name}" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [[ -n "$pane_pid" ]] || return 1
+  pgrep -P "$pane_pid" 2>/dev/null | xargs -I{} ps -o comm= -p {} 2>/dev/null | grep -qE 'claude|node'
 }
 
 # Launch a Claude session in a new tmux window with standard env vars.
@@ -407,8 +415,12 @@ ensure_global_state() {
     fi
   fi
 
-  # Install hooks if missing
-  if [[ ! -f "$HOOKS_DIR/on-stop.sh" || ! -f "$HOOKS_DIR/on-prompt.sh" ]]; then
+  # Install hooks if missing or outdated
+  local _hook_ver=""
+  if [[ -f "$HOOKS_DIR/on-prompt.sh" ]]; then
+    _hook_ver=$(grep -o 'hook-version:[0-9]*' "$HOOKS_DIR/on-prompt.sh" 2>/dev/null | cut -d: -f2)
+  fi
+  if [[ ! -f "$HOOKS_DIR/on-stop.sh" || ! -f "$HOOKS_DIR/on-prompt.sh" || "$_hook_ver" != "$HOOK_VERSION" ]]; then
     _install_hook_scripts
     _register_global_hooks
   fi
@@ -417,20 +429,22 @@ ensure_global_state() {
 _install_hook_scripts() {
   mkdir -p "$HOOKS_DIR"
 
-  cat > "$HOOKS_DIR/on-stop.sh" <<'HOOK'
+  cat > "$HOOKS_DIR/on-stop.sh" <<HOOK
 #!/usr/bin/env bash
 # cloard-board hook: set task status to "waiting" when Claude stops
-[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
-cloard-board signal "$CLOARD_TASK_ID" waiting &>/dev/null &
+# hook-version:${HOOK_VERSION}
+[[ -n "\${CLOARD_TASK_ID:-}" ]] || exit 0
+cloard-board signal "\$CLOARD_TASK_ID" waiting &>/dev/null &
 HOOK
   chmod +x "$HOOKS_DIR/on-stop.sh"
 
-  cat > "$HOOKS_DIR/on-prompt.sh" <<'HOOK'
+  cat > "$HOOKS_DIR/on-prompt.sh" <<HOOK
 #!/usr/bin/env bash
 # cloard-board hook: set task status to "working" when user submits a prompt
-[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
-cloard-board signal "$CLOARD_TASK_ID" working &>/dev/null &
-cloard-board _capture-session-uid "$CLOARD_TASK_ID" &>/dev/null &
+# hook-version:${HOOK_VERSION}
+[[ -n "\${CLOARD_TASK_ID:-}" ]] || exit 0
+cloard-board signal "\$CLOARD_TASK_ID" working &>/dev/null &
+cloard-board _capture-session-uid "\$CLOARD_TASK_ID" &>/dev/null &
 HOOK
   chmod +x "$HOOKS_DIR/on-prompt.sh"
 }
@@ -3314,6 +3328,107 @@ _get_selected_id() {
   [[ -n "$_tid" ]] || return 1
 }
 
+# ── List mode snapshot (flat ordered array from snapshot data) ─────────────────
+# Builds _list_items[] for the list view. Relies on zsh dynamic scoping to
+# access snapshot arrays and list state declared in cmd__dash_loop.
+
+_list_build_items() {
+  _list_items=()
+
+  # ── Repo task groups ────────────────────────────────────────────────────────
+  local _lb_repo _lb_name
+  for _lb_repo in "${_repo_names[@]}"; do
+    _lb_name="$_lb_repo"
+    _list_items+=("group:${_lb_name}")
+
+    # Skip items if group is collapsed
+    [[ "${_list_group_collapsed[$_lb_name]:-}" == "1" ]] && continue
+
+    # Collect all task IDs across columns 0-3
+    local -a _lb_all_ids=()
+    local _lb_col _lb_ids_str
+    for _lb_col in {0..3}; do
+      _lb_ids_str="${_repo_cols[${_lb_repo}:${_lb_col}]:-}"
+      [[ -z "$_lb_ids_str" ]] && continue
+      local -a _lb_split=(${(s: :)_lb_ids_str})
+      _lb_all_ids+=("${_lb_split[@]}")
+    done
+
+    [[ ${#_lb_all_ids[@]} -eq 0 ]] && continue
+
+    # Compute priority for each task and emit in priority order (stable)
+    local -a _lb_pri_0=() _lb_pri_1=() _lb_pri_2=() _lb_pri_3=() _lb_pri_4=() _lb_pri_5=() _lb_pri_6=()
+    local _lb_tid _lb_st _lb_cl
+    for _lb_tid in "${_lb_all_ids[@]}"; do
+      _lb_st="${_task_status[$_lb_tid]:-}"
+      _lb_cl="${_task_claude[$_lb_tid]:-}"
+
+      case "$_lb_st" in
+        active)
+          if [[ "$_lb_cl" == "working" ]]; then
+            _lb_pri_0+=("$_lb_tid")
+          elif [[ "$_lb_cl" == "waiting" ]]; then
+            _lb_pri_1+=("$_lb_tid")
+          else
+            _lb_pri_2+=("$_lb_tid")
+          fi
+          ;;
+        needs_review)
+          _lb_pri_3+=("$_lb_tid")
+          ;;
+        pending)
+          _lb_pri_4+=("$_lb_tid")
+          ;;
+        paused)
+          _lb_pri_5+=("$_lb_tid")
+          ;;
+        done)
+          [[ "$_show_done" == "0" ]] && continue
+          _lb_pri_6+=("$_lb_tid")
+          ;;
+      esac
+    done
+
+    # Append in priority order
+    local _lb_id
+    for _lb_id in "${_lb_pri_0[@]}"; do _list_items+=("task:${_lb_id}"); done
+    for _lb_id in "${_lb_pri_1[@]}"; do _list_items+=("task:${_lb_id}"); done
+    for _lb_id in "${_lb_pri_2[@]}"; do _list_items+=("task:${_lb_id}"); done
+    for _lb_id in "${_lb_pri_3[@]}"; do _list_items+=("task:${_lb_id}"); done
+    for _lb_id in "${_lb_pri_4[@]}"; do _list_items+=("task:${_lb_id}"); done
+    for _lb_id in "${_lb_pri_5[@]}"; do _list_items+=("task:${_lb_id}"); done
+    for _lb_id in "${_lb_pri_6[@]}"; do _list_items+=("task:${_lb_id}"); done
+  done
+
+  # ── Cron group ──────────────────────────────────────────────────────────────
+  _list_items+=("cron_group:__cron")
+
+  if [[ "${_list_group_collapsed[__cron]:-}" != "1" ]]; then
+    # Cron items: active (col 1), then needs_review (col 2), then scheduled (col 0)
+    local _lb_cron_col _lb_cron_ids
+    for _lb_cron_col in 1 2 0; do
+      _lb_cron_ids="${_cron_col_ids[__cron:${_lb_cron_col}]:-}"
+      [[ -z "$_lb_cron_ids" ]] && continue
+      local -a _lb_cron_arr=(${(s: :)_lb_cron_ids})
+      local _lb_cid
+      for _lb_cid in "${_lb_cron_arr[@]}"; do
+        _list_items+=("cron:${_lb_cid}")
+      done
+    done
+  fi
+
+  # ── Follow cursor to tracked item ──────────────────────────────────────────
+  if [[ -n "${_list_follow_id:-}" ]]; then
+    local _lb_fi _lb_target="task:${_list_follow_id}"
+    for (( _lb_fi=0; _lb_fi<${#_list_items[@]}; _lb_fi++ )); do
+      if [[ "${_list_items[$_lb_fi]}" == "$_lb_target" ]]; then
+        _list_cursor=$_lb_fi
+        break
+      fi
+    done
+    _list_follow_id=""
+  fi
+}
 # ── Dashboard render helpers ───────────────────────────────────────────────────
 # Pure render functions that append to _frame. They rely on zsh dynamic scoping
 # to access variables declared local in cmd__dash_loop (snapshot arrays, nav
@@ -3497,19 +3612,955 @@ _render_cron_row() {
 # Render the key-hints footer bar at the bottom of the screen
 _render_footer() {
   move_to "$((rows - 1))" 1
-  if [[ $cron_row_selected -eq 1 ]]; then
-    printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: new cron  D: delete  Esc: back  q: quit${C_RESET}"
+  if [[ "${_view_mode:-kanban}" == "list" ]]; then
+    if [[ ${_split_active:-0} -eq 1 ]]; then
+      printf "${C_DIM}  j/k: nav  Enter: switch  b: full list  </> status  t: rename  v: kanban  q: quit${C_RESET}"
+    else
+      printf "${C_DIM}  j/k: nav  Enter: open/expand  Tab: groups  </> status  D: done  b: split  v: kanban  c: new  q: quit${C_RESET}"
+    fi
+  elif [[ $cron_row_selected -eq 1 ]]; then
+    printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: new cron  D: delete  Esc: back  v: list  q: quit${C_RESET}"
   elif [[ "$filter_mode" == "all" ]]; then
     if [[ "$nav_mode" == "repo" ]]; then
-      printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  q: quit${C_RESET}"
+      printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  v: list  q: quit${C_RESET}"
     else
-      printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  c: new  S: import  t: rename  R: add repo  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  c: new  S: import  t: rename  R: add repo  v: list  q: quit${C_RESET}"
     fi
   else
-    printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  c: new  t: rename  s: shell  d: diff  q: quit${C_RESET}"
+    printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  c: new  t: rename  s: shell  d: diff  v: list  q: quit${C_RESET}"
   fi
 }
 
+# ── List mode render + key handler ────────────────────────────────────────────
+# Pure render functions that append to _frame. They rely on zsh dynamic scoping
+# to access variables declared local in cmd__dash_loop.
+
+# ── Height / offset helpers ──────────────────────────────────────────────────
+
+# Return the display height of item at index $1. Result in _lih (avoids subshell).
+_list_item_height() {
+  local item="${_list_items[$1]:-}"
+  case "$item" in
+    group:*|cron_group:*) _lih=1 ;;
+    task:*|cron:*)        _lih=2 ;;
+    *)                    _lih=1 ;;
+  esac
+}
+
+# Compute the content-line offset of item at index $1 by summing heights of all
+# preceding items. Result in _lcl (avoids subshell).
+_list_content_line_of() {
+  local _idx="$1"
+  _lcl=0
+  local _li
+  for (( _li=0; _li<_idx; _li++ )); do
+    _list_item_height "$_li"
+    _lcl=$((_lcl + _lih))
+  done
+}
+
+# ── Scroll management ───────────────────────────────────────────────────────
+
+# Ensure the cursor item is within the visible viewport. Adjusts _list_scroll_top.
+_list_adjust_scroll() {
+  local viewport_height=$((rows - 3))
+  [[ $viewport_height -lt 1 ]] && viewport_height=1
+
+  _list_content_line_of "$_list_cursor"
+  local cursor_line=$_lcl
+
+  _list_item_height "$_list_cursor"
+  local cursor_bottom=$((cursor_line + _lih - 1))
+
+  # Scroll down if cursor extends below viewport
+  if [[ $cursor_bottom -ge $((_list_scroll_top + viewport_height)) ]]; then
+    _list_scroll_top=$((cursor_bottom - viewport_height + 1))
+  fi
+
+  # Scroll up if cursor is above viewport
+  if [[ $cursor_line -lt $_list_scroll_top ]]; then
+    _list_scroll_top=$cursor_line
+  fi
+}
+
+# ── Group headers ────────────────────────────────────────────────────────────
+
+# Render a repo group header line. Appends to _frame.
+# $1 = repo_name, $2 = 1 if selected, 0 otherwise
+_render_list_group_header() {
+  local repo_name="$1"
+  local is_selected="$2"
+
+  local total="${_repo_task_count[$repo_name]:-0}"
+  local active_cnt="${_repo_col_cnt[${repo_name}:1]:-0}"
+  local review_cnt="${_repo_col_cnt[${repo_name}:2]:-0}"
+
+  local arrow="▼"
+  [[ "${_list_group_collapsed[$repo_name]:-}" == "1" ]] && arrow="▶"
+
+  local hdr_text="${arrow} ${repo_name} (${total} tasks: ${active_cnt} active, ${review_cnt} review)"
+
+  if [[ "$is_selected" == "1" ]]; then
+    _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}" "$hdr_text")
+  else
+    _frame+=$(printf "${C_BOLD}%-${cols}s${C_RESET}" "$hdr_text")
+  fi
+  _frame+=$'\n'
+}
+
+# Render the cron group header line. Appends to _frame.
+# $1 = 1 if selected, 0 otherwise
+_render_list_cron_header() {
+  local is_selected="$1"
+
+  local cron_total=0
+  local _ci
+  for _ci in {0..2}; do
+    cron_total=$((cron_total + ${_cron_col_cnt[__cron:${_ci}]:-0}))
+  done
+
+  local arrow="▼"
+  [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="▶"
+
+  local hdr_text="${arrow} cron jobs (${cron_total} items)"
+
+  if [[ "$is_selected" == "1" ]]; then
+    _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}" "$hdr_text")
+  else
+    _frame+=$(printf "${C_BOLD}%-${cols}s${C_RESET}" "$hdr_text")
+  fi
+  _frame+=$'\n'
+}
+
+# ── Task card (2 lines) ─────────────────────────────────────────────────────
+
+# Render a two-line task card. Appends to _frame.
+# $1 = task_id, $2 = available width, $3 = 1 if selected
+_render_list_task_card() {
+  local task_id="$1"
+  local width="$2"
+  local is_selected="$3"
+
+  local title="${_task_title[$task_id]:-}"
+  local tstatus="${_task_status[$task_id]:-}"
+  local claude="${_task_claude[$task_id]:-}"
+  local pr="${_task_pr[$task_id]:-}"
+
+  # Status badge
+  local badge="" badge_color=""
+  case "$tstatus" in
+    active)       badge="● Active";       badge_color="$C_GREEN" ;;
+    needs_review) badge="◆ Review";       badge_color="$C_YELLOW" ;;
+    pending)      badge="○ Pending";      badge_color="$C_DIM" ;;
+    paused)       badge="◫ Paused";       badge_color="$C_CYAN" ;;
+    done)         badge="✓ Done";         badge_color="$C_DIM" ;;
+  esac
+
+  # Claude status indicator
+  local claude_str=""
+  [[ "$claude" == "working" ]] && claude_str="  ⚙ working"
+  [[ "$claude" == "waiting" ]] && claude_str="  ○ waiting"
+
+  # PR short
+  local pr_short=""
+  if [[ -n "$pr" ]]; then
+    pr_short=$(echo "$pr" | command grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
+    pr_short="  ${pr_short}"
+  fi
+
+  local prefix=" "
+  local sel_on="" sel_off=""
+  if [[ "$is_selected" == "1" ]]; then
+    prefix=">"
+    sel_on="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+    sel_off="${C_RESET}"
+  fi
+
+  if [[ $width -gt 35 ]]; then
+    # ── Wide format ──
+    # Line 1:  > t-003  Fix authentication bug
+    local id_field
+    id_field=$(printf '%-6s' "$task_id")
+    local title_max=$((width - 10))
+    [[ $title_max -lt 1 ]] && title_max=1
+    local title_str
+    title_str=$(trunc "$title" "$title_max")
+
+    if [[ "$is_selected" == "1" ]]; then
+      _frame+=$(printf "${sel_on}%s %-6s  %-$((width - 10))s${sel_off}" "$prefix" "$task_id" "$title_str")
+    else
+      _frame+=$(printf "%s ${C_DIM}%-6s${C_RESET}  %-$((width - 10))s" "$prefix" "$task_id" "$title_str")
+    fi
+    _frame+=$'\n'
+
+    # Line 2:           ● Active  ⚙ working  #42
+    local detail="${badge}${claude_str}${pr_short}"
+    local detail_max=$((width - 10))
+    [[ $detail_max -lt 1 ]] && detail_max=1
+    detail=$(trunc "$detail" "$detail_max")
+
+    if [[ "$is_selected" == "1" ]]; then
+      _frame+=$(printf "${sel_on}%-${width}s${sel_off}" "         ${detail}")
+    else
+      _frame+=$(printf "         ${badge_color}%s${C_RESET}%-$((width - 9 - ${#detail}))s" "$detail" "")
+    fi
+    _frame+=$'\n'
+  else
+    # ── Narrow format ──
+    # Line 1: > t-003 Fix auth..  ● Active
+    local badge_short
+    case "$tstatus" in
+      active)       badge_short="●" ;;
+      needs_review) badge_short="◆" ;;
+      pending)      badge_short="○" ;;
+      paused)       badge_short="◫" ;;
+      done)         badge_short="✓" ;;
+    esac
+    local title_max=$((width - ${#task_id} - 6))
+    [[ $title_max -lt 4 ]] && title_max=4
+    local title_str
+    title_str=$(trunc "$title" "$title_max")
+
+    if [[ "$is_selected" == "1" ]]; then
+      _frame+=$(printf "${sel_on}%s %-5s %-$((width - 9))s ${badge_short}${sel_off}" "$prefix" "$task_id" "$title_str")
+    else
+      _frame+=$(printf "%s ${C_DIM}%-5s${C_RESET} %-$((width - 9))s ${badge_color}${badge_short}${C_RESET}" "$prefix" "$task_id" "$title_str")
+    fi
+    _frame+=$'\n'
+
+    # Line 2: additional info or blank
+    local info_str="${claude_str:+${claude_str:2}}${pr_short}"
+    local info_max=$((width - 8))
+    [[ $info_max -lt 1 ]] && info_max=1
+    info_str=$(trunc "$info_str" "$info_max")
+    if [[ "$is_selected" == "1" ]]; then
+      _frame+=$(printf "${sel_on}%-${width}s${sel_off}" "       ${info_str}")
+    else
+      _frame+=$(printf "       ${C_DIM}%-$((width - 7))s${C_RESET}" "$info_str")
+    fi
+    _frame+=$'\n'
+  fi
+}
+
+# ── Cron card (2 lines) ─────────────────────────────────────────────────────
+
+# Render a two-line cron card. Appends to _frame.
+# $1 = cron_id, $2 = available width, $3 = 1 if selected
+_render_list_cron_card() {
+  local cron_id="$1"
+  local width="$2"
+  local is_selected="$3"
+
+  local prefix=" "
+  local sel_on="" sel_off=""
+  if [[ "$is_selected" == "1" ]]; then
+    prefix=">"
+    sel_on="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+    sel_off="${C_RESET}"
+  fi
+
+  # Determine if this is a job (col 0) or a run (col 1/2)
+  local rdata="${_cron_run_data[$cron_id]:-}"
+
+  if [[ -z "$rdata" ]]; then
+    # Scheduled cron job
+    local jname="${_cron_jobs[$cron_id]:-$cron_id}"
+    local jsched="${_cron_job_schedule[$cron_id]:-}"
+    local jenabled="${_cron_job_enabled[$cron_id]:-true}"
+
+    local status_str="scheduled"
+    local status_color="$C_DIM"
+    if [[ "$jenabled" != "true" ]]; then
+      status_str="disabled"
+      status_color="$C_RED"
+    fi
+
+    # Line 1: cron ID + job name
+    local id_max=$((width - 3))
+    local id_name="${cron_id}  ${jname}"
+    id_name=$(trunc "$id_name" "$id_max")
+    if [[ "$is_selected" == "1" ]]; then
+      _frame+=$(printf "${sel_on}%s %-$((width - 2))s${sel_off}" "$prefix" "$id_name")
+    else
+      _frame+=$(printf "%s ${C_DIM}%-$((width - 2))s${C_RESET}" "$prefix" "$id_name")
+    fi
+    _frame+=$'\n'
+
+    # Line 2: schedule / status
+    local detail="${status_str}"
+    [[ -n "$jsched" ]] && detail="${jsched}"
+    local detail_max=$((width - 9))
+    [[ $detail_max -lt 1 ]] && detail_max=1
+    detail=$(trunc "$detail" "$detail_max")
+    if [[ "$is_selected" == "1" ]]; then
+      _frame+=$(printf "${sel_on}%-${width}s${sel_off}" "       ${detail}")
+    else
+      _frame+=$(printf "       ${status_color}%-$((width - 7))s${C_RESET}" "$detail")
+    fi
+    _frame+=$'\n'
+  else
+    # Cron run (active or needs_review)
+    local rjob_id rstat recode rstart rsid rwin
+    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+    local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
+
+    local status_str="" status_color=""
+    case "$rstat" in
+      active)       status_str="● running";       status_color="$C_GREEN" ;;
+      needs_review) status_str="◆ needs review";  status_color="$C_YELLOW" ;;
+      reviewed)     status_str="✓ reviewed";       status_color="$C_CYAN" ;;
+      *)            status_str="$rstat";           status_color="$C_DIM" ;;
+    esac
+
+    # Line 1: run ID + job name
+    local id_max=$((width - 3))
+    local id_name="${cron_id}  ${rjname}"
+    id_name=$(trunc "$id_name" "$id_max")
+    if [[ "$is_selected" == "1" ]]; then
+      _frame+=$(printf "${sel_on}%s %-$((width - 2))s${sel_off}" "$prefix" "$id_name")
+    else
+      _frame+=$(printf "%s ${C_DIM}%-$((width - 2))s${C_RESET}" "$prefix" "$id_name")
+    fi
+    _frame+=$'\n'
+
+    # Line 2: status + exit code
+    local exit_info=""
+    [[ -n "$recode" && "$recode" != "null" && "$rstat" != "active" ]] && exit_info="  exit ${recode}"
+    local detail="${status_str}${exit_info}"
+    local detail_max=$((width - 9))
+    [[ $detail_max -lt 1 ]] && detail_max=1
+    detail=$(trunc "$detail" "$detail_max")
+    if [[ "$is_selected" == "1" ]]; then
+      _frame+=$(printf "${sel_on}%-${width}s${sel_off}" "       ${detail}")
+    else
+      _frame+=$(printf "       ${status_color}%-$((width - 7))s${C_RESET}" "$detail")
+    fi
+    _frame+=$'\n'
+  fi
+}
+
+# ── Scrollbar ────────────────────────────────────────────────────────────────
+
+# Render a scrollbar on the right edge of the screen.
+# $1 = viewport_height, $2 = total_content_lines
+_render_scrollbar_track() {
+  local viewport_height="$1"
+  local total_content_lines="$2"
+
+  [[ $total_content_lines -le $viewport_height ]] && return 0
+
+  # Thumb size: at least 1 char
+  local thumb_size=$((viewport_height * viewport_height / total_content_lines))
+  [[ $thumb_size -lt 1 ]] && thumb_size=1
+
+  # Thumb position
+  local scrollable=$((total_content_lines - viewport_height))
+  [[ $scrollable -lt 1 ]] && scrollable=1
+  local track_range=$((viewport_height - thumb_size))
+  local thumb_pos=$(((_list_scroll_top * track_range + scrollable / 2) / scrollable))
+  [[ $thumb_pos -lt 0 ]] && thumb_pos=0
+  [[ $thumb_pos -gt $track_range ]] && thumb_pos=$track_range
+
+  local _ri
+  for (( _ri=0; _ri<viewport_height; _ri++ )); do
+    move_to "$((_ri + 2))" "$cols"
+    if [[ $_ri -ge $thumb_pos && $_ri -lt $((thumb_pos + thumb_size)) ]]; then
+      printf "${C_BOLD}█${C_RESET}"
+    else
+      printf "${C_DIM}│${C_RESET}"
+    fi
+  done
+}
+
+# ── Full-screen list renderer ────────────────────────────────────────────────
+
+# Render the full-screen list view (no split pane).
+_render_list_full() {
+  local viewport_height=$((rows - 3))
+  [[ $viewport_height -lt 1 ]] && viewport_height=1
+
+  _list_adjust_scroll
+
+  # Compute total content lines
+  local total_content_lines=0
+  local _rf_i
+  for (( _rf_i=0; _rf_i<${#_list_items[@]}; _rf_i++ )); do
+    _list_item_height "$_rf_i"
+    total_content_lines=$(( total_content_lines + _lih ))
+  done
+
+  # Iterate items, tracking content line offset
+  local content_line=0
+  local _rf_idx
+  for (( _rf_idx=0; _rf_idx<${#_list_items[@]}; _rf_idx++ )); do
+    _list_item_height "$_rf_idx"
+    local item_h=$_lih
+
+    # Skip items entirely above the viewport
+    if [[ $((content_line + item_h)) -le $_list_scroll_top ]]; then
+      content_line=$((content_line + item_h))
+      continue
+    fi
+
+    # Stop if we're past the viewport bottom
+    [[ $content_line -ge $((_list_scroll_top + viewport_height)) ]] && break
+
+    local is_sel=0
+    [[ $_rf_idx -eq $_list_cursor ]] && is_sel=1
+
+    local item="${_list_items[$_rf_idx]}"
+    case "$item" in
+      group:*)
+        _render_list_group_header "${item#group:}" "$is_sel"
+        ;;
+      task:*)
+        _render_list_task_card "${item#task:}" "$cols" "$is_sel"
+        ;;
+      cron_group:*)
+        _render_list_cron_header "$is_sel"
+        ;;
+      cron:*)
+        _render_list_cron_card "${item#cron:}" "$cols" "$is_sel"
+        ;;
+    esac
+
+    content_line=$((content_line + item_h))
+  done
+
+  # Pad remaining viewport lines with empty lines
+  local rendered_lines=$((content_line - _list_scroll_top))
+  [[ $rendered_lines -gt $viewport_height ]] && rendered_lines=$viewport_height
+  local _pad_i
+  for (( _pad_i=rendered_lines; _pad_i<viewport_height; _pad_i++ )); do
+    _frame+=$(printf "%-${cols}s" "")
+    _frame+=$'\n'
+  done
+
+  # Scrollbar (rendered after frame output, using move_to for positioning)
+  if [[ $total_content_lines -gt $viewport_height ]]; then
+    _list_scrollbar_vh=$viewport_height
+    _list_scrollbar_total=$total_content_lines
+  else
+    _list_scrollbar_vh=0
+    _list_scrollbar_total=0
+  fi
+}
+
+# ── Sidebar list renderer (split-pane mode) ──────────────────────────────────
+
+# Render the list as a narrow sidebar. Same logic as _render_list_full but
+# uses the narrower pane width and omits the scrollbar.
+_render_list_sidebar() {
+  local sidebar_w="${1:-$cols}"
+  local viewport_height=$((rows - 3))
+  [[ $viewport_height -lt 1 ]] && viewport_height=1
+
+  _list_adjust_scroll
+
+  local content_line=0
+  local _rs_idx
+  for (( _rs_idx=0; _rs_idx<${#_list_items[@]}; _rs_idx++ )); do
+    _list_item_height "$_rs_idx"
+    local item_h=$_lih
+
+    if [[ $((content_line + item_h)) -le $_list_scroll_top ]]; then
+      content_line=$((content_line + item_h))
+      continue
+    fi
+
+    [[ $content_line -ge $((_list_scroll_top + viewport_height)) ]] && break
+
+    local is_sel=0
+    [[ $_rs_idx -eq $_list_cursor ]] && is_sel=1
+
+    local item="${_list_items[$_rs_idx]}"
+    case "$item" in
+      group:*)
+        # Slim group header for sidebar
+        local rn="${item#group:}"
+        local arrow="▼"
+        [[ "${_list_group_collapsed[$rn]:-}" == "1" ]] && arrow="▶"
+        local total="${_repo_task_count[$rn]:-0}"
+        local hdr="${arrow} ${rn} (${total})"
+        hdr=$(trunc "$hdr" "$sidebar_w")
+        if [[ $is_sel -eq 1 ]]; then
+          _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${sidebar_w}s${C_RESET}" "$hdr")
+        else
+          _frame+=$(printf "${C_BOLD}%-${sidebar_w}s${C_RESET}" "$hdr")
+        fi
+        _frame+=$'\n'
+        ;;
+      task:*)
+        _render_list_task_card "${item#task:}" "$sidebar_w" "$is_sel"
+        ;;
+      cron_group:*)
+        _render_list_cron_header "$is_sel"
+        ;;
+      cron:*)
+        _render_list_cron_card "${item#cron:}" "$sidebar_w" "$is_sel"
+        ;;
+    esac
+
+    content_line=$((content_line + item_h))
+  done
+
+  # Pad remaining lines
+  local rendered_lines=$((content_line - _list_scroll_top))
+  [[ $rendered_lines -gt $viewport_height ]] && rendered_lines=$viewport_height
+  local _pad_i
+  for (( _pad_i=rendered_lines; _pad_i<viewport_height; _pad_i++ )); do
+    _frame+=$(printf "%-${sidebar_w}s" "")
+    _frame+=$'\n'
+  done
+}
+
+# ── Selection helpers ────────────────────────────────────────────────────────
+
+# Get task ID of the currently selected item. Sets _tid, returns 1 if not a task.
+_list_get_selected_id() {
+  local item="${_list_items[$_list_cursor]:-}"
+  case "$item" in
+    task:*) _tid="${item#task:}" ;;
+    *)      _tid=""; return 1 ;;
+  esac
+}
+
+# Get cron ID of the currently selected item. Sets _tid, returns 1 if not cron.
+_list_get_selected_cron_id() {
+  local item="${_list_items[$_list_cursor]:-}"
+  case "$item" in
+    cron:*) _tid="${item#cron:}" ;;
+    *)      _tid=""; return 1 ;;
+  esac
+}
+
+# ── Key handler ──────────────────────────────────────────────────────────────
+
+# Handle list-mode specific keys. Returns 1 if key was not handled (fall through
+# to shared key handlers in cmd__dash_loop).
+_list_handle_key() {
+  local key="$1"
+  local max_idx=$((${#_list_items[@]} - 1))
+  [[ $max_idx -lt 0 ]] && max_idx=0
+
+  case "$key" in
+    j) # Cursor down
+      if [[ $_list_cursor -lt $max_idx ]]; then
+        _list_cursor=$((_list_cursor + 1))
+      fi
+      ;;
+
+    k) # Cursor up
+      if [[ $_list_cursor -gt 0 ]]; then
+        _list_cursor=$((_list_cursor - 1))
+      fi
+      ;;
+
+    ENTER|$'\n'|$'\r') # Enter
+      local item="${_list_items[$_list_cursor]:-}"
+      case "$item" in
+        group:*)
+          local gname="${item#group:}"
+          if [[ "${_list_group_collapsed[$gname]:-}" == "1" ]]; then
+            unset "_list_group_collapsed[$gname]"
+          else
+            _list_group_collapsed[$gname]=1
+          fi
+          _list_needs_rebuild=1
+          ;;
+        cron_group:*)
+          if [[ "${_list_group_collapsed[__cron]:-}" == "1" ]]; then
+            unset "_list_group_collapsed[__cron]"
+          else
+            _list_group_collapsed[__cron]=1
+          fi
+          _list_needs_rebuild=1
+          ;;
+        task:*)
+          local sel_id="${item#task:}"
+          if [[ "${_split_active:-0}" == "1" ]]; then
+            _split_switch_session "$sel_id"
+          else
+            # Delegate to kanban-style Enter handling (start/resume/attach)
+            local cur_status="${_task_status[$sel_id]}"
+            local sel_repo="${_task_repo[$sel_id]}"
+            local sel_rpath
+            sel_rpath=$(repo_path "$sel_repo")
+
+            if [[ -n "${_repo_stale[$sel_repo]:-}" ]]; then
+              cursor_show; stty echo
+              echo ""
+              echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${sel_repo} <new-path>${C_RESET}"
+              sleep 2
+              stty -echo; cursor_hide
+            else
+              case "$cur_status" in
+                pending)
+                  cursor_show; stty echo
+                  local task_title="${_task_title[$sel_id]}"
+                  echo ""
+                  echo "${C_CYAN}Starting task '${sel_id}': ${task_title}${C_RESET}"
+                  printf "${C_CYAN}Prompt for Claude (or Enter to skip): ${C_RESET}"
+                  local task_prompt=""
+                  read -r task_prompt
+                  local dash_wt_mode="${_task_wtmode[$sel_id]}"
+                  local rtype="${_repo_types[$sel_repo]:-git}"
+                  if [[ "$rtype" == "dir" ]]; then
+                    dash_wt_mode="none"
+                  elif [[ "$dash_wt_mode" != "none" ]]; then
+                    printf "${C_CYAN}Use worktree? [Y/n]: ${C_RESET}"
+                    local wt_choice=""
+                    read -r wt_choice
+                    if [[ "$wt_choice" =~ ^[nN]$ ]]; then
+                      dash_wt_mode="none"
+                      update_task_field "$sel_id" "worktree_mode" "none"
+                      update_task_field_raw "$sel_id" "branch" "null"
+                    fi
+                  fi
+                  stty -echo; cursor_hide
+                  local dash_session_uid
+                  dash_session_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+                  local dash_claude_cmd
+                  if [[ "$dash_wt_mode" == "none" ]]; then
+                    dash_claude_cmd="claude --session-id ${dash_session_uid} --dangerously-skip-permissions"
+                  else
+                    dash_claude_cmd="claude --worktree ${sel_id} --session-id ${dash_session_uid} --dangerously-skip-permissions"
+                  fi
+                  if [[ -n "$task_prompt" ]]; then
+                    local escaped="${task_prompt//\'/\'\\\'\'}"
+                    dash_claude_cmd="${dash_claude_cmd} '${escaped}'"
+                  fi
+                  _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
+                  update_task_field "$sel_id" "status" "active"
+                  update_task_field "$sel_id" "started_at" "$(now_iso)"
+                  update_task_field "$sel_id" "session_uid" "$dash_session_uid"
+                  tmux_select_window "$sel_id"
+                  ;;
+                paused)
+                  if tmux_window_exists "$sel_id" && ! _tmux_claude_alive "$sel_id"; then
+                    tmux_kill_window "$sel_id"
+                  fi
+                  if ! tmux_window_exists "$sel_id"; then
+                    local wt_mode_paused="${_task_wtmode[$sel_id]}"
+                    local resume_cmd
+                    resume_cmd=$(_build_claude_resume_cmd "$sel_id")
+                    if [[ "$wt_mode_paused" == "none" ]]; then
+                      _tmux_launch_claude "$sel_id" "$sel_rpath" "$resume_cmd"
+                    else
+                      local wt_p
+                      wt_p=$(find_worktree_path "$sel_id" "$sel_rpath")
+                      [[ -n "$wt_p" ]] && _tmux_launch_claude "$sel_id" "$wt_p" "$resume_cmd"
+                    fi
+                  fi
+                  update_task_field "$sel_id" "status" "active"
+                  tmux_select_window "$sel_id"
+                  ;;
+                active|needs_review)
+                  if tmux_window_exists "$sel_id" && ! _tmux_claude_alive "$sel_id"; then
+                    tmux_kill_window "$sel_id"
+                  fi
+                  if ! tmux_window_exists "$sel_id"; then
+                    local wt_mode_act="${_task_wtmode[$sel_id]}"
+                    local resume_cmd
+                    resume_cmd=$(_build_claude_resume_cmd "$sel_id")
+                    if [[ "$wt_mode_act" == "none" ]]; then
+                      _tmux_launch_claude "$sel_id" "$sel_rpath" "$resume_cmd"
+                    else
+                      local wt_a
+                      wt_a=$(find_worktree_path "$sel_id" "$sel_rpath")
+                      [[ -n "$wt_a" ]] && _tmux_launch_claude "$sel_id" "$wt_a" "$resume_cmd"
+                    fi
+                  fi
+                  cursor_show
+                  tmux_select_window "$sel_id"
+                  cursor_hide
+                  ;;
+                done)
+                  cursor_show; stty echo
+                  local task_title_done="${_task_title[$sel_id]}"
+                  echo ""
+                  echo "${C_CYAN}Reopening '${sel_id}': ${task_title_done}${C_RESET}"
+                  printf "${C_CYAN}Prompt for Claude (or Enter to continue previous session): ${C_RESET}"
+                  local reopen_prompt=""
+                  read -r reopen_prompt
+                  stty -echo; cursor_hide
+                  local dash_claude_cmd
+                  if [[ -n "$reopen_prompt" ]]; then
+                    local escaped="${reopen_prompt//\'/\'\\\'\'}"
+                    dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
+                  else
+                    dash_claude_cmd=$(_build_claude_resume_cmd "$sel_id")
+                  fi
+                  _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
+                  update_task_field "$sel_id" "status" "active"
+                  update_task_field "$sel_id" "worktree_mode" "none"
+                  update_task_field_raw "$sel_id" "branch" "null"
+                  update_task_field_raw "$sel_id" "completed_at" "null"
+                  cursor_show
+                  tmux_select_window "$sel_id"
+                  cursor_hide
+                  ;;
+              esac
+            fi
+          fi
+          ;;
+        cron:*)
+          # Cron Enter: attach to active run window, or show details
+          local cid="${item#cron:}"
+          local rdata="${_cron_run_data[$cid]:-}"
+          if [[ -n "$rdata" ]]; then
+            local rjob_id rstat recode rstart rsid rwin
+            IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+            if [[ "$rstat" == "active" && -n "$rwin" ]] && tmux_window_exists "$rwin"; then
+              cursor_show
+              tmux_select_window "$rwin"
+              cursor_hide
+            elif [[ -n "$rsid" ]]; then
+              local resume_win="resume-${cid}"
+              local cjob_wdir
+              cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
+              local safe_wdir=${(q)cjob_wdir}
+              ensure_tmux_session
+              tmux_create_window "$resume_win" "zsh" "-c" \
+                "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+              cursor_show
+              tmux_select_window "$resume_win"
+              cursor_hide
+            fi
+          else
+            # Scheduled job: show details
+            cursor_show; stty echo
+            echo ""
+            local jname="${_cron_jobs[$cid]:-}"
+            local jsched="${_cron_job_schedule[$cid]:-}"
+            local jenabled="${_cron_job_enabled[$cid]:-}"
+            echo "${C_BOLD}Cron Job: ${cid}${C_RESET}"
+            echo "  name: ${jname}"
+            echo "  schedule: ${jsched}"
+            echo "  enabled: ${jenabled}"
+            echo ""
+            echo "${C_DIM}Press any key to return...${C_RESET}"
+            read -rsk1 2>/dev/null || true
+            stty -echo; cursor_hide
+          fi
+          ;;
+      esac
+      ;;
+
+    $'\t') # Tab: jump cursor to next group/cron_group header
+      local _ti
+      for (( _ti=_list_cursor + 1; _ti <= max_idx; _ti++ )); do
+        case "${_list_items[$_ti]:-}" in
+          group:*|cron_group:*)
+            _list_cursor=$_ti
+            break
+            ;;
+        esac
+      done
+      ;;
+
+    SHIFT_TAB) # Shift-Tab: jump cursor to previous group/cron_group header
+      local _ti
+      for (( _ti=_list_cursor - 1; _ti >= 0; _ti-- )); do
+        case "${_list_items[$_ti]:-}" in
+          group:*|cron_group:*)
+            _list_cursor=$_ti
+            break
+            ;;
+        esac
+      done
+      ;;
+
+    D) # Toggle show done tasks
+      if [[ "$_show_done" == "1" ]]; then
+        _show_done=0
+      else
+        _show_done=1
+      fi
+      _list_needs_rebuild=1
+      ;;
+
+    b) # Toggle split view
+      if [[ "${_split_active:-0}" == "1" ]]; then
+        _split_close
+      elif _list_get_selected_id; then
+        _split_open "$_tid"
+      fi
+      ;;
+
+    ESC) # Escape
+      if [[ "${_split_active:-0}" == "1" ]]; then
+        _split_close
+      else
+        # Collapse current group if cursor is on a task within it
+        local item="${_list_items[$_list_cursor]:-}"
+        case "$item" in
+          task:*)
+            # Walk backward to find the parent group header
+            local _ei
+            for (( _ei=_list_cursor - 1; _ei >= 0; _ei-- )); do
+              case "${_list_items[$_ei]:-}" in
+                group:*)
+                  local gname="${_list_items[$_ei]#group:}"
+                  _list_group_collapsed[$gname]=1
+                  _list_cursor=$_ei
+                  _list_needs_rebuild=1
+                  break
+                  ;;
+              esac
+            done
+            ;;
+          cron:*)
+            _list_group_collapsed[__cron]=1
+            # Jump to the cron_group header
+            local _ei
+            for (( _ei=_list_cursor - 1; _ei >= 0; _ei-- )); do
+              [[ "${_list_items[$_ei]:-}" == "cron_group:__cron" ]] && { _list_cursor=$_ei; break; }
+            done
+            _list_needs_rebuild=1
+            ;;
+        esac
+      fi
+      ;;
+
+    *) return 1 ;; # Key not handled; fall through to shared handlers
+  esac
+
+  return 0
+}
+# ── Split-pane lifecycle (list mode sidebar + Claude session) ─────────────────
+
+# Helper: build the Claude launch command and work directory for a task.
+# Sets dynamic-scoped variables _sbc_cmd and _sbc_dir for the caller.
+_split_build_cmd() {
+  local task_id="$1"
+  local tst="${_task_status[$task_id]}"
+  local repo_name="${_task_repo[$task_id]}"
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  local wt_mode="${_task_wtmode[$task_id]}"
+
+  # Default work directory to repo root
+  _sbc_dir="$rpath"
+
+  # Try worktree path if applicable
+  if [[ "$wt_mode" != "none" ]]; then
+    local wt_path
+    wt_path=$(find_worktree_path "$task_id" "$rpath")
+    [[ -n "$wt_path" ]] && _sbc_dir="$wt_path"
+  fi
+
+  if [[ "$tst" == "pending" ]]; then
+    # New session: generate UUID, update state
+    local session_uid
+    session_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$wt_mode" == "none" ]]; then
+      _sbc_cmd="claude --session-id ${session_uid} --dangerously-skip-permissions"
+    else
+      _sbc_cmd="claude --worktree ${task_id} --session-id ${session_uid} --dangerously-skip-permissions"
+    fi
+
+    update_task_field "$task_id" "status" "active"
+    update_task_field "$task_id" "started_at" "$(now_iso)"
+    update_task_field "$task_id" "session_uid" "$session_uid"
+  else
+    # Resume existing session (active, paused, needs_review, done)
+    _sbc_cmd=$(_build_claude_resume_cmd "$task_id")
+  fi
+}
+
+# Open a split pane with the task's Claude session on the right side.
+_split_open() {
+  local task_id="$1"
+  local repo_name="${_task_repo[$task_id]}"
+
+  # Bail if repo is stale (directory missing)
+  if [[ "${_repo_stale[$repo_name]}" == "1" ]]; then
+    return 1
+  fi
+
+  _split_active=1
+  _split_task_id="$task_id"
+
+  if tmux_window_exists "$task_id"; then
+    if _tmux_claude_alive "$task_id"; then
+      # Existing live session: join it into the dashboard as right pane
+      tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -p 60 2>/dev/null || true
+      tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+      return 0
+    else
+      # Dead window (Claude exited, bare zsh): clean up first
+      tmux_kill_window "$task_id"
+    fi
+  fi
+
+  # Build command and work directory
+  local _sbc_cmd="" _sbc_dir=""
+  _split_build_cmd "$task_id"
+
+  local safe_global_dir=${(q)GLOBAL_DIR}
+  local safe_work_dir=${(q)_sbc_dir}
+
+  tmux_cmd split-window -h -t "board:dashboard" -p 60 \
+    "export CLOARD_TASK_ID=${task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+
+  tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+}
+
+# Switch the right pane to a different task's session.
+_split_switch_session() {
+  local new_task_id="$1"
+
+  # Preserve the current session by breaking it out to its own window
+  if [[ -n "$_split_task_id" ]]; then
+    tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null || true
+  fi
+
+  _split_task_id="$new_task_id"
+  local repo_name="${_task_repo[$new_task_id]}"
+
+  # Bail if repo is stale
+  if [[ "${_repo_stale[$repo_name]}" == "1" ]]; then
+    _split_active=0
+    _split_task_id=""
+    return 1
+  fi
+
+  if tmux_window_exists "$new_task_id"; then
+    if _tmux_claude_alive "$new_task_id"; then
+      tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -p 60 2>/dev/null || true
+      tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+      return 0
+    else
+      tmux_kill_window "$new_task_id"
+    fi
+  fi
+
+  # Build command and work directory for the new task
+  local _sbc_cmd="" _sbc_dir=""
+  _split_build_cmd "$new_task_id"
+
+  local safe_global_dir=${(q)GLOBAL_DIR}
+  local safe_work_dir=${(q)_sbc_dir}
+
+  tmux_cmd split-window -h -t "board:dashboard" -p 60 \
+    "export CLOARD_TASK_ID=${new_task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+
+  tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+}
+
+# Close the split view, preserving the running session in its own tmux window.
+_split_close() {
+  if [[ -n "$_split_task_id" ]]; then
+    # Try to preserve as named window; fall back to killing the pane
+    tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null \
+      || tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null \
+      || true
+  fi
+  _split_active=0
+  _split_task_id=""
+}
 cmd_dash() {
   ensure_tmux_session
 
@@ -3578,6 +4629,19 @@ cmd__dash_loop() {
   # Per-repo collapsed state for accordion (1=collapsed, unset=expanded)
   typeset -A _repo_collapsed
 
+  # ── List mode state ──
+  local _view_mode="kanban"       # "kanban" or "list"
+  local -i _split_active=0        # 1 when sidebar+session split is open
+  local -i _show_done=0           # 1 when done tasks visible in list mode
+  local -i _list_cursor=0         # index into _list_items[]
+  local -i _list_scroll_top=0     # first visible content-line in viewport
+  local -a _list_items=()         # flat ordered array: "group:repo", "task:t-001", etc.
+  local _split_task_id=""          # task ID in right pane
+  local _list_follow_id=""         # task ID to follow after re-sort
+  typeset -A _list_group_collapsed # group_name -> 1 if collapsed
+  local -i _list_scrollbar_vh=0    # set by _render_list_full for deferred scrollbar
+  local -i _list_scrollbar_total=0
+
   # Declare snapshot arrays (persist across loop, modified by _snapshot_tasks via dynamic scope)
   typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo
   typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
@@ -3618,6 +4682,18 @@ cmd__dash_loop() {
 
     # Snapshot all data
     _snapshot_tasks
+
+    # Build list items (needed for list mode; cheap no-op data if in kanban)
+    if [[ "$_view_mode" == "list" ]]; then
+      _list_build_items
+      # Clamp list cursor
+      if [[ ${#_list_items[@]} -gt 0 ]]; then
+        [[ $_list_cursor -ge ${#_list_items[@]} ]] && _list_cursor=$((${#_list_items[@]} - 1))
+        [[ $_list_cursor -lt 0 ]] && _list_cursor=0
+      else
+        _list_cursor=0
+      fi
+    fi
 
     # Pre-compute border strings
     local _border_card="" _border_full="" _i
@@ -3668,6 +4744,13 @@ cmd__dash_loop() {
       # No repos registered
       _frame+=$'\n'
       _frame+="  ${C_DIM}No repos registered. Run: cloard-board repo add <path>${C_RESET}"$'\n'
+    elif [[ "$_view_mode" == "list" ]]; then
+      # ── List mode rendering ──
+      if [[ $_split_active -eq 1 ]]; then
+        _render_list_sidebar
+      else
+        _render_list_full
+      fi
     elif [[ "$filter_mode" == "all" ]]; then
       # ── All-repos view (compact cards with accordion) ──
       local total_repos=${#_repo_names[@]}
@@ -4056,8 +5139,8 @@ cmd__dash_loop() {
       fi
     fi
 
-    # ── Cron row (always visible when cron data exists) ──
-    if $_has_cron_data; then
+    # ── Cron row (kanban mode only; list mode handles cron in _list_items) ──
+    if [[ "$_view_mode" == "kanban" ]] && $_has_cron_data; then
       _render_cron_row
     fi
 
@@ -4072,6 +5155,13 @@ cmd__dash_loop() {
 
     # Output frame
     printf '\033[H%s\033[J' "$_frame"
+
+    # Deferred scrollbar (list mode, rendered after frame to use move_to positioning)
+    if [[ "$_view_mode" == "list" && $_list_scrollbar_vh -gt 0 ]]; then
+      _render_scrollbar_track "$_list_scrollbar_vh" "$_list_scrollbar_total"
+      _list_scrollbar_vh=0
+      _list_scrollbar_total=0
+    fi
 
     # Footer
     _render_footer
@@ -4479,7 +5569,7 @@ cmd__dash_loop() {
         fi
         ;;
       '>'|'.') # Move task right
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local mv_status="${_task_status[$sel_id]}"
           local -a status_order=("pending" "paused" "active" "needs_review" "done")
@@ -4494,11 +5584,12 @@ cmd__dash_loop() {
             else
               update_task_field "$sel_id" "status" "$next_status"
             fi
+            [[ "$_view_mode" == "list" ]] && _list_follow_id="$sel_id"
           fi
         fi
         ;;
       '<'|',') # Move task left
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local mv_status="${_task_status[$sel_id]}"
           local -a status_order=("pending" "paused" "active" "needs_review" "done")
@@ -4509,6 +5600,7 @@ cmd__dash_loop() {
           if [[ $mv_idx -gt 0 ]]; then
             local prev_status="${status_order[$((mv_idx - 1))]}"
             update_task_field "$sel_id" "status" "$prev_status"
+            [[ "$_view_mode" == "list" ]] && _list_follow_id="$sel_id"
           fi
         fi
         ;;
@@ -4697,7 +5789,7 @@ cmd__dash_loop() {
               update_cron_run_field "$cron_item" "status" "archived"
               ;;
           esac
-        elif _get_selected_id; then
+        elif _get_active_task_id; then
           local sel_id="$_tid"
           local sel_status="${_task_status[$sel_id]}"
           if [[ "$sel_status" == "done" ]]; then
@@ -4708,7 +5800,7 @@ cmd__dash_loop() {
         fi
         ;;
       d) # Show diff
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local sel_repo="${_task_repo[$sel_id]}"
           local sel_rpath
@@ -4729,7 +5821,7 @@ cmd__dash_loop() {
         fi
         ;;
       s) # Shell popup
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           if tmux_window_exists "$sel_id"; then
             cursor_show
@@ -4830,7 +5922,7 @@ cmd__dash_loop() {
         cursor_hide
         ;;
       t) # Rename focused task
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local cur_title="${_task_title[$sel_id]}"
           cursor_show
@@ -4846,7 +5938,7 @@ cmd__dash_loop() {
         fi
         ;;
       p) # Pause active task
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local p_status="${_task_status[$sel_id]}"
           if [[ "$p_status" == "active" || "$p_status" == "needs_review" ]]; then
@@ -4857,7 +5949,7 @@ cmd__dash_loop() {
         fi
         ;;
       r) # Reopen done task
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local r_status="${_task_status[$sel_id]}"
           if [[ "$r_status" == "done" ]]; then
@@ -4914,13 +6006,143 @@ cmd__dash_loop() {
           cursor_hide
         fi
         ;;
+      v) # Toggle kanban/list view
+        if [[ "$_view_mode" == "kanban" ]]; then
+          _list_transfer_from_kanban
+          _view_mode="list"
+        else
+          _list_transfer_to_kanban
+          _view_mode="kanban"
+        fi
+        ;;
       q) # Quit / detach
+        if [[ $_split_active -eq 1 ]]; then
+          _split_close
+        fi
         cursor_show
         tmux_cmd detach-client 2>/dev/null || exit 0
         exit 0
         ;;
     esac
+
+    # ── List mode key dispatch (navigation + list-specific keys) ──
+    if [[ "$_view_mode" == "list" ]]; then
+      case "$key" in
+        j|k|$'\t'|SHIFT_TAB|D|b|ESC)
+          _list_handle_key "$key"
+          ;;
+        $'\n'|$'\r') # Enter in list mode
+          _list_handle_key "ENTER"
+          ;;
+      esac
+    fi
+
   done
+}
+
+# Helper: get selected task ID regardless of view mode
+_get_active_task_id() {
+  case "$_view_mode" in
+    kanban) _get_selected_id ;;
+    list)   _list_get_selected_id ;;
+  esac
+}
+
+# ── Context transfer functions ────────────────────────────────────────────────
+
+# Transfer state from kanban to list mode
+_list_transfer_from_kanban() {
+  _list_group_collapsed=()  # expand all groups by default
+
+  # Try to position cursor on the same task selected in kanban
+  if _get_selected_id 2>/dev/null; then
+    _list_follow_id="$_tid"
+  elif [[ ${#_repo_names[@]} -gt 0 ]]; then
+    # Position at current repo's group header
+    _list_follow_id=""
+    # Expand the current repo, collapse others if many
+    if [[ ${#_repo_names[@]} -gt 6 ]]; then
+      for rn in "${_repo_names[@]}"; do
+        _list_group_collapsed[$rn]=1
+      done
+      local cur_rname="${_repo_names[$cur_repo_idx]:-}"
+      [[ -n "$cur_rname" ]] && unset "_list_group_collapsed[$cur_rname]"
+    fi
+  fi
+
+  # Build items immediately so _list_follow_id takes effect
+  _list_build_items
+}
+
+# Transfer state from list mode back to kanban
+_list_transfer_to_kanban() {
+  local item="${_list_items[$_list_cursor]:-}"
+
+  case "$item" in
+    task:*)
+      local tid="${item#task:}"
+      local trepo="${_task_repo[$tid]:-}"
+      local tst="${_task_status[$tid]:-}"
+
+      # Set filter to the task's repo
+      if [[ -n "$trepo" ]]; then
+        # Find repo index
+        local ri=0
+        for rn in "${_repo_names[@]}"; do
+          [[ "$rn" == "$trepo" ]] && break
+          ri=$((ri + 1))
+        done
+        if [[ $ri -lt ${#_repo_names[@]} ]]; then
+          cur_repo_idx=$ri
+        fi
+        # Set column based on status
+        case "$tst" in
+          pending|paused) cur_col=0 ;;
+          active)         cur_col=1 ;;
+          needs_review)   cur_col=2 ;;
+          done)           cur_col=3 ;;
+        esac
+        nav_mode="card"
+
+        # Try to find task row in column
+        local ids_str="${_repo_cols[${trepo}:${cur_col}]:-}"
+        if [[ -n "$ids_str" ]]; then
+          local -a ids_arr=(${(s: :)ids_str})
+          local ti=0
+          for id in "${ids_arr[@]}"; do
+            [[ "$id" == "$tid" ]] && break
+            ti=$((ti + 1))
+          done
+          cur_card_row["${trepo}:${cur_col}"]=$ti
+        fi
+      fi
+      cron_row_selected=0
+      ;;
+    group:*)
+      local rname="${item#group:}"
+      local ri=0
+      for rn in "${_repo_names[@]}"; do
+        [[ "$rn" == "$rname" ]] && break
+        ri=$((ri + 1))
+      done
+      [[ $ri -lt ${#_repo_names[@]} ]] && cur_repo_idx=$ri
+      nav_mode="repo"
+      cron_row_selected=0
+      ;;
+    cron_group:*|cron:*)
+      cron_row_selected=1
+      nav_mode="card"
+      ;;
+    *)
+      nav_mode="repo"
+      cron_row_selected=0
+      ;;
+  esac
+
+  # Close split if active
+  if [[ $_split_active -eq 1 ]]; then
+    _split_close
+  fi
 }
 
 # ── Help ───────────────────────────────────────────────────────────────────────
@@ -5021,6 +6243,20 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     x           Col 0: toggle enable/disable / Col 2: mark reviewed
     o           Create new cron job
     D           Delete cron job (Col 0 only, with confirmation)
+
+  View switching:
+    v           Toggle between kanban and list view
+
+  List view:
+    j/k         Move cursor up/down through items
+    Enter       Expand/collapse group, or open task (split mode)
+    Tab         Jump to next group header
+    Shift-Tab   Jump to previous group header
+    </>         Cycle task status left/right
+    D           Toggle show/hide done tasks
+    b           Toggle split view (sidebar + Claude session)
+    v           Switch back to kanban view
+    ESC         Close split view or collapse current group
 EOF
 }
 
@@ -5072,6 +6308,7 @@ main() {
         doctor)     cmd_doctor "$@" ;;
         _dash_loop) cmd__dash_loop "$@" ;;
         _dash_switch) cmd__dash_switch "$@" ;;
+        _split_session) cmd__split_session "$@" ;;
         *)          die "unknown command: ${cmd}; run 'cloard-board help'" ;;
       esac
       ;;

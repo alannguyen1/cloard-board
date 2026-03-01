@@ -181,16 +181,22 @@ _render_cron_row() {
 # Render the key-hints footer bar at the bottom of the screen
 _render_footer() {
   move_to "$((rows - 1))" 1
-  if [[ $cron_row_selected -eq 1 ]]; then
-    printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: new cron  D: delete  Esc: back  q: quit${C_RESET}"
+  if [[ "${_view_mode:-kanban}" == "list" ]]; then
+    if [[ ${_split_active:-0} -eq 1 ]]; then
+      printf "${C_DIM}  j/k: nav  Enter: switch  b: full list  </> status  t: rename  v: kanban  q: quit${C_RESET}"
+    else
+      printf "${C_DIM}  j/k: nav  Enter: open/expand  Tab: groups  </> status  D: done  b: split  v: kanban  c: new  q: quit${C_RESET}"
+    fi
+  elif [[ $cron_row_selected -eq 1 ]]; then
+    printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: new cron  D: delete  Esc: back  v: list  q: quit${C_RESET}"
   elif [[ "$filter_mode" == "all" ]]; then
     if [[ "$nav_mode" == "repo" ]]; then
-      printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  q: quit${C_RESET}"
+      printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  v: list  q: quit${C_RESET}"
     else
-      printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  c: new  S: import  t: rename  R: add repo  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  c: new  S: import  t: rename  R: add repo  v: list  q: quit${C_RESET}"
     fi
   else
-    printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  c: new  t: rename  s: shell  d: diff  q: quit${C_RESET}"
+    printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  c: new  t: rename  s: shell  d: diff  v: list  q: quit${C_RESET}"
   fi
 }
 

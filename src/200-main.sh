@@ -44,6 +44,7 @@ main() {
         doctor)     cmd_doctor "$@" ;;
         _dash_loop) cmd__dash_loop "$@" ;;
         _dash_switch) cmd__dash_switch "$@" ;;
+        _split_session) cmd__split_session "$@" ;;
         *)          die "unknown command: ${cmd}; run 'cloard-board help'" ;;
       esac
       ;;

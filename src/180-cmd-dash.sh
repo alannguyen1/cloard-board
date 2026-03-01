@@ -66,6 +66,19 @@ cmd__dash_loop() {
   # Per-repo collapsed state for accordion (1=collapsed, unset=expanded)
   typeset -A _repo_collapsed
 
+  # ── List mode state ──
+  local _view_mode="kanban"       # "kanban" or "list"
+  local -i _split_active=0        # 1 when sidebar+session split is open
+  local -i _show_done=0           # 1 when done tasks visible in list mode
+  local -i _list_cursor=0         # index into _list_items[]
+  local -i _list_scroll_top=0     # first visible content-line in viewport
+  local -a _list_items=()         # flat ordered array: "group:repo", "task:t-001", etc.
+  local _split_task_id=""          # task ID in right pane
+  local _list_follow_id=""         # task ID to follow after re-sort
+  typeset -A _list_group_collapsed # group_name -> 1 if collapsed
+  local -i _list_scrollbar_vh=0    # set by _render_list_full for deferred scrollbar
+  local -i _list_scrollbar_total=0
+
   # Declare snapshot arrays (persist across loop, modified by _snapshot_tasks via dynamic scope)
   typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo
   typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
@@ -106,6 +119,18 @@ cmd__dash_loop() {
 
     # Snapshot all data
     _snapshot_tasks
+
+    # Build list items (needed for list mode; cheap no-op data if in kanban)
+    if [[ "$_view_mode" == "list" ]]; then
+      _list_build_items
+      # Clamp list cursor
+      if [[ ${#_list_items[@]} -gt 0 ]]; then
+        [[ $_list_cursor -ge ${#_list_items[@]} ]] && _list_cursor=$((${#_list_items[@]} - 1))
+        [[ $_list_cursor -lt 0 ]] && _list_cursor=0
+      else
+        _list_cursor=0
+      fi
+    fi
 
     # Pre-compute border strings
     local _border_card="" _border_full="" _i
@@ -156,6 +181,13 @@ cmd__dash_loop() {
       # No repos registered
       _frame+=$'\n'
       _frame+="  ${C_DIM}No repos registered. Run: cloard-board repo add <path>${C_RESET}"$'\n'
+    elif [[ "$_view_mode" == "list" ]]; then
+      # ── List mode rendering ──
+      if [[ $_split_active -eq 1 ]]; then
+        _render_list_sidebar
+      else
+        _render_list_full
+      fi
     elif [[ "$filter_mode" == "all" ]]; then
       # ── All-repos view (compact cards with accordion) ──
       local total_repos=${#_repo_names[@]}
@@ -544,8 +576,8 @@ cmd__dash_loop() {
       fi
     fi
 
-    # ── Cron row (always visible when cron data exists) ──
-    if $_has_cron_data; then
+    # ── Cron row (kanban mode only; list mode handles cron in _list_items) ──
+    if [[ "$_view_mode" == "kanban" ]] && $_has_cron_data; then
       _render_cron_row
     fi
 
@@ -560,6 +592,13 @@ cmd__dash_loop() {
 
     # Output frame
     printf '\033[H%s\033[J' "$_frame"
+
+    # Deferred scrollbar (list mode, rendered after frame to use move_to positioning)
+    if [[ "$_view_mode" == "list" && $_list_scrollbar_vh -gt 0 ]]; then
+      _render_scrollbar_track "$_list_scrollbar_vh" "$_list_scrollbar_total"
+      _list_scrollbar_vh=0
+      _list_scrollbar_total=0
+    fi
 
     # Footer
     _render_footer
@@ -967,7 +1006,7 @@ cmd__dash_loop() {
         fi
         ;;
       '>'|'.') # Move task right
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local mv_status="${_task_status[$sel_id]}"
           local -a status_order=("pending" "paused" "active" "needs_review" "done")
@@ -982,11 +1021,12 @@ cmd__dash_loop() {
             else
               update_task_field "$sel_id" "status" "$next_status"
             fi
+            [[ "$_view_mode" == "list" ]] && _list_follow_id="$sel_id"
           fi
         fi
         ;;
       '<'|',') # Move task left
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local mv_status="${_task_status[$sel_id]}"
           local -a status_order=("pending" "paused" "active" "needs_review" "done")
@@ -997,6 +1037,7 @@ cmd__dash_loop() {
           if [[ $mv_idx -gt 0 ]]; then
             local prev_status="${status_order[$((mv_idx - 1))]}"
             update_task_field "$sel_id" "status" "$prev_status"
+            [[ "$_view_mode" == "list" ]] && _list_follow_id="$sel_id"
           fi
         fi
         ;;
@@ -1185,7 +1226,7 @@ cmd__dash_loop() {
               update_cron_run_field "$cron_item" "status" "archived"
               ;;
           esac
-        elif _get_selected_id; then
+        elif _get_active_task_id; then
           local sel_id="$_tid"
           local sel_status="${_task_status[$sel_id]}"
           if [[ "$sel_status" == "done" ]]; then
@@ -1196,7 +1237,7 @@ cmd__dash_loop() {
         fi
         ;;
       d) # Show diff
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local sel_repo="${_task_repo[$sel_id]}"
           local sel_rpath
@@ -1217,7 +1258,7 @@ cmd__dash_loop() {
         fi
         ;;
       s) # Shell popup
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           if tmux_window_exists "$sel_id"; then
             cursor_show
@@ -1318,7 +1359,7 @@ cmd__dash_loop() {
         cursor_hide
         ;;
       t) # Rename focused task
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local cur_title="${_task_title[$sel_id]}"
           cursor_show
@@ -1334,7 +1375,7 @@ cmd__dash_loop() {
         fi
         ;;
       p) # Pause active task
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local p_status="${_task_status[$sel_id]}"
           if [[ "$p_status" == "active" || "$p_status" == "needs_review" ]]; then
@@ -1345,7 +1386,7 @@ cmd__dash_loop() {
         fi
         ;;
       r) # Reopen done task
-        if _get_selected_id; then
+        if _get_active_task_id; then
           local sel_id="$_tid"
           local r_status="${_task_status[$sel_id]}"
           if [[ "$r_status" == "done" ]]; then
@@ -1402,12 +1443,142 @@ cmd__dash_loop() {
           cursor_hide
         fi
         ;;
+      v) # Toggle kanban/list view
+        if [[ "$_view_mode" == "kanban" ]]; then
+          _list_transfer_from_kanban
+          _view_mode="list"
+        else
+          _list_transfer_to_kanban
+          _view_mode="kanban"
+        fi
+        ;;
       q) # Quit / detach
+        if [[ $_split_active -eq 1 ]]; then
+          _split_close
+        fi
         cursor_show
         tmux_cmd detach-client 2>/dev/null || exit 0
         exit 0
         ;;
     esac
+
+    # ── List mode key dispatch (navigation + list-specific keys) ──
+    if [[ "$_view_mode" == "list" ]]; then
+      case "$key" in
+        j|k|$'\t'|SHIFT_TAB|D|b|ESC)
+          _list_handle_key "$key"
+          ;;
+        $'\n'|$'\r') # Enter in list mode
+          _list_handle_key "ENTER"
+          ;;
+      esac
+    fi
+
   done
+}
+
+# Helper: get selected task ID regardless of view mode
+_get_active_task_id() {
+  case "$_view_mode" in
+    kanban) _get_selected_id ;;
+    list)   _list_get_selected_id ;;
+  esac
+}
+
+# ── Context transfer functions ────────────────────────────────────────────────
+
+# Transfer state from kanban to list mode
+_list_transfer_from_kanban() {
+  _list_group_collapsed=()  # expand all groups by default
+
+  # Try to position cursor on the same task selected in kanban
+  if _get_selected_id 2>/dev/null; then
+    _list_follow_id="$_tid"
+  elif [[ ${#_repo_names[@]} -gt 0 ]]; then
+    # Position at current repo's group header
+    _list_follow_id=""
+    # Expand the current repo, collapse others if many
+    if [[ ${#_repo_names[@]} -gt 6 ]]; then
+      for rn in "${_repo_names[@]}"; do
+        _list_group_collapsed[$rn]=1
+      done
+      local cur_rname="${_repo_names[$cur_repo_idx]:-}"
+      [[ -n "$cur_rname" ]] && unset "_list_group_collapsed[$cur_rname]"
+    fi
+  fi
+
+  # Build items immediately so _list_follow_id takes effect
+  _list_build_items
+}
+
+# Transfer state from list mode back to kanban
+_list_transfer_to_kanban() {
+  local item="${_list_items[$_list_cursor]:-}"
+
+  case "$item" in
+    task:*)
+      local tid="${item#task:}"
+      local trepo="${_task_repo[$tid]:-}"
+      local tst="${_task_status[$tid]:-}"
+
+      # Set filter to the task's repo
+      if [[ -n "$trepo" ]]; then
+        # Find repo index
+        local ri=0
+        for rn in "${_repo_names[@]}"; do
+          [[ "$rn" == "$trepo" ]] && break
+          ri=$((ri + 1))
+        done
+        if [[ $ri -lt ${#_repo_names[@]} ]]; then
+          cur_repo_idx=$ri
+        fi
+        # Set column based on status
+        case "$tst" in
+          pending|paused) cur_col=0 ;;
+          active)         cur_col=1 ;;
+          needs_review)   cur_col=2 ;;
+          done)           cur_col=3 ;;
+        esac
+        nav_mode="card"
+
+        # Try to find task row in column
+        local ids_str="${_repo_cols[${trepo}:${cur_col}]:-}"
+        if [[ -n "$ids_str" ]]; then
+          local -a ids_arr=(${(s: :)ids_str})
+          local ti=0
+          for id in "${ids_arr[@]}"; do
+            [[ "$id" == "$tid" ]] && break
+            ti=$((ti + 1))
+          done
+          cur_card_row["${trepo}:${cur_col}"]=$ti
+        fi
+      fi
+      cron_row_selected=0
+      ;;
+    group:*)
+      local rname="${item#group:}"
+      local ri=0
+      for rn in "${_repo_names[@]}"; do
+        [[ "$rn" == "$rname" ]] && break
+        ri=$((ri + 1))
+      done
+      [[ $ri -lt ${#_repo_names[@]} ]] && cur_repo_idx=$ri
+      nav_mode="repo"
+      cron_row_selected=0
+      ;;
+    cron_group:*|cron:*)
+      cron_row_selected=1
+      nav_mode="card"
+      ;;
+    *)
+      nav_mode="repo"
+      cron_row_selected=0
+      ;;
+  esac
+
+  # Close split if active
+  if [[ $_split_active -eq 1 ]]; then
+    _split_close
+  fi
 }
 

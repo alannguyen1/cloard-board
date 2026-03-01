@@ -96,6 +96,20 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     x           Col 0: toggle enable/disable / Col 2: mark reviewed
     o           Create new cron job
     D           Delete cron job (Col 0 only, with confirmation)
+
+  View switching:
+    v           Toggle between kanban and list view
+
+  List view:
+    j/k         Move cursor up/down through items
+    Enter       Expand/collapse group, or open task (split mode)
+    Tab         Jump to next group header
+    Shift-Tab   Jump to previous group header
+    </>         Cycle task status left/right
+    D           Toggle show/hide done tasks
+    b           Toggle split view (sidebar + Claude session)
+    v           Switch back to kanban view
+    ESC         Close split view or collapse current group
 EOF
 }
 
