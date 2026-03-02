@@ -53,9 +53,16 @@ tmux_select_window() {
 _tmux_claude_alive() {
   local name="$1"
   tmux_window_exists "$name" || return 1
+  # Fast path: check pane_current_command directly
   local pane_cmd
   pane_cmd=$(tmux_cmd list-panes -t "board:${name}" -F '#{pane_current_command}' 2>/dev/null | head -1)
-  [[ "$pane_cmd" == *claude* || "$pane_cmd" == *node* ]]
+  [[ "$pane_cmd" == *claude* || "$pane_cmd" == *node* ]] && return 0
+  # Fallback: pane_current_command reports "zsh" when launched via zsh -c wrapper;
+  # check child processes of the pane's PID for claude or node
+  local pane_pid
+  pane_pid=$(tmux_cmd list-panes -t "board:${name}" -F '#{pane_pid}' 2>/dev/null | head -1)
+  [[ -n "$pane_pid" ]] || return 1
+  pgrep -P "$pane_pid" 2>/dev/null | xargs -I{} ps -o comm= -p {} 2>/dev/null | grep -qE 'claude|node'
 }
 
 # Launch a Claude session in a new tmux window with standard env vars.

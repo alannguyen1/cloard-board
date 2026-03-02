@@ -13,8 +13,12 @@ ensure_global_state() {
     fi
   fi
 
-  # Install hooks if missing
-  if [[ ! -f "$HOOKS_DIR/on-stop.sh" || ! -f "$HOOKS_DIR/on-prompt.sh" ]]; then
+  # Install hooks if missing or outdated
+  local _hook_ver=""
+  if [[ -f "$HOOKS_DIR/on-prompt.sh" ]]; then
+    _hook_ver=$(grep -o 'hook-version:[0-9]*' "$HOOKS_DIR/on-prompt.sh" 2>/dev/null | cut -d: -f2) || true
+  fi
+  if [[ ! -f "$HOOKS_DIR/on-stop.sh" || ! -f "$HOOKS_DIR/on-prompt.sh" || "$_hook_ver" != "$HOOK_VERSION" ]]; then
     _install_hook_scripts
     _register_global_hooks
   fi
@@ -23,20 +27,22 @@ ensure_global_state() {
 _install_hook_scripts() {
   mkdir -p "$HOOKS_DIR"
 
-  cat > "$HOOKS_DIR/on-stop.sh" <<'HOOK'
+  cat > "$HOOKS_DIR/on-stop.sh" <<HOOK
 #!/usr/bin/env bash
 # cloard-board hook: set task status to "waiting" when Claude stops
-[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
-cloard-board signal "$CLOARD_TASK_ID" waiting &>/dev/null &
+# hook-version:${HOOK_VERSION}
+[[ -n "\${CLOARD_TASK_ID:-}" ]] || exit 0
+cloard-board signal "\$CLOARD_TASK_ID" waiting &>/dev/null &
 HOOK
   chmod +x "$HOOKS_DIR/on-stop.sh"
 
-  cat > "$HOOKS_DIR/on-prompt.sh" <<'HOOK'
+  cat > "$HOOKS_DIR/on-prompt.sh" <<HOOK
 #!/usr/bin/env bash
 # cloard-board hook: set task status to "working" when user submits a prompt
-[[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
-cloard-board signal "$CLOARD_TASK_ID" working &>/dev/null &
-cloard-board _capture-session-uid "$CLOARD_TASK_ID" &>/dev/null &
+# hook-version:${HOOK_VERSION}
+[[ -n "\${CLOARD_TASK_ID:-}" ]] || exit 0
+cloard-board signal "\$CLOARD_TASK_ID" working &>/dev/null &
+cloard-board _capture-session-uid "\$CLOARD_TASK_ID" &>/dev/null &
 HOOK
   chmod +x "$HOOKS_DIR/on-prompt.sh"
 }

@@ -102,9 +102,12 @@ cmd_cron_add() {
       ;;
     3)
       schedule_type="interval"
-      printf "${C_CYAN}Interval in minutes (e.g. 30): ${C_RESET}"
+      printf "${C_CYAN}Interval in minutes (1-59, e.g. 30): ${C_RESET}"
       local interval="" start_h="" end_h=""
       read -r interval
+      if [[ ! "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 1 || "$interval" -gt 59 ]]; then
+        die "interval must be a number between 1 and 59"
+      fi
       printf "${C_CYAN}Start hour (0-23): ${C_RESET}"
       read -r start_h
       printf "${C_CYAN}End hour (0-23): ${C_RESET}"

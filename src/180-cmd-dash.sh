@@ -244,11 +244,12 @@ cmd__dash_loop() {
 
         if ! $is_expanded; then
           # ── Collapsed repo: header only ──
-          local repo_hdr="  [${rname}] (${tcnt} tasks)"
           if $is_sel_repo && [[ "$nav_mode" == "repo" ]]; then
-            _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}> [${rname}] (${tcnt} tasks)%-$((cols - ${#repo_hdr}))s${C_RESET}" "")
+            local _ch="> [${rname}] (${tcnt} tasks)"
+            _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${(r:${cols}:)_ch}${C_RESET}"
           else
-            _frame+=$(printf "${C_DIM}  [${rname}] (${tcnt} tasks)%-$((cols - ${#repo_hdr}))s${C_RESET}" "")
+            local _ch="  [${rname}] (${tcnt} tasks)"
+            _frame+="${C_DIM}${(r:${cols}:)_ch}${C_RESET}"
           fi
           _frame+=$'\n'
           repo_idx=$((repo_idx + 1))
@@ -259,9 +260,11 @@ cmd__dash_loop() {
         # Repo header
         local repo_hdr="[${rname}]${stale_indicator} (${tcnt} tasks)"
         if $is_sel_repo && [[ "$nav_mode" == "repo" ]]; then
-          _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}> %-$((cols-2))s${C_RESET}" "$repo_hdr")
+          local _rh="> ${repo_hdr}"
+          _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${(r:${cols}:)_rh}${C_RESET}"
         else
-          _frame+=$(printf "${C_BOLD}  %-$((cols-2))s${C_RESET}" "$repo_hdr")
+          local _rh="  ${repo_hdr}"
+          _frame+="${C_BOLD}${(r:${cols}:)_rh}${C_RESET}"
         fi
         _frame+=$'\n'
 
@@ -587,7 +590,7 @@ cmd__dash_loop() {
     _flines=("${(@f)_frame}")
     if [[ ${#_flines[@]} -gt $_max_lines ]]; then
       _flines=("${_flines[@]:0:$_max_lines}")
-      _frame="${(pj:\n:)_flines}"$'\n'
+      _frame="${(pj:\n:)_flines[@]}"$'\n'
     fi
 
     # Output frame

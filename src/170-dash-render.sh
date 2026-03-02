@@ -12,7 +12,8 @@ _render_status_bar() {
     local ft_cnt="${_repo_task_count[$filter_mode]:-0}"
     title_str="  cloard-board -- ${filter_mode} (${ft_cnt} tasks)"
   fi
-  _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}" "$title_str")
+  local _tpad="${(r:${cols}:)title_str}"
+  _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${_tpad}${C_RESET}"
   _frame+=$'\n'
 }
 
@@ -22,10 +23,14 @@ _render_cron_row() {
 
   # Cron section header
   local cron_hdr="[cron jobs] (${cron_total} items)"
+  local _cron_w=$((cols - 2))
+  [[ $_cron_w -lt 0 ]] && _cron_w=0
   if [[ $cron_row_selected -eq 1 && "$nav_mode" == "repo" ]]; then
-    _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}> %-$((cols-2))s${C_RESET}" "$cron_hdr")
+    local _ch="> ${cron_hdr}"
+    _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${(r:${cols}:)_ch}${C_RESET}"
   else
-    _frame+=$(printf "${C_BOLD}  %-$((cols-2))s${C_RESET}" "$cron_hdr")
+    local _ch="  ${cron_hdr}"
+    _frame+="${C_BOLD}${(r:${cols}:)_ch}${C_RESET}"
   fi
   _frame+=$'\n'
 
@@ -183,7 +188,7 @@ _render_footer() {
   move_to "$((rows - 1))" 1
   if [[ "${_view_mode:-kanban}" == "list" ]]; then
     if [[ ${_split_active:-0} -eq 1 ]]; then
-      printf "${C_DIM}  j/k: nav  Enter: switch  b: full list  </> status  t: rename  v: kanban  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: nav  Enter/l: focus session  ^b h: sidebar  b: full list  q: quit${C_RESET}"
     else
       printf "${C_DIM}  j/k: nav  Enter: open/expand  Tab: groups  </> status  D: done  b: split  v: kanban  c: new  q: quit${C_RESET}"
     fi

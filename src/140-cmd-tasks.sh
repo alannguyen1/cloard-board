@@ -169,6 +169,10 @@ cmd_session() {
 
   local session_uid="${1:-}"
   [[ -n "$session_uid" ]] || die "usage: cloard-board session <session-uid> [--repo <name>] [--title \"...\"]"
+  # Validate session UID: must be UUID format or hex string (no shell metacharacters)
+  if [[ ! "$session_uid" =~ ^[0-9a-fA-F-]+$ ]]; then
+    die "invalid session-uid: must be a UUID or hex string"
+  fi
   shift
 
   local repo_name="" title=""
@@ -332,6 +336,8 @@ cmd_start() {
 
   ensure_tmux_session
 
+  local session_uid=""
+
   if tmux_window_exists "$id"; then
     warn "tmux window '$id' already exists; switching to it"
     tmux_select_window "$id"
@@ -343,7 +349,6 @@ cmd_start() {
     [[ "$rtype" == "dir" ]] && wt_mode="none"
 
     # Generate session ID for reliable resumption
-    local session_uid
     session_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
 
     local claude_cmd
@@ -371,7 +376,7 @@ cmd_start() {
   # Update state
   update_task_field "$id" "status" "active"
   update_task_field "$id" "started_at" "$(now_iso)"
-  update_task_field "$id" "session_uid" "$session_uid"
+  [[ -n "$session_uid" ]] && update_task_field "$id" "session_uid" "$session_uid"
 
   # Try to discover worktree path
   local wt_path

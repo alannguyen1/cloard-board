@@ -66,11 +66,12 @@ _render_list_group_header() {
   [[ "${_list_group_collapsed[$repo_name]:-}" == "1" ]] && arrow="▶"
 
   local hdr_text="${arrow} ${repo_name} (${total} tasks: ${active_cnt} active, ${review_cnt} review)"
+  local _hpad="${(r:${cols}:)hdr_text}"
 
   if [[ "$is_selected" == "1" ]]; then
-    _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}" "$hdr_text")
+    _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${_hpad}${C_RESET}"
   else
-    _frame+=$(printf "${C_BOLD}%-${cols}s${C_RESET}" "$hdr_text")
+    _frame+="${C_BOLD}${_hpad}${C_RESET}"
   fi
   _frame+=$'\n'
 }
@@ -90,11 +91,12 @@ _render_list_cron_header() {
   [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="▶"
 
   local hdr_text="${arrow} cron jobs (${cron_total} items)"
+  local _hpad="${(r:${cols}:)hdr_text}"
 
   if [[ "$is_selected" == "1" ]]; then
-    _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${cols}s${C_RESET}" "$hdr_text")
+    _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${_hpad}${C_RESET}"
   else
-    _frame+=$(printf "${C_BOLD}%-${cols}s${C_RESET}" "$hdr_text")
+    _frame+="${C_BOLD}${_hpad}${C_RESET}"
   fi
   _frame+=$'\n'
 }
@@ -146,17 +148,17 @@ _render_list_task_card() {
   if [[ $width -gt 35 ]]; then
     # ── Wide format ──
     # Line 1:  > t-003  Fix authentication bug
-    local id_field
-    id_field=$(printf '%-6s' "$task_id")
     local title_max=$((width - 10))
     [[ $title_max -lt 1 ]] && title_max=1
     local title_str
     title_str=$(trunc "$title" "$title_max")
+    local _tw=$((width - 10))
+    [[ $_tw -lt 0 ]] && _tw=0
 
     if [[ "$is_selected" == "1" ]]; then
-      _frame+=$(printf "${sel_on}%s %-6s  %-$((width - 10))s${sel_off}" "$prefix" "$task_id" "$title_str")
+      _frame+="${sel_on}${prefix} ${(r:6:)task_id}  ${(r:$_tw:)title_str}${sel_off}"
     else
-      _frame+=$(printf "%s ${C_DIM}%-6s${C_RESET}  %-$((width - 10))s" "$prefix" "$task_id" "$title_str")
+      _frame+="${prefix} ${C_DIM}${(r:6:)task_id}${C_RESET}  ${(r:$_tw:)title_str}"
     fi
     _frame+=$'\n'
 
@@ -167,9 +169,13 @@ _render_list_task_card() {
     detail=$(trunc "$detail" "$detail_max")
 
     if [[ "$is_selected" == "1" ]]; then
-      _frame+=$(printf "${sel_on}%-${width}s${sel_off}" "         ${detail}")
+      local _det_full="         ${detail}"
+      _frame+="${sel_on}${(r:${width}:)_det_full}${sel_off}"
     else
-      _frame+=$(printf "         ${badge_color}%s${C_RESET}%-$((width - 9 - ${#detail}))s" "$detail" "")
+      local _dpad_n=$((width - 9 - ${#detail}))
+      local _e=""
+      _frame+="         ${badge_color}${detail}${C_RESET}"
+      [[ $_dpad_n -gt 0 ]] && _frame+="${(r:$_dpad_n:)_e}"
     fi
     _frame+=$'\n'
   else
@@ -188,10 +194,12 @@ _render_list_task_card() {
     local title_str
     title_str=$(trunc "$title" "$title_max")
 
+    local _nw=$((width - 9))
+    [[ $_nw -lt 0 ]] && _nw=0
     if [[ "$is_selected" == "1" ]]; then
-      _frame+=$(printf "${sel_on}%s %-5s %-$((width - 9))s ${badge_short}${sel_off}" "$prefix" "$task_id" "$title_str")
+      _frame+="${sel_on}${prefix} ${(r:5:)task_id} ${(r:$_nw:)title_str} ${badge_short}${sel_off}"
     else
-      _frame+=$(printf "%s ${C_DIM}%-5s${C_RESET} %-$((width - 9))s ${badge_color}${badge_short}${C_RESET}" "$prefix" "$task_id" "$title_str")
+      _frame+="${prefix} ${C_DIM}${(r:5:)task_id}${C_RESET} ${(r:$_nw:)title_str} ${badge_color}${badge_short}${C_RESET}"
     fi
     _frame+=$'\n'
 
@@ -200,10 +208,13 @@ _render_list_task_card() {
     local info_max=$((width - 8))
     [[ $info_max -lt 1 ]] && info_max=1
     info_str=$(trunc "$info_str" "$info_max")
+    local _iw=$((width - 7))
+    [[ $_iw -lt 0 ]] && _iw=0
     if [[ "$is_selected" == "1" ]]; then
-      _frame+=$(printf "${sel_on}%-${width}s${sel_off}" "       ${info_str}")
+      local _info_full="       ${info_str}"
+      _frame+="${sel_on}${(r:${width}:)_info_full}${sel_off}"
     else
-      _frame+=$(printf "       ${C_DIM}%-$((width - 7))s${C_RESET}" "$info_str")
+      _frame+="       ${C_DIM}${(r:$_iw:)info_str}${C_RESET}"
     fi
     _frame+=$'\n'
   fi
@@ -246,10 +257,12 @@ _render_list_cron_card() {
     local id_max=$((width - 3))
     local id_name="${cron_id}  ${jname}"
     id_name=$(trunc "$id_name" "$id_max")
+    local _cw=$((width - 2))
+    [[ $_cw -lt 0 ]] && _cw=0
     if [[ "$is_selected" == "1" ]]; then
-      _frame+=$(printf "${sel_on}%s %-$((width - 2))s${sel_off}" "$prefix" "$id_name")
+      _frame+="${sel_on}${prefix} ${(r:$_cw:)id_name}${sel_off}"
     else
-      _frame+=$(printf "%s ${C_DIM}%-$((width - 2))s${C_RESET}" "$prefix" "$id_name")
+      _frame+="${prefix} ${C_DIM}${(r:$_cw:)id_name}${C_RESET}"
     fi
     _frame+=$'\n'
 
@@ -259,10 +272,13 @@ _render_list_cron_card() {
     local detail_max=$((width - 9))
     [[ $detail_max -lt 1 ]] && detail_max=1
     detail=$(trunc "$detail" "$detail_max")
+    local _dw=$((width - 7))
+    [[ $_dw -lt 0 ]] && _dw=0
     if [[ "$is_selected" == "1" ]]; then
-      _frame+=$(printf "${sel_on}%-${width}s${sel_off}" "       ${detail}")
+      local _sd_full="       ${detail}"
+      _frame+="${sel_on}${(r:${width}:)_sd_full}${sel_off}"
     else
-      _frame+=$(printf "       ${status_color}%-$((width - 7))s${C_RESET}" "$detail")
+      _frame+="       ${status_color}${(r:$_dw:)detail}${C_RESET}"
     fi
     _frame+=$'\n'
   else
@@ -283,10 +299,12 @@ _render_list_cron_card() {
     local id_max=$((width - 3))
     local id_name="${cron_id}  ${rjname}"
     id_name=$(trunc "$id_name" "$id_max")
+    local _cw=$((width - 2))
+    [[ $_cw -lt 0 ]] && _cw=0
     if [[ "$is_selected" == "1" ]]; then
-      _frame+=$(printf "${sel_on}%s %-$((width - 2))s${sel_off}" "$prefix" "$id_name")
+      _frame+="${sel_on}${prefix} ${(r:$_cw:)id_name}${sel_off}"
     else
-      _frame+=$(printf "%s ${C_DIM}%-$((width - 2))s${C_RESET}" "$prefix" "$id_name")
+      _frame+="${prefix} ${C_DIM}${(r:$_cw:)id_name}${C_RESET}"
     fi
     _frame+=$'\n'
 
@@ -297,10 +315,13 @@ _render_list_cron_card() {
     local detail_max=$((width - 9))
     [[ $detail_max -lt 1 ]] && detail_max=1
     detail=$(trunc "$detail" "$detail_max")
+    local _dw=$((width - 7))
+    [[ $_dw -lt 0 ]] && _dw=0
     if [[ "$is_selected" == "1" ]]; then
-      _frame+=$(printf "${sel_on}%-${width}s${sel_off}" "       ${detail}")
+      local _cr_full="       ${detail}"
+      _frame+="${sel_on}${(r:${width}:)_cr_full}${sel_off}"
     else
-      _frame+=$(printf "       ${status_color}%-$((width - 7))s${C_RESET}" "$detail")
+      _frame+="       ${status_color}${(r:$_dw:)detail}${C_RESET}"
     fi
     _frame+=$'\n'
   fi
@@ -397,9 +418,9 @@ _render_list_full() {
   # Pad remaining viewport lines with empty lines
   local rendered_lines=$((content_line - _list_scroll_top))
   [[ $rendered_lines -gt $viewport_height ]] && rendered_lines=$viewport_height
-  local _pad_i
+  local _pad_i _e=""
   for (( _pad_i=rendered_lines; _pad_i<viewport_height; _pad_i++ )); do
-    _frame+=$(printf "%-${cols}s" "")
+    _frame+="${(r:${cols}:)_e}"
     _frame+=$'\n'
   done
 
@@ -411,6 +432,75 @@ _render_list_full() {
     _list_scrollbar_vh=0
     _list_scrollbar_total=0
   fi
+}
+
+# ── Sidebar task card (compact, title-first layout) ──────────────────────────
+
+# Render a two-line sidebar task card. Title gets full width on line 1,
+# id + status badge on line 2.
+_render_sidebar_task_card() {
+  local task_id="$1"
+  local width="$2"
+  local is_selected="$3"
+
+  local title="${_task_title[$task_id]:-}"
+  local tstatus="${_task_status[$task_id]:-}"
+  local claude="${_task_claude[$task_id]:-}"
+
+  # Single-char status badge
+  local badge_char="" badge_color=""
+  case "$tstatus" in
+    active)       badge_char="●"; badge_color="$C_GREEN" ;;
+    needs_review) badge_char="◆"; badge_color="$C_YELLOW" ;;
+    pending)      badge_char="○"; badge_color="$C_DIM" ;;
+    paused)       badge_char="◫"; badge_color="$C_CYAN" ;;
+    done)         badge_char="✓"; badge_color="$C_DIM" ;;
+  esac
+
+  local claude_char=""
+  [[ "$claude" == "working" ]] && claude_char=" ⚙"
+  [[ "$claude" == "waiting" ]] && claude_char=" ○"
+
+  local prefix=" "
+  local sel_on="" sel_off=""
+  if [[ "$is_selected" == "1" ]]; then
+    prefix=">"
+    sel_on="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+    sel_off="${C_RESET}"
+  fi
+
+  # Line 1: > Title text here (full width minus 2 for prefix+space)
+  local title_max=$((width - 2))
+  [[ $title_max -lt 1 ]] && title_max=1
+  local title_str
+  title_str=$(trunc "$title" "$title_max")
+  local _tw=$((width - 2))
+  [[ $_tw -lt 0 ]] && _tw=0
+
+  if [[ "$is_selected" == "1" ]]; then
+    _frame+="${sel_on}${prefix} ${(r:$_tw:)title_str}${sel_off}"
+  else
+    _frame+="${sel_on}${prefix} ${(r:$_tw:)title_str}${sel_off}"
+  fi
+  _frame+=$'\n'
+
+  # Line 2:   t-002 ● ⚙  (id + badge + claude indicator, dimmed)
+  local detail="${task_id} ${badge_char}${claude_char}"
+  local _dw=$((width - 3))
+  [[ $_dw -lt 0 ]] && _dw=0
+  if [[ "$is_selected" == "1" ]]; then
+    local _det="  ${detail}"
+    _frame+="${sel_on}${(r:${width}:)_det}${sel_off}"
+  else
+    _frame+="  ${C_DIM}${task_id}${C_RESET} ${badge_color}${badge_char}${C_RESET}${C_DIM}${claude_char}${C_RESET}"
+    local detail_plain_len=$((${#task_id} + 1 + 1 + ${#claude_char}))
+    local _pad_n=$((width - 2 - detail_plain_len))
+    if [[ $_pad_n -gt 0 ]]; then
+      local _e=""
+      _frame+="${(r:$_pad_n:)_e}"
+    fi
+  fi
+  _frame+=$'\n'
 }
 
 # ── Sidebar list renderer (split-pane mode) ──────────────────────────────────
@@ -450,15 +540,16 @@ _render_list_sidebar() {
         local total="${_repo_task_count[$rn]:-0}"
         local hdr="${arrow} ${rn} (${total})"
         hdr=$(trunc "$hdr" "$sidebar_w")
+        local _shpad="${(r:${sidebar_w}:)hdr}"
         if [[ $is_sel -eq 1 ]]; then
-          _frame+=$(printf "${C_BOLD}${C_BG_BLUE}${C_WHITE}%-${sidebar_w}s${C_RESET}" "$hdr")
+          _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${_shpad}${C_RESET}"
         else
-          _frame+=$(printf "${C_BOLD}%-${sidebar_w}s${C_RESET}" "$hdr")
+          _frame+="${C_BOLD}${_shpad}${C_RESET}"
         fi
         _frame+=$'\n'
         ;;
       task:*)
-        _render_list_task_card "${item#task:}" "$sidebar_w" "$is_sel"
+        _render_sidebar_task_card "${item#task:}" "$sidebar_w" "$is_sel"
         ;;
       cron_group:*)
         _render_list_cron_header "$is_sel"
@@ -474,9 +565,9 @@ _render_list_sidebar() {
   # Pad remaining lines
   local rendered_lines=$((content_line - _list_scroll_top))
   [[ $rendered_lines -gt $viewport_height ]] && rendered_lines=$viewport_height
-  local _pad_i
+  local _pad_i _e=""
   for (( _pad_i=rendered_lines; _pad_i<viewport_height; _pad_i++ )); do
-    _frame+=$(printf "%-${sidebar_w}s" "")
+    _frame+="${(r:${sidebar_w}:)_e}"
     _frame+=$'\n'
   done
 }
@@ -546,7 +637,11 @@ _list_handle_key() {
         task:*)
           local sel_id="${item#task:}"
           if [[ "${_split_active:-0}" == "1" ]]; then
-            _split_switch_session "$sel_id"
+            if [[ "$sel_id" != "$_split_task_id" ]]; then
+              _split_switch_session "$sel_id"
+            fi
+            # Focus the Claude session pane
+            tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
           else
             # Delegate to kanban-style Enter handling (start/resume/attach)
             local cur_status="${_task_status[$sel_id]}"
@@ -752,6 +847,12 @@ _list_handle_key() {
         _split_close
       elif _list_get_selected_id; then
         _split_open "$_tid"
+      fi
+      ;;
+
+    l) # Focus right pane (Claude session) when split is active
+      if [[ "${_split_active:-0}" == "1" ]]; then
+        tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       fi
       ;;
 

@@ -398,6 +398,9 @@ assert_eq "_split_build_cmd helper present" "0" "$?"
 grep -q 'join-pane.*-h.*-s.*board:' "$BOARD"
 assert_eq "join-pane for existing windows" "0" "$?"
 
+grep -q "join-pane.*-l '60%'" "$BOARD"
+assert_eq "join-pane uses -l percentage (not -p)" "0" "$?"
+
 grep -q 'break-pane.*-d.*-s.*board:dashboard.1' "$BOARD"
 assert_eq "break-pane preserves sessions" "0" "$?"
 

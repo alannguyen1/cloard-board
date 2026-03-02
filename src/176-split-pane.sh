@@ -40,6 +40,14 @@ _split_build_cmd() {
   fi
 }
 
+# Install/remove tmux keybinding for returning to sidebar from the Claude pane.
+_split_bind_sidebar_key() {
+  tmux_cmd bind-key -T prefix h select-pane -t "board:dashboard.0" 2>/dev/null || true
+}
+_split_unbind_sidebar_key() {
+  tmux_cmd unbind-key -T prefix h 2>/dev/null || true
+}
+
 # Open a split pane with the task's Claude session on the right side.
 _split_open() {
   local task_id="$1"
@@ -52,11 +60,12 @@ _split_open() {
 
   _split_active=1
   _split_task_id="$task_id"
+  _split_bind_sidebar_key
 
   if tmux_window_exists "$task_id"; then
     if _tmux_claude_alive "$task_id"; then
       # Existing live session: join it into the dashboard as right pane
-      tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -p 60 2>/dev/null || true
+      tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
       tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
       return 0
     else
@@ -99,7 +108,7 @@ _split_switch_session() {
 
   if tmux_window_exists "$new_task_id"; then
     if _tmux_claude_alive "$new_task_id"; then
-      tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -p 60 2>/dev/null || true
+      tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
       tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
       return 0
     else
@@ -130,4 +139,5 @@ _split_close() {
   fi
   _split_active=0
   _split_task_id=""
+  _split_unbind_sidebar_key
 }
