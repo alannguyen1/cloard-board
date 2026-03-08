@@ -131,13 +131,60 @@ Schedule and manage recurring Claude Code tasks via macOS LaunchAgents.
 | `p` | Pause: kill the tmux window but keep the worktree |
 | `r` | Reopen a done task (restart session) |
 | `x` | Mark task as done (or remove if already done) |
+| `d` | Toggle show/hide done tasks |
 | `>` / `.` | Move task to the next status |
 | `<` / `,` | Move task to the previous status |
 | `:` / `"` | Reorder card up/down within a column |
-| `d` | Show git diff for the selected task's worktree |
 | `s` | Shell popup: view the task's terminal output |
+| `H` | Open session history modal (switch between previous sessions) |
+| `v` | Switch to list view |
 | `R` | Register a new repo |
 | `q` | Quit (detach from tmux) |
+
+### List view
+
+Press `v` to switch between kanban and list views. The list view shows all tasks in a flat, scrollable list grouped by repo with status-based sorting (active first, then needs review, pending, paused, done).
+
+#### Full list mode
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Navigate items |
+| `Tab` / `Shift-Tab` | Cycle repo filter |
+| `Enter` | Open task or toggle group collapse |
+| `>` / `<` | Move task to next/previous status |
+| `:` / `"` | Reorder task up/down |
+| `r` | Reopen a done task |
+| `t` | Rename the focused task |
+| `s` | Shell popup |
+| `x` | Mark task as done (or remove if already done) |
+| `d` | Toggle show/hide done tasks |
+| `H` | Open session history modal |
+| `c` | Open new task modal |
+| `b` | Toggle split view (sidebar + Claude session pane) |
+| `v` | Switch back to kanban view |
+| `Esc` | Collapse current group |
+| `q` | Quit |
+
+#### Sidebar mode (split view)
+
+Press `b` in list mode to open a split pane: a narrow task sidebar on the left (40%) and the selected task's Claude session on the right (60%).
+
+| Key | Action |
+|---|---|
+| `j` / `k` | Navigate items in sidebar |
+| `Enter` / `l` | Focus the Claude session pane |
+| `>` / `<` | Move task to next/previous status |
+| `r` | Reopen a done task |
+| `t` | Rename the focused task |
+| `s` | Shell popup |
+| `x` | Mark task as done (or remove if already done) |
+| `d` | Toggle show/hide done tasks |
+| `H` | Open session history modal |
+| `Tab` | Cycle repo filter |
+| `b` | Close split, return to full list |
+| `Esc` | Close split |
+| `q` | Quit |
 
 ### Cron row
 
@@ -204,9 +251,11 @@ Press `c` in the dashboard to open a centered modal overlay for creating tasks. 
 
 Navigate fields with `Tab`/`Shift-Tab`. Press `Enter` to create and immediately start the task. On terminals narrower than 40 columns, the modal falls back to sequential prompts.
 
-### Session tracking
+### Session tracking and history
 
 Each task stores a session UID so that `resume` uses `claude --resume <uid>` instead of the less precise `--continue`. Sessions are captured automatically via hooks. If a tmux window dies (e.g., Claude exits), the dashboard detects it and cleans up the window on the next interaction.
+
+Tasks maintain a history stack of up to 10 previous session UIDs. Press `H` in the dashboard (kanban or list mode) to open the session history modal, where you can browse previous sessions and switch to any of them. The selected session becomes the active one for future resume operations.
 
 ## Cron jobs
 
@@ -267,7 +316,7 @@ All state is stored globally at `~/.cloard-board/state.json`:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "next_task_id": 4,
   "next_cron_id": 1,
   "next_run_id": 1,
@@ -275,7 +324,10 @@ All state is stored globally at `~/.cloard-board/state.json`:
     { "name": "my-api", "path": "/Users/you/code/my-api", "type": "git", "base_branch": "main" }
   ],
   "tasks": [
-    { "id": "t-001", "title": "Fix auth bug", "repo": "my-api", "status": "active" }
+    {
+      "id": "t-001", "title": "Fix auth bug", "repo": "my-api", "status": "active",
+      "session_uid": "abc-123", "session_history": ["abc-123"]
+    }
   ],
   "cron_jobs": [],
   "cron_runs": []
@@ -283,6 +335,8 @@ All state is stored globally at `~/.cloard-board/state.json`:
 ```
 
 Task IDs are auto-generated (`t-001`, `t-002`, ...) and globally unique across all repos. Cron job IDs follow the same pattern (`cj-001`, `cj-002`, ...) with run IDs as `cr-001`, `cr-002`, etc.
+
+Each task stores a `session_history` array (up to 10 entries, newest first) so you can switch between previous Claude sessions using the `H` key in the dashboard.
 
 ## Dependencies
 
