@@ -352,8 +352,8 @@ echo "C: List render functions structure"
 grep -q "group:\*|cron_group:\*) _lih=1" "$BOARD"
 assert_eq "group items have height 1" "0" "$?"
 
-grep -q "task:\*|cron:\*.*_lih=2" "$BOARD"
-assert_eq "task items have height 2" "0" "$?"
+grep -q "task:\*|cron:\*.*_lih=1" "$BOARD"
+assert_eq "task items have height 1" "0" "$?"
 
 # Group header uses expand/collapse arrows
 grep -q '▼' "$BOARD"
@@ -362,21 +362,21 @@ assert_eq "expanded arrow ▼ present" "0" "$?"
 grep -q '▶' "$BOARD"
 assert_eq "collapsed arrow ▶ present" "0" "$?"
 
-# Task card status badges
-grep -q '● Active' "$BOARD"
-assert_eq "active badge present" "0" "$?"
+# Task card single-char status badges
+grep -q 'badge_char="●"' "$BOARD"
+assert_eq "active badge_char present" "0" "$?"
 
-grep -q '◆ Review' "$BOARD"
-assert_eq "review badge present" "0" "$?"
+grep -q 'badge_char="◆"' "$BOARD"
+assert_eq "review badge_char present" "0" "$?"
 
-grep -q '○ Pending' "$BOARD"
-assert_eq "pending badge present" "0" "$?"
+grep -q 'badge_char="○"' "$BOARD"
+assert_eq "pending badge_char present" "0" "$?"
 
-grep -q '◫ Paused' "$BOARD"
-assert_eq "paused badge present" "0" "$?"
+grep -q 'badge_char="◫"' "$BOARD"
+assert_eq "paused badge_char present" "0" "$?"
 
-grep -q '✓ Done' "$BOARD"
-assert_eq "done badge present" "0" "$?"
+grep -q 'badge_char="✓"' "$BOARD"
+assert_eq "done badge_char present" "0" "$?"
 
 # ── D: Split-pane lifecycle ─────────────────────────────────────────────────
 
@@ -449,13 +449,13 @@ assert_eq "list mode rendering branch present" "0" "$?"
 grep -q 'b).*Toggle split view' "$BOARD"
 assert_eq "b key handler for split toggle" "0" "$?"
 
-# D key for done toggle in list mode
-grep -q 'D).*Toggle show done' "$BOARD"
+# D key for done toggle / cron delete in list mode
+grep -q 'D).*Delete scheduled cron.*toggle show done' "$BOARD"
 assert_eq "D key handler for done toggle" "0" "$?"
 
-# Tab jumps between groups
-grep -q 'Tab.*jump.*cursor.*to.*next.*group' "$BOARD"
-assert_eq "Tab jumps between groups" "0" "$?"
+# Tab cycles repo filter
+grep -q 'Tab.*cycle.*repo.*filter' "$BOARD"
+assert_eq "Tab cycles repo filter" "0" "$?"
 
 # Context transfer sets correct kanban state
 grep -q 'cur_repo_idx=\$ri' "$BOARD"
@@ -579,11 +579,36 @@ assert_eq "cron items: active first, then review, then scheduled" "$expected_cro
 grep -q '_view_mode.*==.*kanban.*&&.*_has_cron_data' "$BOARD"
 assert_eq "cron row only renders in kanban mode" "0" "$?"
 
+# ── I: Stale window cleanup ────────────────────────────────────────────────
+
+echo ""
+echo "I: Stale window cleanup"
+
+# _purge_stale_windows function present
+grep -q '_purge_stale_windows()' "$BOARD"
+assert_eq "_purge_stale_windows function present" "0" "$?"
+
+# _purge_stale_windows has iteration limit (prevents infinite loop)
+grep -q '_pw_i -lt 50' "$BOARD"
+assert_eq "_purge_stale_windows has iteration limit" "0" "$?"
+
+# _split_open calls _purge_stale_windows
+result_open=$(sed -n '/_split_open()/,/^}/p' "$BOARD" | grep '_purge_stale_windows')
+assert_match "_split_open purges stale windows" '_purge_stale_windows' "$result_open"
+
+# _split_switch_session calls _purge_stale_windows for both old and new task
+result_switch=$(sed -n '/_split_switch_session()/,/^}/p' "$BOARD" | grep -c '_purge_stale_windows')
+assert_eq "_split_switch_session purges both old and new task" "2" "$result_switch"
+
+# _split_close calls _purge_stale_windows
+result_close=$(sed -n '/_split_close()/,/^}/p' "$BOARD" | grep '_purge_stale_windows')
+assert_match "_split_close purges stale windows" '_purge_stale_windows' "$result_close"
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Results: ${pass}/${total} passed, ${fail} failed"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 [[ $fail -eq 0 ]] || exit 1

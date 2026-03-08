@@ -423,8 +423,8 @@ echo "POST_CLIP:\${post_clip}"
 echo "FLINES:\${flines_count}"
 echo "MAX_LINES:\${_max_lines}"
 # Post-clip frame should still have significant content (not just status bar)
-echo "HAS_TASK:[[ "\$_frame" == *"t-001"* ]] && echo yes || echo no"
-[[ "\$_frame" == *"t-001"* ]] && echo "HAS_TASK:yes" || echo "HAS_TASK:no"
+echo "HAS_TASK:[[ "\$_frame" == *"Fix authentication"* ]] && echo yes || echo no"
+[[ "\$_frame" == *"Fix authentication"* ]] && echo "HAS_TASK:yes" || echo "HAS_TASK:no"
 SCRIPT
 )
 

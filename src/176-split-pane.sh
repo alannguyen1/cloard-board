@@ -33,11 +33,22 @@ _split_build_cmd() {
 
     update_task_field "$task_id" "status" "active"
     update_task_field "$task_id" "started_at" "$(now_iso)"
-    update_task_field "$task_id" "session_uid" "$session_uid"
+    push_session_history "$task_id" "$session_uid"
   else
     # Resume existing session (active, paused, needs_review, done)
     _sbc_cmd=$(_build_claude_resume_cmd "$task_id")
   fi
+}
+
+# Kill all stale (dead Claude) windows for a task, keeping any live one.
+# Prevents duplicate windows from accumulating across split-pane switches.
+_purge_stale_windows() {
+  local name="$1"
+  local _pw_i=0
+  while [[ $_pw_i -lt 50 ]] && tmux_window_exists "$name" && ! _tmux_claude_alive "$name"; do
+    tmux_kill_window "$name"
+    _pw_i=$((_pw_i + 1))
+  done
 }
 
 # Install/remove tmux keybinding for returning to sidebar from the Claude pane.
@@ -62,16 +73,14 @@ _split_open() {
   _split_task_id="$task_id"
   _split_bind_sidebar_key
 
+  # Clean up stale windows before checking for a live one
+  _purge_stale_windows "$task_id"
+
   if tmux_window_exists "$task_id"; then
-    if _tmux_claude_alive "$task_id"; then
-      # Existing live session: join it into the dashboard as right pane
-      tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
-      tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
-      return 0
-    else
-      # Dead window (Claude exited, bare zsh): clean up first
-      tmux_kill_window "$task_id"
-    fi
+    # Live session found: join it into the dashboard as right pane
+    tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+    return 0
   fi
 
   # Build command and work directory
@@ -93,6 +102,8 @@ _split_switch_session() {
 
   # Preserve the current session by breaking it out to its own window
   if [[ -n "$_split_task_id" ]]; then
+    # Kill stale windows first so break-pane creates the only named window
+    _purge_stale_windows "$_split_task_id"
     tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null || true
   fi
 
@@ -106,14 +117,14 @@ _split_switch_session() {
     return 1
   fi
 
+  # Clean up stale windows for the target task
+  _purge_stale_windows "$new_task_id"
+
   if tmux_window_exists "$new_task_id"; then
-    if _tmux_claude_alive "$new_task_id"; then
-      tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
-      tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
-      return 0
-    else
-      tmux_kill_window "$new_task_id"
-    fi
+    # Live session found: join it
+    tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+    return 0
   fi
 
   # Build command and work directory for the new task
@@ -132,6 +143,8 @@ _split_switch_session() {
 # Close the split view, preserving the running session in its own tmux window.
 _split_close() {
   if [[ -n "$_split_task_id" ]]; then
+    # Kill stale windows first so break-pane creates the only named window
+    _purge_stale_windows "$_split_task_id"
     # Try to preserve as named window; fall back to killing the pane
     tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null \
       || tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null \

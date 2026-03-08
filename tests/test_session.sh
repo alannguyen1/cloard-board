@@ -37,7 +37,7 @@ assert "--session-id flag used in cmd_start" \
   'sed -n "/^cmd_start/,/^cmd_/p" "$SCRIPT" | grep -q "\-\-session-id"'
 
 assert "session_uid stored after window creation" \
-  'sed -n "/^cmd_start/,/^cmd_/p" "$SCRIPT" | grep -q "update_task_field.*session_uid"'
+  'sed -n "/^cmd_start/,/^cmd_/p" "$SCRIPT" | grep -q "push_session_history"'
 
 # ── Resume uses --resume with session_uid ──────────────────────────
 section "Resume uses --resume"
@@ -100,7 +100,7 @@ assert "dashboard pending uses --session-id" \
 section "Session capture logic"
 
 assert "capture checks for existing session_uid" \
-  'sed -n "/^cmd__capture_session_uid/,/^}/p" "$SCRIPT" | grep -q "already set"'
+  'sed -n "/^cmd__capture_session_uid/,/^}/p" "$SCRIPT" | grep -q "uid.*existing"'
 
 assert "capture scans .claude/projects for session files" \
   'sed -n "/^cmd__capture_session_uid/,/^}/p" "$SCRIPT" | grep -q "\.claude/projects"'

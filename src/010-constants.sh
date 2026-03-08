@@ -6,6 +6,7 @@ readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
 readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
 readonly HOOK_VERSION="2"
+readonly MAX_SESSION_HISTORY=10
 
 # ── Colours (ANSI) ────────────────────────────────────────────────────────────
 readonly C_RESET=$'\e[0m'

@@ -83,6 +83,7 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     t           Rename focused task
     p           Pause task
     r           Reopen done task (restart session)
+    H           Browse session history for selected task
     x           Done/remove task
     </>         Move task left/right (change status)
     :/"         Reorder card up/down within column
@@ -106,6 +107,7 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     Tab         Jump to next group header
     Shift-Tab   Jump to previous group header
     </>         Cycle task status left/right
+    H           Browse session history for selected task
     D           Toggle show/hide done tasks
     b           Toggle split view (sidebar + Claude session)
     v           Switch back to kanban view

@@ -9,7 +9,7 @@ _list_item_height() {
   local item="${_list_items[$1]:-}"
   case "$item" in
     group:*|cron_group:*) _lih=1 ;;
-    task:*|cron:*)        _lih=2 ;;
+    task:*|cron:*)        _lih=1 ;;
     *)                    _lih=1 ;;
   esac
 }
@@ -17,13 +17,7 @@ _list_item_height() {
 # Compute the content-line offset of item at index $1 by summing heights of all
 # preceding items. Result in _lcl (avoids subshell).
 _list_content_line_of() {
-  local _idx="$1"
-  _lcl=0
-  local _li
-  for (( _li=0; _li<_idx; _li++ )); do
-    _list_item_height "$_li"
-    _lcl=$((_lcl + _lih))
-  done
+  _lcl=$1
 }
 
 # ── Scroll management ───────────────────────────────────────────────────────
@@ -101,9 +95,10 @@ _render_list_cron_header() {
   _frame+=$'\n'
 }
 
-# ── Task card (2 lines) ─────────────────────────────────────────────────────
+# ── Task card (1 line) ──────────────────────────────────────────────────────
 
-# Render a two-line task card. Appends to _frame.
+# Render a single-line task card. Appends to _frame.
+# Format: > ● Fix authentication bug          ⚙ #42
 # $1 = task_id, $2 = available width, $3 = 1 if selected
 _render_list_task_card() {
   local task_id="$1"
@@ -115,27 +110,28 @@ _render_list_task_card() {
   local claude="${_task_claude[$task_id]:-}"
   local pr="${_task_pr[$task_id]:-}"
 
-  # Status badge
-  local badge="" badge_color=""
+  # Single-char status badge
+  local badge_char="" badge_color=""
   case "$tstatus" in
-    active)       badge="● Active";       badge_color="$C_GREEN" ;;
-    needs_review) badge="◆ Review";       badge_color="$C_YELLOW" ;;
-    pending)      badge="○ Pending";      badge_color="$C_DIM" ;;
-    paused)       badge="◫ Paused";       badge_color="$C_CYAN" ;;
-    done)         badge="✓ Done";         badge_color="$C_DIM" ;;
+    active)       badge_char="●"; badge_color="$C_GREEN" ;;
+    needs_review) badge_char="◆"; badge_color="$C_YELLOW" ;;
+    pending)      badge_char="○"; badge_color="$C_DIM" ;;
+    paused)       badge_char="◫"; badge_color="$C_CYAN" ;;
+    done)         badge_char="✓"; badge_color="$C_DIM" ;;
   esac
 
-  # Claude status indicator
-  local claude_str=""
-  [[ "$claude" == "working" ]] && claude_str="  ⚙ working"
-  [[ "$claude" == "waiting" ]] && claude_str="  ○ waiting"
-
-  # PR short
-  local pr_short=""
+  # Right-side metadata: claude indicator + PR short
+  local right_meta=""
+  [[ "$claude" == "working" ]] && right_meta="⚙"
+  [[ "$claude" == "waiting" ]] && right_meta="○"
   if [[ -n "$pr" ]]; then
+    local pr_short
     pr_short=$(echo "$pr" | command grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
-    pr_short="  ${pr_short}"
+    [[ -n "$right_meta" ]] && right_meta+=" "
+    right_meta+="$pr_short"
   fi
+  # Add spacing if we have right metadata
+  [[ -n "$right_meta" ]] && right_meta="  ${right_meta}"
 
   local prefix=" "
   local sel_on="" sel_off=""
@@ -145,84 +141,31 @@ _render_list_task_card() {
     sel_off="${C_RESET}"
   fi
 
-  if [[ $width -gt 35 ]]; then
-    # ── Wide format ──
-    # Line 1:  > t-003  Fix authentication bug
-    local title_max=$((width - 10))
-    [[ $title_max -lt 1 ]] && title_max=1
-    local title_str
-    title_str=$(trunc "$title" "$title_max")
-    local _tw=$((width - 10))
-    [[ $_tw -lt 0 ]] && _tw=0
+  # Layout: prefix(1) space(1) badge(1) space(1) title(fill) right_meta
+  local fixed_left=4
+  local right_len=${#right_meta}
+  local title_max=$((width - fixed_left - right_len))
+  [[ $title_max -lt 1 ]] && title_max=1
+  local title_str
+  title_str=$(trunc "$title" "$title_max")
 
-    if [[ "$is_selected" == "1" ]]; then
-      _frame+="${sel_on}${prefix} ${(r:6:)task_id}  ${(r:$_tw:)title_str}${sel_off}"
-    else
-      _frame+="${prefix} ${C_DIM}${(r:6:)task_id}${C_RESET}  ${(r:$_tw:)title_str}"
-    fi
-    _frame+=$'\n'
+  local title_w=$((width - fixed_left - right_len))
+  [[ $title_w -lt 0 ]] && title_w=0
 
-    # Line 2:           ● Active  ⚙ working  #42
-    local detail="${badge}${claude_str}${pr_short}"
-    local detail_max=$((width - 10))
-    [[ $detail_max -lt 1 ]] && detail_max=1
-    detail=$(trunc "$detail" "$detail_max")
-
-    if [[ "$is_selected" == "1" ]]; then
-      local _det_full="         ${detail}"
-      _frame+="${sel_on}${(r:${width}:)_det_full}${sel_off}"
-    else
-      local _dpad_n=$((width - 9 - ${#detail}))
-      local _e=""
-      _frame+="         ${badge_color}${detail}${C_RESET}"
-      [[ $_dpad_n -gt 0 ]] && _frame+="${(r:$_dpad_n:)_e}"
-    fi
-    _frame+=$'\n'
+  if [[ "$is_selected" == "1" ]]; then
+    _frame+="${sel_on}${prefix} ${badge_char} ${(r:$title_w:)title_str}${right_meta}${sel_off}"
   else
-    # ── Narrow format ──
-    # Line 1: > t-003 Fix auth..  ● Active
-    local badge_short
-    case "$tstatus" in
-      active)       badge_short="●" ;;
-      needs_review) badge_short="◆" ;;
-      pending)      badge_short="○" ;;
-      paused)       badge_short="◫" ;;
-      done)         badge_short="✓" ;;
-    esac
-    local title_max=$((width - ${#task_id} - 6))
-    [[ $title_max -lt 4 ]] && title_max=4
-    local title_str
-    title_str=$(trunc "$title" "$title_max")
-
-    local _nw=$((width - 9))
-    [[ $_nw -lt 0 ]] && _nw=0
-    if [[ "$is_selected" == "1" ]]; then
-      _frame+="${sel_on}${prefix} ${(r:5:)task_id} ${(r:$_nw:)title_str} ${badge_short}${sel_off}"
-    else
-      _frame+="${prefix} ${C_DIM}${(r:5:)task_id}${C_RESET} ${(r:$_nw:)title_str} ${badge_color}${badge_short}${C_RESET}"
-    fi
-    _frame+=$'\n'
-
-    # Line 2: additional info or blank
-    local info_str="${claude_str:+${claude_str:2}}${pr_short}"
-    local info_max=$((width - 8))
-    [[ $info_max -lt 1 ]] && info_max=1
-    info_str=$(trunc "$info_str" "$info_max")
-    local _iw=$((width - 7))
-    [[ $_iw -lt 0 ]] && _iw=0
-    if [[ "$is_selected" == "1" ]]; then
-      local _info_full="       ${info_str}"
-      _frame+="${sel_on}${(r:${width}:)_info_full}${sel_off}"
-    else
-      _frame+="       ${C_DIM}${(r:$_iw:)info_str}${C_RESET}"
-    fi
-    _frame+=$'\n'
+    _frame+="${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$title_w:)title_str}${C_DIM}${right_meta}${C_RESET}"
   fi
+  _frame+=$'\n'
 }
 
-# ── Cron card (2 lines) ─────────────────────────────────────────────────────
+# ── Cron card (1 line) ──────────────────────────────────────────────────────
 
-# Render a two-line cron card. Appends to _frame.
+# Render a single-line cron card. Appends to _frame.
+# Scheduled: "  ○ morning-routine              every 30m"
+# Active:    "  ● morning-routine              ● running"
+# Review:    "  ◆ morning-routine              ◆ review"
 # $1 = cron_id, $2 = available width, $3 = 1 if selected
 _render_list_cron_card() {
   local cron_id="$1"
@@ -237,94 +180,58 @@ _render_list_cron_card() {
     sel_off="${C_RESET}"
   fi
 
-  # Determine if this is a job (col 0) or a run (col 1/2)
+  # Determine if this is a job (col 0) or a run (col 1/2/3)
   local rdata="${_cron_run_data[$cron_id]:-}"
+
+  local cron_name="" right_meta="" right_color=""
+  local badge_char="" badge_color=""
 
   if [[ -z "$rdata" ]]; then
     # Scheduled cron job
-    local jname="${_cron_jobs[$cron_id]:-$cron_id}"
+    cron_name="${_cron_jobs[$cron_id]:-$cron_id}"
     local jsched="${_cron_job_schedule[$cron_id]:-}"
     local jenabled="${_cron_job_enabled[$cron_id]:-true}"
-
-    local status_str="scheduled"
-    local status_color="$C_DIM"
     if [[ "$jenabled" != "true" ]]; then
-      status_str="disabled"
-      status_color="$C_RED"
-    fi
-
-    # Line 1: cron ID + job name
-    local id_max=$((width - 3))
-    local id_name="${cron_id}  ${jname}"
-    id_name=$(trunc "$id_name" "$id_max")
-    local _cw=$((width - 2))
-    [[ $_cw -lt 0 ]] && _cw=0
-    if [[ "$is_selected" == "1" ]]; then
-      _frame+="${sel_on}${prefix} ${(r:$_cw:)id_name}${sel_off}"
+      badge_char="⊘"; badge_color="$C_RED"
+      right_meta="disabled"
+      right_color="$C_RED"
+    elif [[ -n "$jsched" ]]; then
+      badge_char="○"; badge_color="$C_DIM"
+      right_meta="$jsched"
+      right_color="$C_DIM"
     else
-      _frame+="${prefix} ${C_DIM}${(r:$_cw:)id_name}${C_RESET}"
+      badge_char="○"; badge_color="$C_DIM"
+      right_meta="scheduled"
+      right_color="$C_DIM"
     fi
-    _frame+=$'\n'
-
-    # Line 2: schedule / status
-    local detail="${status_str}"
-    [[ -n "$jsched" ]] && detail="${jsched}"
-    local detail_max=$((width - 9))
-    [[ $detail_max -lt 1 ]] && detail_max=1
-    detail=$(trunc "$detail" "$detail_max")
-    local _dw=$((width - 7))
-    [[ $_dw -lt 0 ]] && _dw=0
-    if [[ "$is_selected" == "1" ]]; then
-      local _sd_full="       ${detail}"
-      _frame+="${sel_on}${(r:${width}:)_sd_full}${sel_off}"
-    else
-      _frame+="       ${status_color}${(r:$_dw:)detail}${C_RESET}"
-    fi
-    _frame+=$'\n'
   else
-    # Cron run (active or needs_review)
+    # Cron run
     local rjob_id rstat recode rstart rsid rwin
     IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
-    local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
-
-    local status_str="" status_color=""
+    cron_name="${_cron_jobs[$rjob_id]:-$rjob_id}"
     case "$rstat" in
-      active)       status_str="● running";       status_color="$C_GREEN" ;;
-      needs_review) status_str="◆ needs review";  status_color="$C_YELLOW" ;;
-      reviewed)     status_str="✓ reviewed";       status_color="$C_CYAN" ;;
-      *)            status_str="$rstat";           status_color="$C_DIM" ;;
+      active)       badge_char="●"; badge_color="$C_GREEN";  right_meta="● running";  right_color="$C_GREEN" ;;
+      needs_review) badge_char="◆"; badge_color="$C_YELLOW"; right_meta="◆ review";   right_color="$C_YELLOW" ;;
+      reviewed)     badge_char="✓"; badge_color="$C_CYAN";   right_meta="✓ reviewed";  right_color="$C_CYAN" ;;
+      *)            badge_char="○"; badge_color="$C_DIM";     right_meta="$rstat";      right_color="$C_DIM" ;;
     esac
-
-    # Line 1: run ID + job name
-    local id_max=$((width - 3))
-    local id_name="${cron_id}  ${rjname}"
-    id_name=$(trunc "$id_name" "$id_max")
-    local _cw=$((width - 2))
-    [[ $_cw -lt 0 ]] && _cw=0
-    if [[ "$is_selected" == "1" ]]; then
-      _frame+="${sel_on}${prefix} ${(r:$_cw:)id_name}${sel_off}"
-    else
-      _frame+="${prefix} ${C_DIM}${(r:$_cw:)id_name}${C_RESET}"
-    fi
-    _frame+=$'\n'
-
-    # Line 2: status + exit code
-    local exit_info=""
-    [[ -n "$recode" && "$recode" != "null" && "$rstat" != "active" ]] && exit_info="  exit ${recode}"
-    local detail="${status_str}${exit_info}"
-    local detail_max=$((width - 9))
-    [[ $detail_max -lt 1 ]] && detail_max=1
-    detail=$(trunc "$detail" "$detail_max")
-    local _dw=$((width - 7))
-    [[ $_dw -lt 0 ]] && _dw=0
-    if [[ "$is_selected" == "1" ]]; then
-      local _cr_full="       ${detail}"
-      _frame+="${sel_on}${(r:${width}:)_cr_full}${sel_off}"
-    else
-      _frame+="       ${status_color}${(r:$_dw:)detail}${C_RESET}"
-    fi
-    _frame+=$'\n'
   fi
+
+  # Layout: prefix(1) space(1) badge(1) space(1) name(fill) "  " right_meta
+  local fixed_left=4
+  local right_str="  ${right_meta}"
+  local right_len=${#right_str}
+  local name_w=$((width - fixed_left - right_len))
+  [[ $name_w -lt 1 ]] && name_w=1
+  local name_str
+  name_str=$(trunc "$cron_name" "$name_w")
+
+  if [[ "$is_selected" == "1" ]]; then
+    _frame+="${sel_on}${prefix} ${badge_char} ${(r:$name_w:)name_str}${right_str}${sel_off}"
+  else
+    _frame+="${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$name_w:)name_str}${right_color}${right_str}${C_RESET}"
+  fi
+  _frame+=$'\n'
 }
 
 # ── Scrollbar ────────────────────────────────────────────────────────────────
@@ -434,10 +341,11 @@ _render_list_full() {
   fi
 }
 
-# ── Sidebar task card (compact, title-first layout) ──────────────────────────
+# ── Sidebar task card (compact, single-line) ─────────────────────────────────
 
-# Render a two-line sidebar task card. Title gets full width on line 1,
-# id + status badge on line 2.
+# Render a single-line sidebar task card. No task ID or PR; sidebar is narrow.
+# Format: > ● Fix auth bug     ⚙
+# $1 = task_id, $2 = available width, $3 = 1 if selected
 _render_sidebar_task_card() {
   local task_id="$1"
   local width="$2"
@@ -469,36 +377,20 @@ _render_sidebar_task_card() {
     sel_off="${C_RESET}"
   fi
 
-  # Line 1: > Title text here (full width minus 2 for prefix+space)
-  local title_max=$((width - 2))
+  # Layout: prefix(1) space(1) badge(1) space(1) title(fill) claude_char
+  local fixed=4
+  local cc_len=${#claude_char}
+  local title_max=$((width - fixed - cc_len))
   [[ $title_max -lt 1 ]] && title_max=1
   local title_str
   title_str=$(trunc "$title" "$title_max")
-  local _tw=$((width - 2))
-  [[ $_tw -lt 0 ]] && _tw=0
+  local title_w=$((width - fixed - cc_len))
+  [[ $title_w -lt 0 ]] && title_w=0
 
   if [[ "$is_selected" == "1" ]]; then
-    _frame+="${sel_on}${prefix} ${(r:$_tw:)title_str}${sel_off}"
+    _frame+="${sel_on}${prefix} ${badge_char} ${(r:$title_w:)title_str}${claude_char}${sel_off}"
   else
-    _frame+="${sel_on}${prefix} ${(r:$_tw:)title_str}${sel_off}"
-  fi
-  _frame+=$'\n'
-
-  # Line 2:   t-002 ● ⚙  (id + badge + claude indicator, dimmed)
-  local detail="${task_id} ${badge_char}${claude_char}"
-  local _dw=$((width - 3))
-  [[ $_dw -lt 0 ]] && _dw=0
-  if [[ "$is_selected" == "1" ]]; then
-    local _det="  ${detail}"
-    _frame+="${sel_on}${(r:${width}:)_det}${sel_off}"
-  else
-    _frame+="  ${C_DIM}${task_id}${C_RESET} ${badge_color}${badge_char}${C_RESET}${C_DIM}${claude_char}${C_RESET}"
-    local detail_plain_len=$((${#task_id} + 1 + 1 + ${#claude_char}))
-    local _pad_n=$((width - 2 - detail_plain_len))
-    if [[ $_pad_n -gt 0 ]]; then
-      local _e=""
-      _frame+="${(r:$_pad_n:)_e}"
-    fi
+    _frame+="${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$title_w:)title_str}${C_DIM}${claude_char}${C_RESET}"
   fi
   _frame+=$'\n'
 }
@@ -590,6 +482,29 @@ _list_get_selected_cron_id() {
     cron:*) _tid="${item#cron:}" ;;
     *)      _tid=""; return 1 ;;
   esac
+}
+
+# Get the kanban-column-equivalent for a cron item selected in list mode.
+# Sets _list_cron_col: 0=scheduled, 1=active, 2=needs_review, 3=reviewed.
+# Returns 1 if not a cron item.
+_list_get_cron_col() {
+  local item="${_list_items[$_list_cursor]:-}"
+  [[ "$item" != cron:* ]] && return 1
+  local cid="${item#cron:}"
+  local rdata="${_cron_run_data[$cid]:-}"
+  if [[ -z "$rdata" ]]; then
+    _list_cron_col=0  # Scheduled job
+  else
+    local rjob_id rstat recode rstart rsid rwin
+    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+    case "$rstat" in
+      active)       _list_cron_col=1 ;;
+      needs_review) _list_cron_col=2 ;;
+      reviewed)     _list_cron_col=3 ;;
+      *)            _list_cron_col=0 ;;
+    esac
+  fi
+  return 0
 }
 
 # ── Key handler ──────────────────────────────────────────────────────────────
@@ -695,7 +610,7 @@ _list_handle_key() {
                   _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
                   update_task_field "$sel_id" "status" "active"
                   update_task_field "$sel_id" "started_at" "$(now_iso)"
-                  update_task_field "$sel_id" "session_uid" "$dash_session_uid"
+                  push_session_history "$sel_id" "$dash_session_uid"
                   tmux_select_window "$sel_id"
                   ;;
                 paused)
@@ -809,37 +724,77 @@ _list_handle_key() {
       esac
       ;;
 
-    $'\t') # Tab: jump cursor to next group/cron_group header
-      local _ti
-      for (( _ti=_list_cursor + 1; _ti <= max_idx; _ti++ )); do
-        case "${_list_items[$_ti]:-}" in
-          group:*|cron_group:*)
-            _list_cursor=$_ti
-            break
-            ;;
-        esac
-      done
+    $'\t') # Tab: cycle repo filter forward (matches kanban Tab behavior)
+      local total_filters=$(( ${#_repo_names[@]} + 1 ))
+      filter_idx=$(( (filter_idx + 1) % total_filters ))
+      if [[ $filter_idx -eq 0 ]]; then
+        filter_mode="all"
+        # Expand all groups
+        _list_group_collapsed=()
+      else
+        filter_mode="${_repo_names[$((filter_idx - 1))]}"
+        # Collapse all groups except the selected repo; expand that one
+        local _tf_rn
+        for _tf_rn in "${_repo_names[@]}"; do
+          _list_group_collapsed[$_tf_rn]=1
+        done
+        unset "_list_group_collapsed[$filter_mode]"
+        _list_group_collapsed[__cron]=1
+        # Move cursor to that repo's group header
+        local _tf_i
+        for (( _tf_i=0; _tf_i<${#_list_items[@]}; _tf_i++ )); do
+          [[ "${_list_items[$_tf_i]}" == "group:${filter_mode}" ]] && { _list_cursor=$_tf_i; break; }
+        done
+      fi
+      _list_needs_rebuild=1
       ;;
 
-    SHIFT_TAB) # Shift-Tab: jump cursor to previous group/cron_group header
-      local _ti
-      for (( _ti=_list_cursor - 1; _ti >= 0; _ti-- )); do
-        case "${_list_items[$_ti]:-}" in
-          group:*|cron_group:*)
-            _list_cursor=$_ti
-            break
-            ;;
-        esac
-      done
+    SHIFT_TAB) # Shift-Tab: cycle repo filter backward
+      local total_filters=$(( ${#_repo_names[@]} + 1 ))
+      filter_idx=$(( (filter_idx - 1 + total_filters) % total_filters ))
+      if [[ $filter_idx -eq 0 ]]; then
+        filter_mode="all"
+        _list_group_collapsed=()
+      else
+        filter_mode="${_repo_names[$((filter_idx - 1))]}"
+        local _tf_rn
+        for _tf_rn in "${_repo_names[@]}"; do
+          _list_group_collapsed[$_tf_rn]=1
+        done
+        unset "_list_group_collapsed[$filter_mode]"
+        _list_group_collapsed[__cron]=1
+        local _tf_i
+        for (( _tf_i=0; _tf_i<${#_list_items[@]}; _tf_i++ )); do
+          [[ "${_list_items[$_tf_i]}" == "group:${filter_mode}" ]] && { _list_cursor=$_tf_i; break; }
+        done
+      fi
+      _list_needs_rebuild=1
       ;;
 
-    D) # Toggle show done tasks
+    d) # Toggle show/hide done tasks
       if [[ "$_show_done" == "1" ]]; then
         _show_done=0
       else
         _show_done=1
       fi
       _list_needs_rebuild=1
+      ;;
+
+    D) # Delete scheduled cron job
+      local _d_item="${_list_items[$_list_cursor]:-}"
+      if [[ "$_d_item" == cron:* ]]; then
+        local _d_cid="${_d_item#cron:}"
+        local _d_rdata="${_cron_run_data[$_d_cid]:-}"
+        if [[ -z "$_d_rdata" ]]; then
+          cursor_show
+          stty echo
+          echo ""
+          (cmd_cron_remove "$_d_cid") 2>&1 || true
+          stty -echo
+          cursor_hide
+          _list_needs_rebuild=1
+        fi
+      fi
       ;;
 
     b) # Toggle split view
@@ -888,6 +843,54 @@ _list_handle_key() {
             _list_needs_rebuild=1
             ;;
         esac
+      fi
+      ;;
+
+    ':') # Move task up: swap with previous same-status/same-repo task
+      local _r_item="${_list_items[$_list_cursor]:-}"
+      if [[ "$_r_item" == task:* ]]; then
+        local _r_id="${_r_item#task:}"
+        local _r_repo="${_task_repo[$_r_id]:-}"
+        local _r_st="${_task_status[$_r_id]:-}"
+        # Find immediately previous task in same repo with same status
+        local _r_i
+        for (( _r_i=_list_cursor - 1; _r_i >= 0; _r_i-- )); do
+          local _r_prev="${_list_items[$_r_i]:-}"
+          [[ "$_r_prev" != task:* ]] && break  # Hit a group header; stop
+          local _r_pid="${_r_prev#task:}"
+          if [[ "${_task_repo[$_r_pid]:-}" == "$_r_repo" && "${_task_status[$_r_pid]:-}" == "$_r_st" ]]; then
+            _swap_tasks_in_state "$_r_id" "$_r_pid"
+            _list_cursor=$_r_i
+            _list_needs_rebuild=1
+            _list_follow_id="$_r_id"
+            break
+          fi
+          break  # Only check the immediately previous task item
+        done
+      fi
+      ;;
+
+    '"') # Move task down: swap with next same-status/same-repo task
+      local _r_item="${_list_items[$_list_cursor]:-}"
+      if [[ "$_r_item" == task:* ]]; then
+        local _r_id="${_r_item#task:}"
+        local _r_repo="${_task_repo[$_r_id]:-}"
+        local _r_st="${_task_status[$_r_id]:-}"
+        local _r_max=$((${#_list_items[@]} - 1))
+        local _r_i
+        for (( _r_i=_list_cursor + 1; _r_i <= _r_max; _r_i++ )); do
+          local _r_next="${_list_items[$_r_i]:-}"
+          [[ "$_r_next" != task:* ]] && break  # Hit a group header; stop
+          local _r_nid="${_r_next#task:}"
+          if [[ "${_task_repo[$_r_nid]:-}" == "$_r_repo" && "${_task_status[$_r_nid]:-}" == "$_r_st" ]]; then
+            _swap_tasks_in_state "$_r_id" "$_r_nid"
+            _list_cursor=$_r_i
+            _list_needs_rebuild=1
+            _list_follow_id="$_r_id"
+            break
+          fi
+          break  # Only check the immediately next task item
+        done
       fi
       ;;
 

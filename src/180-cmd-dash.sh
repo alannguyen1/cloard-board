@@ -768,26 +768,30 @@ cmd__dash_loop() {
         fi
         ;;
       '') ;; # Timeout: just refresh
-      $'\t') # Tab: next filter
-        local total_filters=$(( ${#_repo_names[@]} + 1 ))
-        filter_idx=$(( (filter_idx + 1) % total_filters ))
-        if [[ $filter_idx -eq 0 ]]; then
-          filter_mode="all"
-          nav_mode="repo"
-        else
-          filter_mode="${_repo_names[$((filter_idx - 1))]}"
-          nav_mode="card"
+      $'\t') # Tab: next filter (kanban only; list handles its own)
+        if [[ "$_view_mode" == "kanban" ]]; then
+          local total_filters=$(( ${#_repo_names[@]} + 1 ))
+          filter_idx=$(( (filter_idx + 1) % total_filters ))
+          if [[ $filter_idx -eq 0 ]]; then
+            filter_mode="all"
+            nav_mode="repo"
+          else
+            filter_mode="${_repo_names[$((filter_idx - 1))]}"
+            nav_mode="card"
+          fi
         fi
         ;;
-      SHIFT_TAB) # Shift-Tab: previous filter
-        local total_filters=$(( ${#_repo_names[@]} + 1 ))
-        filter_idx=$(( (filter_idx - 1 + total_filters) % total_filters ))
-        if [[ $filter_idx -eq 0 ]]; then
-          filter_mode="all"
-          nav_mode="repo"
-        else
-          filter_mode="${_repo_names[$((filter_idx - 1))]}"
-          nav_mode="card"
+      SHIFT_TAB) # Shift-Tab: previous filter (kanban only)
+        if [[ "$_view_mode" == "kanban" ]]; then
+          local total_filters=$(( ${#_repo_names[@]} + 1 ))
+          filter_idx=$(( (filter_idx - 1 + total_filters) % total_filters ))
+          if [[ $filter_idx -eq 0 ]]; then
+            filter_mode="all"
+            nav_mode="repo"
+          else
+            filter_mode="${_repo_names[$((filter_idx - 1))]}"
+            nav_mode="card"
+          fi
         fi
         ;;
       ESC) # Escape: zoom out to repo mode
@@ -807,8 +811,10 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      $'\n'|$'\r') # Enter
-        if [[ $cron_row_selected -eq 1 ]]; then
+      $'\n'|$'\r') # Enter (kanban only; list mode handles its own Enter below)
+        if [[ "$_view_mode" != "kanban" ]]; then
+          : # handled by list mode dispatch below
+        elif [[ $cron_row_selected -eq 1 ]]; then
           # Handle cron row Enter
           if [[ "$nav_mode" == "repo" ]]; then
             nav_mode="card"
@@ -934,7 +940,7 @@ cmd__dash_loop() {
                 _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
                 update_task_field "$sel_id" "status" "active"
                 update_task_field "$sel_id" "started_at" "$(now_iso)"
-                update_task_field "$sel_id" "session_uid" "$dash_session_uid"
+                push_session_history "$sel_id" "$dash_session_uid"
                 tmux_select_window "$sel_id"
                 ;;
               paused)
@@ -1044,8 +1050,9 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      ':') # Move card up in column
-        if _get_selected_id; then
+      ':') # Move card up in column (kanban only; list handles its own)
+        if [[ "$_view_mode" != "kanban" ]]; then true
+        elif _get_selected_id; then
           local sel_id="$_tid"
           local active_repo
           if [[ "$filter_mode" != "all" ]]; then
@@ -1066,8 +1073,9 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      '"') # Move card down in column
-        if _get_selected_id; then
+      '"') # Move card down in column (kanban only; list handles its own)
+        if [[ "$_view_mode" != "kanban" ]]; then true
+        elif _get_selected_id; then
           local sel_id="$_tid"
           local active_repo
           if [[ "$filter_mode" != "all" ]]; then
@@ -1090,6 +1098,19 @@ cmd__dash_loop() {
         fi
         ;;
       c) # Create new task (modal) or cron job
+        if [[ "$_view_mode" == "list" ]]; then
+          local _c_item="${_list_items[$_list_cursor]:-}"
+          if [[ "$_c_item" == cron_group:* || "$_c_item" == cron:* ]]; then
+            cursor_show
+            stty echo
+            echo ""
+            echo "${C_CYAN}Creating new cron job...${C_RESET}"
+            (cmd_cron_add) 2>&1 || true
+            stty -echo
+            cursor_hide
+            continue
+          fi
+        fi
         if [[ $cron_row_selected -eq 1 ]]; then
           cursor_show
           stty echo
@@ -1201,7 +1222,36 @@ cmd__dash_loop() {
         fi
         ;;
       x) # Done/delete selected task OR cron toggle/review
-        if [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
+        if [[ "$_view_mode" == "list" ]] && _list_get_selected_cron_id; then
+          local cron_item="$_tid"
+          _list_get_cron_col
+          case $_list_cron_col in
+            0)  # Scheduled: toggle enable/disable
+              local is_enabled="${_cron_job_enabled[$cron_item]:-true}"
+              cursor_show
+              stty echo
+              if [[ "$is_enabled" == "true" ]]; then
+                printf "${C_YELLOW}Disable cron job ${cron_item}? [y/N]: ${C_RESET}"
+                local dconfirm=""
+                read -r dconfirm
+                [[ "$dconfirm" =~ ^[yY]$ ]] && (cmd_cron_disable "$cron_item") 2>&1 || true
+              else
+                printf "${C_CYAN}Enable cron job ${cron_item}? [Y/n]: ${C_RESET}"
+                local econfirm=""
+                read -r econfirm
+                [[ ! "$econfirm" =~ ^[nN]$ ]] && (cmd_cron_enable "$cron_item") 2>&1 || true
+              fi
+              stty -echo
+              cursor_hide
+              ;;
+            2)  # Needs Review: mark reviewed
+              (cmd_cron_review "$cron_item") 2>&1 || true
+              ;;
+            3)  # Done: archive
+              update_cron_run_field "$cron_item" "status" "archived"
+              ;;
+          esac
+        elif [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
           local cron_item="$_tid"
           case $cur_cron_col in
             0)  # Scheduled: toggle enable/disable
@@ -1239,25 +1289,14 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      d) # Show diff
-        if _get_active_task_id; then
-          local sel_id="$_tid"
-          local sel_repo="${_task_repo[$sel_id]}"
-          local sel_rpath
-          sel_rpath=$(repo_path "$sel_repo")
-          local diff_dir=""
-          if [[ "${_task_wtmode[$sel_id]}" == "none" ]]; then
-            diff_dir="$sel_rpath"
-          else
-            diff_dir=$(find_worktree_path "$sel_id" "$sel_rpath")
-          fi
-          if [[ -n "$diff_dir" && -d "$diff_dir" ]]; then
-            cursor_show
-            stty echo
-            (cd "$diff_dir" && git diff --stat && echo "" && git diff) | less
-            stty -echo
-            cursor_hide
-          fi
+      d) # Toggle show/hide done tasks
+        if [[ "$_show_done" == "1" ]]; then
+          _show_done=0
+        else
+          _show_done=1
+        fi
+        if [[ "$_view_mode" == "list" ]]; then
+          _list_needs_rebuild=1
         fi
         ;;
       s) # Shell popup
@@ -1421,7 +1460,7 @@ cmd__dash_loop() {
                 local new_uid
                 new_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
                 dash_claude_cmd="claude --session-id ${new_uid} --dangerously-skip-permissions '${escaped}'"
-                update_task_field "$sel_id" "session_uid" "$new_uid"
+                push_session_history "$sel_id" "$new_uid"
               else
                 dash_claude_cmd=$(_build_claude_resume_cmd "$sel_id")
               fi
@@ -1431,6 +1470,46 @@ cmd__dash_loop() {
               update_task_field_raw "$sel_id" "branch" "null"
               update_task_field_raw "$sel_id" "completed_at" "null"
               tmux_select_window "$sel_id"
+            fi
+          fi
+        fi
+        ;;
+      H) # Session history
+        if _get_active_task_id; then
+          local sel_id="$_tid"
+          if _session_history_modal "$sel_id"; then
+            # User selected a session; relaunch with updated session_uid
+            local sel_repo="${_task_repo[$sel_id]}"
+            local sel_rpath
+            sel_rpath=$(repo_path "$sel_repo")
+
+            # Close split pane if showing this task
+            local was_split=0
+            if [[ "${_split_active:-0}" == "1" && "$_split_task_id" == "$sel_id" ]]; then
+              _split_close
+              was_split=1
+            fi
+
+            # Kill existing window and relaunch with the selected session
+            tmux_kill_window "$sel_id"
+            local resume_cmd
+            resume_cmd=$(_build_claude_resume_cmd "$sel_id")
+            local wt_mode="${_task_wtmode[$sel_id]}"
+            if [[ "$wt_mode" == "none" ]]; then
+              _tmux_launch_claude "$sel_id" "$sel_rpath" "$resume_cmd"
+            else
+              local wt_p
+              wt_p=$(find_worktree_path "$sel_id" "$sel_rpath")
+              _tmux_launch_claude "$sel_id" "${wt_p:-$sel_rpath}" "$resume_cmd"
+            fi
+
+            if [[ $was_split -eq 1 ]]; then
+              # Re-open in split pane
+              _split_open "$sel_id"
+            else
+              cursor_show
+              tmux_select_window "$sel_id"
+              cursor_hide
             fi
           fi
         fi
@@ -1468,7 +1547,7 @@ cmd__dash_loop() {
     # ── List mode key dispatch (navigation + list-specific keys) ──
     if [[ "$_view_mode" == "list" ]]; then
       case "$key" in
-        j|k|$'\t'|SHIFT_TAB|D|b|ESC)
+        j|k|$'\t'|SHIFT_TAB|D|b|l|ESC|':'|'"')
           _list_handle_key "$key"
           ;;
         $'\n'|$'\r') # Enter in list mode

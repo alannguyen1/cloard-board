@@ -3,13 +3,17 @@ ensure_global_state() {
   mkdir -p "$GLOBAL_DIR"
 
   if [[ ! -f "$GLOBAL_STATE" ]]; then
-    jq -n '{version: 3, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
+    jq -n '{version: 4, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
   else
     # Check for schema migrations
     local _ver
     _ver=$(jq -r '.version // 0' "$GLOBAL_STATE" 2>/dev/null) || _ver=0
     if [[ "$_ver" == "2" ]]; then
       _migrate_v2_to_v3
+      _ver=3
+    fi
+    if [[ "$_ver" == "3" ]]; then
+      _migrate_v3_to_v4
     fi
   fi
 
@@ -92,6 +96,24 @@ _migrate_v2_to_v3() {
     && mv "$tmp" "$GLOBAL_STATE"
   _unlock_state
   ok "state schema migrated to v3"
+}
+
+_migrate_v3_to_v4() {
+  info "migrating state schema v3 -> v4 (adding session history)..."
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.migrate.XXXXXX")
+  jq '.version = 4
+    | .tasks = [.tasks[] |
+        if .session_uid and .session_uid != null and .session_uid != "" then
+          .session_history = [.session_uid]
+        else
+          .session_history = []
+        end
+      ]' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  ok "state schema migrated to v4"
 }
 
 # Auto-migrate old per-repo state on first run from that directory

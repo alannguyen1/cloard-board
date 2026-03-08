@@ -15,6 +15,7 @@ readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
 readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
 readonly HOOK_VERSION="2"
+readonly MAX_SESSION_HISTORY=10
 
 # ── Colours (ANSI) ────────────────────────────────────────────────────────────
 readonly C_RESET=$'\e[0m'
@@ -146,6 +147,63 @@ _swap_tasks_in_state() {
       .tasks[$idx_b] = $entries[$idx_a].value
     else . end
   ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+# Push a session UID onto a task's history stack.
+# Prepends new_uid, deduplicates, caps at MAX_SESSION_HISTORY, syncs session_uid.
+push_session_history() {
+  local id="$1" new_uid="$2"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg id "$id" --arg uid "$new_uid" --argjson max "$MAX_SESSION_HISTORY" '
+    (.tasks[] | select(.id == $id)) |= (
+      ([$uid] + [(.session_history // [])[] | select(. != $uid)])[:$max] as $new |
+      .session_history = $new |
+      .session_uid = $new[0]
+    )
+  ' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+# Return newline-delimited session UIDs (newest first) for a task.
+# Falls back to session_uid if session_history is absent (pre-migration).
+get_session_history() {
+  local id="$1"
+  local hist
+  hist=$(jq -r --arg id "$id" '
+    .tasks[] | select(.id == $id) |
+    if (.session_history // []) | length > 0 then
+      .session_history[]
+    elif .session_uid != null and .session_uid != "" then
+      .session_uid
+    else
+      empty
+    end
+  ' "$GLOBAL_STATE" 2>/dev/null)
+  [[ -n "$hist" ]] && echo "$hist"
+  return 0
+}
+
+# Promote a history entry to position 0 and update session_uid to match.
+set_session_uid_from_history() {
+  local id="$1" uid="$2"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg id "$id" --arg uid "$uid" '
+    (.tasks[] | select(.id == $id)) |= (
+      (.session_history // []) as $old |
+      if ($old | index($uid)) != null then
+        ([$uid] + [$old[] | select(. != $uid)]) as $new |
+        .session_history = $new |
+        .session_uid = $uid
+      else . end
+    )
+  ' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
   _unlock_state
 }
 
@@ -423,13 +481,17 @@ ensure_global_state() {
   mkdir -p "$GLOBAL_DIR"
 
   if [[ ! -f "$GLOBAL_STATE" ]]; then
-    jq -n '{version: 3, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
+    jq -n '{version: 4, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
   else
     # Check for schema migrations
     local _ver
     _ver=$(jq -r '.version // 0' "$GLOBAL_STATE" 2>/dev/null) || _ver=0
     if [[ "$_ver" == "2" ]]; then
       _migrate_v2_to_v3
+      _ver=3
+    fi
+    if [[ "$_ver" == "3" ]]; then
+      _migrate_v3_to_v4
     fi
   fi
 
@@ -512,6 +574,24 @@ _migrate_v2_to_v3() {
     && mv "$tmp" "$GLOBAL_STATE"
   _unlock_state
   ok "state schema migrated to v3"
+}
+
+_migrate_v3_to_v4() {
+  info "migrating state schema v3 -> v4 (adding session history)..."
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.migrate.XXXXXX")
+  jq '.version = 4
+    | .tasks = [.tasks[] |
+        if .session_uid and .session_uid != null and .session_uid != "" then
+          .session_history = [.session_uid]
+        else
+          .session_history = []
+        end
+      ]' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  ok "state schema migrated to v4"
 }
 
 # Auto-migrate old per-repo state on first run from that directory
@@ -1573,17 +1653,14 @@ _build_claude_resume_cmd() {
   fi
 }
 
-# Capture session_uid for a task by finding the most recent session file.
-# Called from the on-prompt hook as a backup for tasks started without session_uid.
+# Capture session_uid for a task by scanning all session files in the project dir.
+# Compares each UID against the task's existing history, pushing any new ones.
+# Called from the on-prompt hook on each prompt submission.
 cmd__capture_session_uid() {
   [[ -f "$GLOBAL_STATE" ]] || return 0
   local id="${1:-}"
   [[ -n "$id" ]] || return 0
   task_exists "$id" || return 0
-
-  local existing
-  existing=$(task_field "$id" "session_uid")
-  [[ -z "$existing" || "$existing" == "null" ]] || return 0  # already set
 
   local repo_name
   repo_name=$(task_repo "$id")
@@ -1597,13 +1674,44 @@ cmd__capture_session_uid() {
   local proj_dir="$HOME/.claude/projects/${encoded}"
   [[ -d "$proj_dir" ]] || return 0
 
-  local latest
-  latest=$(command ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
-  [[ -n "$latest" ]] || return 0
+  # Get all session files sorted by mtime (newest first)
+  local -a all_files=()
+  local _csf
+  while IFS= read -r _csf; do
+    [[ -n "$_csf" ]] && all_files+=("$_csf")
+  done < <(command ls -t "$proj_dir"/*.jsonl 2>/dev/null)
+  [[ ${#all_files[@]} -gt 0 ]] || return 0
 
-  local uid
-  uid=$(basename "$latest" .jsonl)
-  update_task_field "$id" "session_uid" "$uid"
+  # Build lookup set of UIDs already known to this task
+  local -A known_uids=()
+  local _csh
+  while IFS= read -r _csh; do
+    [[ -n "$_csh" ]] && known_uids[$_csh]=1
+  done < <(get_session_history "$id")
+  local existing_uid
+  existing_uid=$(task_field "$id" "session_uid")
+  [[ -n "$existing_uid" && "$existing_uid" != "null" ]] && known_uids[$existing_uid]=1
+
+  # Build collision set: UIDs claimed by other tasks in same repo
+  local -A collision_uids=()
+  local _csc
+  while IFS= read -r _csc; do
+    [[ -n "$_csc" ]] && collision_uids[$_csc]=1
+  done < <(jq -r --arg id "$id" --arg repo "$repo_name" '
+    .tasks[] | select(.id != $id and .repo == $repo) |
+    ((.session_history // [])[], .session_uid // empty)
+  ' "$GLOBAL_STATE" 2>/dev/null)
+
+  # Iterate from oldest to newest so the last push (newest by mtime) becomes active
+  local _csi uid
+  for (( _csi=${#all_files[@]}-1; _csi>=0; _csi-- )); do
+    uid=$(basename "${all_files[$_csi]}" .jsonl)
+    [[ -n "${known_uids[$uid]:-}" ]] && continue
+    [[ -n "${collision_uids[$uid]:-}" ]] && continue
+    push_session_history "$id" "$uid"
+    known_uids[$uid]=1
+  done
+  return 0
 }
 
 cmd_init() {
@@ -1795,7 +1903,8 @@ cmd_session() {
       started_at: $now,
       completed_at: null,
       claude_status: null,
-      session_uid: $uid
+      session_uid: $uid,
+      session_history: [$uid]
     }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
   _unlock_state
 
@@ -1936,7 +2045,7 @@ cmd_start() {
   # Update state
   update_task_field "$id" "status" "active"
   update_task_field "$id" "started_at" "$(now_iso)"
-  [[ -n "$session_uid" ]] && update_task_field "$id" "session_uid" "$session_uid"
+  [[ -n "$session_uid" ]] && push_session_history "$id" "$session_uid"
 
   # Try to discover worktree path
   local wt_path
@@ -3163,6 +3272,272 @@ _modal_render_success() {
   printf "╚%s╝" "$hbar"
 }
 
+# ── Session History Modal ─────────────────────────────────────────────────────
+# Centered overlay modal for browsing and switching between a task's past
+# Claude sessions. Follows the 155-modal.sh pattern (stty, move_to, box chars).
+
+# Show the session history modal for a given task. Returns 0 if user switched
+# session, 1 on cancel / nothing to show.
+# Accesses _task_title, _task_repo via dynamic scoping from cmd__dash_loop.
+_session_history_modal() {
+  local task_id="$1"
+
+  # Gather history UIDs (newline-delimited, most recent first)
+  local hist_raw
+  hist_raw=$(get_session_history "$task_id")
+  if [[ -z "$hist_raw" ]]; then
+    _session_history_modal_empty "$task_id"
+    return 1
+  fi
+
+  local -a sh_uids=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && sh_uids+=("$line")
+  done <<< "$hist_raw"
+
+  if [[ ${#sh_uids[@]} -le 1 ]]; then
+    _session_history_modal_empty "$task_id"
+    return 1
+  fi
+
+  # Resolve repo name and collect mtimes
+  local sh_repo="${_task_repo[$task_id]:-}"
+  local -a sh_mtimes=()
+  local idx
+  for (( idx=0; idx<${#sh_uids[@]}; idx++ )); do
+    sh_mtimes+=("$(_session_file_mtime "${sh_uids[$idx]}" "$sh_repo")")
+  done
+
+  # Modal state
+  local sh_cursor=0
+  local sh_title="${_task_title[$task_id]:-$task_id}"
+
+  stty -echo raw
+
+  local ch result=1
+  _session_history_render
+  while true; do
+    read -rk1 ch 2>/dev/null || { stty echo -raw; return 1; }
+    case "$ch" in
+      $'\e')
+        local seq1=""
+        read -rk1 -t 0.05 seq1 2>/dev/null || true
+        if [[ -z "$seq1" ]]; then
+          # Plain Esc: cancel
+          break
+        elif [[ "$seq1" == "[" ]]; then
+          local seq2=""
+          read -rk1 -t 0.05 seq2 2>/dev/null || true
+          case "$seq2" in
+            A) # Up arrow
+              [[ $sh_cursor -gt 0 ]] && sh_cursor=$((sh_cursor - 1))
+              ;;
+            B) # Down arrow
+              [[ $sh_cursor -lt $((${#sh_uids[@]} - 1)) ]] && sh_cursor=$((sh_cursor + 1))
+              ;;
+          esac
+        fi
+        ;;
+      j)
+        [[ $sh_cursor -lt $((${#sh_uids[@]} - 1)) ]] && sh_cursor=$((sh_cursor + 1))
+        ;;
+      k)
+        [[ $sh_cursor -gt 0 ]] && sh_cursor=$((sh_cursor - 1))
+        ;;
+      $'\n'|$'\r')
+        # Switch to selected session
+        set_session_uid_from_history "$task_id" "${sh_uids[$sh_cursor]}"
+        result=0
+        break
+        ;;
+      $'\x03')
+        # Ctrl-C: cancel
+        break
+        ;;
+      q)
+        break
+        ;;
+    esac
+    _session_history_render
+  done
+
+  stty echo -raw
+  return $result
+}
+
+# Render the "no history" info box, wait for Esc
+_session_history_modal_empty() {
+  local task_id="$1"
+  local m_cols m_rows
+  m_cols=$(tput cols)
+  m_rows=$(tput lines)
+  local m_width=$(( m_cols - 10 ))
+  [[ $m_width -lt 40 ]] && m_width=40
+  [[ $m_width -gt 56 ]] && m_width=56
+  local m_inner=$(( m_width - 2 ))
+  local m_height=7
+  local m_top=$(( (m_rows - m_height) / 2 ))
+  [[ $m_top -lt 1 ]] && m_top=1
+  local m_left=$(( (m_cols - m_width) / 2 + 1 ))
+
+  local hbar="" i
+  for (( i=0; i<m_inner; i++ )); do hbar+="═"; done
+  local title=" Session History "
+  local hbar_left="═══"
+  local hbar_right_len=$(( m_inner - 3 - ${#title} ))
+  local hbar_right=""
+  for (( i=0; i<hbar_right_len; i++ )); do hbar_right+="═"; done
+  local blank_inner=""
+  printf -v blank_inner "%-${m_inner}s" ""
+
+  move_to "$m_top" "$m_left"
+  printf "╔%s%s%s╗" "$hbar_left" "$title" "$hbar_right"
+  move_to "$((m_top + 1))" "$m_left"
+  printf "║%s║" "$blank_inner"
+  move_to "$((m_top + 2))" "$m_left"
+  printf "║  %-$((m_inner - 2))s║" "No session history for ${task_id}."
+  move_to "$((m_top + 3))" "$m_left"
+  printf "║  %-$((m_inner - 2))s║" "Only one session (or none) recorded."
+  move_to "$((m_top + 4))" "$m_left"
+  printf "║%s║" "$blank_inner"
+  move_to "$((m_top + 5))" "$m_left"
+  printf "║  ${C_DIM}%-$((m_inner - 2))s${C_RESET}║" "Esc: close"
+  move_to "$((m_top + 6))" "$m_left"
+  printf "╚%s╝" "$hbar"
+
+  stty -echo raw
+  local ch
+  while true; do
+    read -rk1 ch 2>/dev/null || break
+    if [[ "$ch" == $'\e' ]]; then
+      local discard
+      while read -rk1 -t 0.05 discard 2>/dev/null; do :; done
+      break
+    elif [[ "$ch" == $'\x03' || "$ch" == "q" ]]; then
+      break
+    fi
+  done
+  stty echo -raw
+}
+
+# Render the session history list modal
+# Uses dynamic-scoped: sh_uids, sh_mtimes, sh_cursor, sh_title, task_id
+_session_history_render() {
+  local m_cols m_rows
+  m_cols=$(tput cols)
+  m_rows=$(tput lines)
+  local m_width=$(( m_cols - 10 ))
+  [[ $m_width -lt 40 ]] && m_width=40
+  [[ $m_width -gt 60 ]] && m_width=60
+  local m_inner=$(( m_width - 2 ))
+
+  # Height: top border + blank + task line + blank + items + blank + footer1 + footer2 + bottom border
+  local item_count=${#sh_uids[@]}
+  local m_height=$(( 1 + 1 + 1 + 1 + item_count + 1 + 1 + 1 + 1 ))
+  local m_top=$(( (m_rows - m_height) / 2 ))
+  [[ $m_top -lt 1 ]] && m_top=1
+  local m_left=$(( (m_cols - m_width) / 2 + 1 ))
+
+  # Build horizontal bars
+  local hbar="" i
+  for (( i=0; i<m_inner; i++ )); do hbar+="═"; done
+  local title=" Session History "
+  local hbar_left="═══"
+  local hbar_right_len=$(( m_inner - 3 - ${#title} ))
+  local hbar_right=""
+  for (( i=0; i<hbar_right_len; i++ )); do hbar_right+="═"; done
+  local blank_inner=""
+  printf -v blank_inner "%-${m_inner}s" ""
+
+  local row=$m_top
+
+  # Top border
+  move_to "$row" "$m_left"
+  printf "╔%s%s%s╗" "$hbar_left" "$title" "$hbar_right"
+  row=$((row + 1))
+
+  # Blank line
+  move_to "$row" "$m_left"
+  printf "║%s║" "$blank_inner"
+  row=$((row + 1))
+
+  # Task ID + title line
+  local task_line="${task_id}: ${sh_title}"
+  task_line=$(trunc "$task_line" $((m_inner - 4)))
+  move_to "$row" "$m_left"
+  printf "║  ${C_BOLD}%-$((m_inner - 2))s${C_RESET}║" "$task_line"
+  row=$((row + 1))
+
+  # Blank line
+  move_to "$row" "$m_left"
+  printf "║%s║" "$blank_inner"
+  row=$((row + 1))
+
+  # Session list
+  local si
+  for (( si=0; si<item_count; si++ )); do
+    local uid_short="${sh_uids[$si]:0:8}"
+    local mtime="${sh_mtimes[$si]}"
+    local num=$((si + 1))
+    local prefix="   "
+    [[ $si -eq $sh_cursor ]] && prefix=" > "
+    local suffix=""
+    [[ $si -eq 0 ]] && suffix=" (current)"
+    local entry_text="${prefix}${num}. ${uid_short}  ${mtime}${suffix}"
+    entry_text=$(trunc "$entry_text" $((m_inner - 2)))
+
+    move_to "$row" "$m_left"
+    if [[ $si -eq $sh_cursor ]]; then
+      printf "║${C_BOLD}${C_CYAN}  %-$((m_inner - 2))s${C_RESET}║" "$entry_text"
+    else
+      printf "║  %-$((m_inner - 2))s║" "$entry_text"
+    fi
+    row=$((row + 1))
+  done
+
+  # Blank line
+  move_to "$row" "$m_left"
+  printf "║%s║" "$blank_inner"
+  row=$((row + 1))
+
+  # Footer hints
+  local footer1="  j/k: navigate  Enter: switch"
+  footer1=$(trunc "$footer1" "$m_inner")
+  move_to "$row" "$m_left"
+  printf "║${C_DIM}%-${m_inner}s${C_RESET}║" "$footer1"
+  row=$((row + 1))
+
+  local footer2="  Esc: cancel"
+  footer2=$(trunc "$footer2" "$m_inner")
+  move_to "$row" "$m_left"
+  printf "║${C_DIM}%-${m_inner}s${C_RESET}║" "$footer2"
+  row=$((row + 1))
+
+  # Bottom border
+  move_to "$row" "$m_left"
+  printf "╚%s╝" "$hbar"
+}
+
+# Get the modification time of a session's .jsonl file
+# Returns "file missing" if not found
+_session_file_mtime() {
+  local uid="$1" repo_name="$2"
+  [[ -n "$repo_name" ]] || { echo "file missing"; return; }
+
+  local rpath
+  rpath=$(repo_path "$repo_name")
+  [[ -n "$rpath" ]] || { echo "file missing"; return; }
+
+  local encoded="${rpath//\//-}"
+  encoded="${encoded// /-}"
+  local session_file="$HOME/.claude/projects/${encoded}/${uid}.jsonl"
+
+  if [[ -f "$session_file" ]]; then
+    stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$session_file" 2>/dev/null || echo "unknown"
+  else
+    echo "file missing"
+  fi
+}
 # ── Dashboard snapshot (single jq call per frame) ────────────────────────────
 
 # Snapshot all task data into associative + indexed arrays
@@ -3645,9 +4020,9 @@ _render_footer() {
   move_to "$((rows - 1))" 1
   if [[ "${_view_mode:-kanban}" == "list" ]]; then
     if [[ ${_split_active:-0} -eq 1 ]]; then
-      printf "${C_DIM}  j/k: nav  Enter/l: focus session  ^b h: sidebar  b: full list  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: nav  Enter/l: focus  D: done  H: history  Tab: filter  b: full list  q: quit${C_RESET}"
     else
-      printf "${C_DIM}  j/k: nav  Enter: open/expand  Tab: groups  </> status  D: done  b: split  v: kanban  c: new  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: nav  Tab: filter  Enter: open  </> status  :/\" reorder  t: rename  s: shell  D: done  H: history  c: new  b: split  v: kanban  q: quit${C_RESET}"
     fi
   elif [[ $cron_row_selected -eq 1 ]]; then
     printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: new cron  D: delete  Esc: back  v: list  q: quit${C_RESET}"
@@ -3655,10 +4030,10 @@ _render_footer() {
     if [[ "$nav_mode" == "repo" ]]; then
       printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  v: list  q: quit${C_RESET}"
     else
-      printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  c: new  S: import  t: rename  R: add repo  v: list  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  c: new  S: import  t: rename  H: history  R: add repo  v: list  q: quit${C_RESET}"
     fi
   else
-    printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  c: new  t: rename  s: shell  d: diff  v: list  q: quit${C_RESET}"
+    printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  c: new  t: rename  s: shell  D: done  H: history  v: list  q: quit${C_RESET}"
   fi
 }
 
@@ -3673,7 +4048,7 @@ _list_item_height() {
   local item="${_list_items[$1]:-}"
   case "$item" in
     group:*|cron_group:*) _lih=1 ;;
-    task:*|cron:*)        _lih=2 ;;
+    task:*|cron:*)        _lih=1 ;;
     *)                    _lih=1 ;;
   esac
 }
@@ -3681,13 +4056,7 @@ _list_item_height() {
 # Compute the content-line offset of item at index $1 by summing heights of all
 # preceding items. Result in _lcl (avoids subshell).
 _list_content_line_of() {
-  local _idx="$1"
-  _lcl=0
-  local _li
-  for (( _li=0; _li<_idx; _li++ )); do
-    _list_item_height "$_li"
-    _lcl=$((_lcl + _lih))
-  done
+  _lcl=$1
 }
 
 # ── Scroll management ───────────────────────────────────────────────────────
@@ -3765,9 +4134,10 @@ _render_list_cron_header() {
   _frame+=$'\n'
 }
 
-# ── Task card (2 lines) ─────────────────────────────────────────────────────
+# ── Task card (1 line) ──────────────────────────────────────────────────────
 
-# Render a two-line task card. Appends to _frame.
+# Render a single-line task card. Appends to _frame.
+# Format: > ● Fix authentication bug          ⚙ #42
 # $1 = task_id, $2 = available width, $3 = 1 if selected
 _render_list_task_card() {
   local task_id="$1"
@@ -3779,27 +4149,28 @@ _render_list_task_card() {
   local claude="${_task_claude[$task_id]:-}"
   local pr="${_task_pr[$task_id]:-}"
 
-  # Status badge
-  local badge="" badge_color=""
+  # Single-char status badge
+  local badge_char="" badge_color=""
   case "$tstatus" in
-    active)       badge="● Active";       badge_color="$C_GREEN" ;;
-    needs_review) badge="◆ Review";       badge_color="$C_YELLOW" ;;
-    pending)      badge="○ Pending";      badge_color="$C_DIM" ;;
-    paused)       badge="◫ Paused";       badge_color="$C_CYAN" ;;
-    done)         badge="✓ Done";         badge_color="$C_DIM" ;;
+    active)       badge_char="●"; badge_color="$C_GREEN" ;;
+    needs_review) badge_char="◆"; badge_color="$C_YELLOW" ;;
+    pending)      badge_char="○"; badge_color="$C_DIM" ;;
+    paused)       badge_char="◫"; badge_color="$C_CYAN" ;;
+    done)         badge_char="✓"; badge_color="$C_DIM" ;;
   esac
 
-  # Claude status indicator
-  local claude_str=""
-  [[ "$claude" == "working" ]] && claude_str="  ⚙ working"
-  [[ "$claude" == "waiting" ]] && claude_str="  ○ waiting"
-
-  # PR short
-  local pr_short=""
+  # Right-side metadata: claude indicator + PR short
+  local right_meta=""
+  [[ "$claude" == "working" ]] && right_meta="⚙"
+  [[ "$claude" == "waiting" ]] && right_meta="○"
   if [[ -n "$pr" ]]; then
+    local pr_short
     pr_short=$(echo "$pr" | command grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
-    pr_short="  ${pr_short}"
+    [[ -n "$right_meta" ]] && right_meta+=" "
+    right_meta+="$pr_short"
   fi
+  # Add spacing if we have right metadata
+  [[ -n "$right_meta" ]] && right_meta="  ${right_meta}"
 
   local prefix=" "
   local sel_on="" sel_off=""
@@ -3809,84 +4180,31 @@ _render_list_task_card() {
     sel_off="${C_RESET}"
   fi
 
-  if [[ $width -gt 35 ]]; then
-    # ── Wide format ──
-    # Line 1:  > t-003  Fix authentication bug
-    local title_max=$((width - 10))
-    [[ $title_max -lt 1 ]] && title_max=1
-    local title_str
-    title_str=$(trunc "$title" "$title_max")
-    local _tw=$((width - 10))
-    [[ $_tw -lt 0 ]] && _tw=0
+  # Layout: prefix(1) space(1) badge(1) space(1) title(fill) right_meta
+  local fixed_left=4
+  local right_len=${#right_meta}
+  local title_max=$((width - fixed_left - right_len))
+  [[ $title_max -lt 1 ]] && title_max=1
+  local title_str
+  title_str=$(trunc "$title" "$title_max")
 
-    if [[ "$is_selected" == "1" ]]; then
-      _frame+="${sel_on}${prefix} ${(r:6:)task_id}  ${(r:$_tw:)title_str}${sel_off}"
-    else
-      _frame+="${prefix} ${C_DIM}${(r:6:)task_id}${C_RESET}  ${(r:$_tw:)title_str}"
-    fi
-    _frame+=$'\n'
+  local title_w=$((width - fixed_left - right_len))
+  [[ $title_w -lt 0 ]] && title_w=0
 
-    # Line 2:           ● Active  ⚙ working  #42
-    local detail="${badge}${claude_str}${pr_short}"
-    local detail_max=$((width - 10))
-    [[ $detail_max -lt 1 ]] && detail_max=1
-    detail=$(trunc "$detail" "$detail_max")
-
-    if [[ "$is_selected" == "1" ]]; then
-      local _det_full="         ${detail}"
-      _frame+="${sel_on}${(r:${width}:)_det_full}${sel_off}"
-    else
-      local _dpad_n=$((width - 9 - ${#detail}))
-      local _e=""
-      _frame+="         ${badge_color}${detail}${C_RESET}"
-      [[ $_dpad_n -gt 0 ]] && _frame+="${(r:$_dpad_n:)_e}"
-    fi
-    _frame+=$'\n'
+  if [[ "$is_selected" == "1" ]]; then
+    _frame+="${sel_on}${prefix} ${badge_char} ${(r:$title_w:)title_str}${right_meta}${sel_off}"
   else
-    # ── Narrow format ──
-    # Line 1: > t-003 Fix auth..  ● Active
-    local badge_short
-    case "$tstatus" in
-      active)       badge_short="●" ;;
-      needs_review) badge_short="◆" ;;
-      pending)      badge_short="○" ;;
-      paused)       badge_short="◫" ;;
-      done)         badge_short="✓" ;;
-    esac
-    local title_max=$((width - ${#task_id} - 6))
-    [[ $title_max -lt 4 ]] && title_max=4
-    local title_str
-    title_str=$(trunc "$title" "$title_max")
-
-    local _nw=$((width - 9))
-    [[ $_nw -lt 0 ]] && _nw=0
-    if [[ "$is_selected" == "1" ]]; then
-      _frame+="${sel_on}${prefix} ${(r:5:)task_id} ${(r:$_nw:)title_str} ${badge_short}${sel_off}"
-    else
-      _frame+="${prefix} ${C_DIM}${(r:5:)task_id}${C_RESET} ${(r:$_nw:)title_str} ${badge_color}${badge_short}${C_RESET}"
-    fi
-    _frame+=$'\n'
-
-    # Line 2: additional info or blank
-    local info_str="${claude_str:+${claude_str:2}}${pr_short}"
-    local info_max=$((width - 8))
-    [[ $info_max -lt 1 ]] && info_max=1
-    info_str=$(trunc "$info_str" "$info_max")
-    local _iw=$((width - 7))
-    [[ $_iw -lt 0 ]] && _iw=0
-    if [[ "$is_selected" == "1" ]]; then
-      local _info_full="       ${info_str}"
-      _frame+="${sel_on}${(r:${width}:)_info_full}${sel_off}"
-    else
-      _frame+="       ${C_DIM}${(r:$_iw:)info_str}${C_RESET}"
-    fi
-    _frame+=$'\n'
+    _frame+="${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$title_w:)title_str}${C_DIM}${right_meta}${C_RESET}"
   fi
+  _frame+=$'\n'
 }
 
-# ── Cron card (2 lines) ─────────────────────────────────────────────────────
+# ── Cron card (1 line) ──────────────────────────────────────────────────────
 
-# Render a two-line cron card. Appends to _frame.
+# Render a single-line cron card. Appends to _frame.
+# Scheduled: "  ○ morning-routine              every 30m"
+# Active:    "  ● morning-routine              ● running"
+# Review:    "  ◆ morning-routine              ◆ review"
 # $1 = cron_id, $2 = available width, $3 = 1 if selected
 _render_list_cron_card() {
   local cron_id="$1"
@@ -3901,94 +4219,58 @@ _render_list_cron_card() {
     sel_off="${C_RESET}"
   fi
 
-  # Determine if this is a job (col 0) or a run (col 1/2)
+  # Determine if this is a job (col 0) or a run (col 1/2/3)
   local rdata="${_cron_run_data[$cron_id]:-}"
+
+  local cron_name="" right_meta="" right_color=""
+  local badge_char="" badge_color=""
 
   if [[ -z "$rdata" ]]; then
     # Scheduled cron job
-    local jname="${_cron_jobs[$cron_id]:-$cron_id}"
+    cron_name="${_cron_jobs[$cron_id]:-$cron_id}"
     local jsched="${_cron_job_schedule[$cron_id]:-}"
     local jenabled="${_cron_job_enabled[$cron_id]:-true}"
-
-    local status_str="scheduled"
-    local status_color="$C_DIM"
     if [[ "$jenabled" != "true" ]]; then
-      status_str="disabled"
-      status_color="$C_RED"
-    fi
-
-    # Line 1: cron ID + job name
-    local id_max=$((width - 3))
-    local id_name="${cron_id}  ${jname}"
-    id_name=$(trunc "$id_name" "$id_max")
-    local _cw=$((width - 2))
-    [[ $_cw -lt 0 ]] && _cw=0
-    if [[ "$is_selected" == "1" ]]; then
-      _frame+="${sel_on}${prefix} ${(r:$_cw:)id_name}${sel_off}"
+      badge_char="⊘"; badge_color="$C_RED"
+      right_meta="disabled"
+      right_color="$C_RED"
+    elif [[ -n "$jsched" ]]; then
+      badge_char="○"; badge_color="$C_DIM"
+      right_meta="$jsched"
+      right_color="$C_DIM"
     else
-      _frame+="${prefix} ${C_DIM}${(r:$_cw:)id_name}${C_RESET}"
+      badge_char="○"; badge_color="$C_DIM"
+      right_meta="scheduled"
+      right_color="$C_DIM"
     fi
-    _frame+=$'\n'
-
-    # Line 2: schedule / status
-    local detail="${status_str}"
-    [[ -n "$jsched" ]] && detail="${jsched}"
-    local detail_max=$((width - 9))
-    [[ $detail_max -lt 1 ]] && detail_max=1
-    detail=$(trunc "$detail" "$detail_max")
-    local _dw=$((width - 7))
-    [[ $_dw -lt 0 ]] && _dw=0
-    if [[ "$is_selected" == "1" ]]; then
-      local _sd_full="       ${detail}"
-      _frame+="${sel_on}${(r:${width}:)_sd_full}${sel_off}"
-    else
-      _frame+="       ${status_color}${(r:$_dw:)detail}${C_RESET}"
-    fi
-    _frame+=$'\n'
   else
-    # Cron run (active or needs_review)
+    # Cron run
     local rjob_id rstat recode rstart rsid rwin
     IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
-    local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
-
-    local status_str="" status_color=""
+    cron_name="${_cron_jobs[$rjob_id]:-$rjob_id}"
     case "$rstat" in
-      active)       status_str="● running";       status_color="$C_GREEN" ;;
-      needs_review) status_str="◆ needs review";  status_color="$C_YELLOW" ;;
-      reviewed)     status_str="✓ reviewed";       status_color="$C_CYAN" ;;
-      *)            status_str="$rstat";           status_color="$C_DIM" ;;
+      active)       badge_char="●"; badge_color="$C_GREEN";  right_meta="● running";  right_color="$C_GREEN" ;;
+      needs_review) badge_char="◆"; badge_color="$C_YELLOW"; right_meta="◆ review";   right_color="$C_YELLOW" ;;
+      reviewed)     badge_char="✓"; badge_color="$C_CYAN";   right_meta="✓ reviewed";  right_color="$C_CYAN" ;;
+      *)            badge_char="○"; badge_color="$C_DIM";     right_meta="$rstat";      right_color="$C_DIM" ;;
     esac
-
-    # Line 1: run ID + job name
-    local id_max=$((width - 3))
-    local id_name="${cron_id}  ${rjname}"
-    id_name=$(trunc "$id_name" "$id_max")
-    local _cw=$((width - 2))
-    [[ $_cw -lt 0 ]] && _cw=0
-    if [[ "$is_selected" == "1" ]]; then
-      _frame+="${sel_on}${prefix} ${(r:$_cw:)id_name}${sel_off}"
-    else
-      _frame+="${prefix} ${C_DIM}${(r:$_cw:)id_name}${C_RESET}"
-    fi
-    _frame+=$'\n'
-
-    # Line 2: status + exit code
-    local exit_info=""
-    [[ -n "$recode" && "$recode" != "null" && "$rstat" != "active" ]] && exit_info="  exit ${recode}"
-    local detail="${status_str}${exit_info}"
-    local detail_max=$((width - 9))
-    [[ $detail_max -lt 1 ]] && detail_max=1
-    detail=$(trunc "$detail" "$detail_max")
-    local _dw=$((width - 7))
-    [[ $_dw -lt 0 ]] && _dw=0
-    if [[ "$is_selected" == "1" ]]; then
-      local _cr_full="       ${detail}"
-      _frame+="${sel_on}${(r:${width}:)_cr_full}${sel_off}"
-    else
-      _frame+="       ${status_color}${(r:$_dw:)detail}${C_RESET}"
-    fi
-    _frame+=$'\n'
   fi
+
+  # Layout: prefix(1) space(1) badge(1) space(1) name(fill) "  " right_meta
+  local fixed_left=4
+  local right_str="  ${right_meta}"
+  local right_len=${#right_str}
+  local name_w=$((width - fixed_left - right_len))
+  [[ $name_w -lt 1 ]] && name_w=1
+  local name_str
+  name_str=$(trunc "$cron_name" "$name_w")
+
+  if [[ "$is_selected" == "1" ]]; then
+    _frame+="${sel_on}${prefix} ${badge_char} ${(r:$name_w:)name_str}${right_str}${sel_off}"
+  else
+    _frame+="${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$name_w:)name_str}${right_color}${right_str}${C_RESET}"
+  fi
+  _frame+=$'\n'
 }
 
 # ── Scrollbar ────────────────────────────────────────────────────────────────
@@ -4098,10 +4380,11 @@ _render_list_full() {
   fi
 }
 
-# ── Sidebar task card (compact, title-first layout) ──────────────────────────
+# ── Sidebar task card (compact, single-line) ─────────────────────────────────
 
-# Render a two-line sidebar task card. Title gets full width on line 1,
-# id + status badge on line 2.
+# Render a single-line sidebar task card. No task ID or PR; sidebar is narrow.
+# Format: > ● Fix auth bug     ⚙
+# $1 = task_id, $2 = available width, $3 = 1 if selected
 _render_sidebar_task_card() {
   local task_id="$1"
   local width="$2"
@@ -4133,36 +4416,20 @@ _render_sidebar_task_card() {
     sel_off="${C_RESET}"
   fi
 
-  # Line 1: > Title text here (full width minus 2 for prefix+space)
-  local title_max=$((width - 2))
+  # Layout: prefix(1) space(1) badge(1) space(1) title(fill) claude_char
+  local fixed=4
+  local cc_len=${#claude_char}
+  local title_max=$((width - fixed - cc_len))
   [[ $title_max -lt 1 ]] && title_max=1
   local title_str
   title_str=$(trunc "$title" "$title_max")
-  local _tw=$((width - 2))
-  [[ $_tw -lt 0 ]] && _tw=0
+  local title_w=$((width - fixed - cc_len))
+  [[ $title_w -lt 0 ]] && title_w=0
 
   if [[ "$is_selected" == "1" ]]; then
-    _frame+="${sel_on}${prefix} ${(r:$_tw:)title_str}${sel_off}"
+    _frame+="${sel_on}${prefix} ${badge_char} ${(r:$title_w:)title_str}${claude_char}${sel_off}"
   else
-    _frame+="${sel_on}${prefix} ${(r:$_tw:)title_str}${sel_off}"
-  fi
-  _frame+=$'\n'
-
-  # Line 2:   t-002 ● ⚙  (id + badge + claude indicator, dimmed)
-  local detail="${task_id} ${badge_char}${claude_char}"
-  local _dw=$((width - 3))
-  [[ $_dw -lt 0 ]] && _dw=0
-  if [[ "$is_selected" == "1" ]]; then
-    local _det="  ${detail}"
-    _frame+="${sel_on}${(r:${width}:)_det}${sel_off}"
-  else
-    _frame+="  ${C_DIM}${task_id}${C_RESET} ${badge_color}${badge_char}${C_RESET}${C_DIM}${claude_char}${C_RESET}"
-    local detail_plain_len=$((${#task_id} + 1 + 1 + ${#claude_char}))
-    local _pad_n=$((width - 2 - detail_plain_len))
-    if [[ $_pad_n -gt 0 ]]; then
-      local _e=""
-      _frame+="${(r:$_pad_n:)_e}"
-    fi
+    _frame+="${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$title_w:)title_str}${C_DIM}${claude_char}${C_RESET}"
   fi
   _frame+=$'\n'
 }
@@ -4254,6 +4521,29 @@ _list_get_selected_cron_id() {
     cron:*) _tid="${item#cron:}" ;;
     *)      _tid=""; return 1 ;;
   esac
+}
+
+# Get the kanban-column-equivalent for a cron item selected in list mode.
+# Sets _list_cron_col: 0=scheduled, 1=active, 2=needs_review, 3=reviewed.
+# Returns 1 if not a cron item.
+_list_get_cron_col() {
+  local item="${_list_items[$_list_cursor]:-}"
+  [[ "$item" != cron:* ]] && return 1
+  local cid="${item#cron:}"
+  local rdata="${_cron_run_data[$cid]:-}"
+  if [[ -z "$rdata" ]]; then
+    _list_cron_col=0  # Scheduled job
+  else
+    local rjob_id rstat recode rstart rsid rwin
+    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+    case "$rstat" in
+      active)       _list_cron_col=1 ;;
+      needs_review) _list_cron_col=2 ;;
+      reviewed)     _list_cron_col=3 ;;
+      *)            _list_cron_col=0 ;;
+    esac
+  fi
+  return 0
 }
 
 # ── Key handler ──────────────────────────────────────────────────────────────
@@ -4359,7 +4649,7 @@ _list_handle_key() {
                   _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
                   update_task_field "$sel_id" "status" "active"
                   update_task_field "$sel_id" "started_at" "$(now_iso)"
-                  update_task_field "$sel_id" "session_uid" "$dash_session_uid"
+                  push_session_history "$sel_id" "$dash_session_uid"
                   tmux_select_window "$sel_id"
                   ;;
                 paused)
@@ -4473,37 +4763,77 @@ _list_handle_key() {
       esac
       ;;
 
-    $'\t') # Tab: jump cursor to next group/cron_group header
-      local _ti
-      for (( _ti=_list_cursor + 1; _ti <= max_idx; _ti++ )); do
-        case "${_list_items[$_ti]:-}" in
-          group:*|cron_group:*)
-            _list_cursor=$_ti
-            break
-            ;;
-        esac
-      done
-      ;;
-
-    SHIFT_TAB) # Shift-Tab: jump cursor to previous group/cron_group header
-      local _ti
-      for (( _ti=_list_cursor - 1; _ti >= 0; _ti-- )); do
-        case "${_list_items[$_ti]:-}" in
-          group:*|cron_group:*)
-            _list_cursor=$_ti
-            break
-            ;;
-        esac
-      done
-      ;;
-
-    D) # Toggle show done tasks
-      if [[ "$_show_done" == "1" ]]; then
-        _show_done=0
+    $'\t') # Tab: cycle repo filter forward (matches kanban Tab behavior)
+      local total_filters=$(( ${#_repo_names[@]} + 1 ))
+      filter_idx=$(( (filter_idx + 1) % total_filters ))
+      if [[ $filter_idx -eq 0 ]]; then
+        filter_mode="all"
+        # Expand all groups
+        _list_group_collapsed=()
       else
-        _show_done=1
+        filter_mode="${_repo_names[$((filter_idx - 1))]}"
+        # Collapse all groups except the selected repo; expand that one
+        local _tf_rn
+        for _tf_rn in "${_repo_names[@]}"; do
+          _list_group_collapsed[$_tf_rn]=1
+        done
+        unset "_list_group_collapsed[$filter_mode]"
+        _list_group_collapsed[__cron]=1
+        # Move cursor to that repo's group header
+        local _tf_i
+        for (( _tf_i=0; _tf_i<${#_list_items[@]}; _tf_i++ )); do
+          [[ "${_list_items[$_tf_i]}" == "group:${filter_mode}" ]] && { _list_cursor=$_tf_i; break; }
+        done
       fi
       _list_needs_rebuild=1
+      ;;
+
+    SHIFT_TAB) # Shift-Tab: cycle repo filter backward
+      local total_filters=$(( ${#_repo_names[@]} + 1 ))
+      filter_idx=$(( (filter_idx - 1 + total_filters) % total_filters ))
+      if [[ $filter_idx -eq 0 ]]; then
+        filter_mode="all"
+        _list_group_collapsed=()
+      else
+        filter_mode="${_repo_names[$((filter_idx - 1))]}"
+        local _tf_rn
+        for _tf_rn in "${_repo_names[@]}"; do
+          _list_group_collapsed[$_tf_rn]=1
+        done
+        unset "_list_group_collapsed[$filter_mode]"
+        _list_group_collapsed[__cron]=1
+        local _tf_i
+        for (( _tf_i=0; _tf_i<${#_list_items[@]}; _tf_i++ )); do
+          [[ "${_list_items[$_tf_i]}" == "group:${filter_mode}" ]] && { _list_cursor=$_tf_i; break; }
+        done
+      fi
+      _list_needs_rebuild=1
+      ;;
+
+    d|D) # Delete scheduled cron job, or toggle show done tasks
+      local _d_item="${_list_items[$_list_cursor]:-}"
+      if [[ "$_d_item" == cron:* ]]; then
+        local _d_cid="${_d_item#cron:}"
+        local _d_rdata="${_cron_run_data[$_d_cid]:-}"
+        if [[ -z "$_d_rdata" ]]; then
+          # Scheduled job: delete
+          cursor_show
+          stty echo
+          echo ""
+          (cmd_cron_remove "$_d_cid") 2>&1 || true
+          stty -echo
+          cursor_hide
+          _list_needs_rebuild=1
+        fi
+      else
+        # Toggle show done tasks
+        if [[ "$_show_done" == "1" ]]; then
+          _show_done=0
+        else
+          _show_done=1
+        fi
+        _list_needs_rebuild=1
+      fi
       ;;
 
     b) # Toggle split view
@@ -4555,6 +4885,54 @@ _list_handle_key() {
       fi
       ;;
 
+    ':') # Move task up: swap with previous same-status/same-repo task
+      local _r_item="${_list_items[$_list_cursor]:-}"
+      if [[ "$_r_item" == task:* ]]; then
+        local _r_id="${_r_item#task:}"
+        local _r_repo="${_task_repo[$_r_id]:-}"
+        local _r_st="${_task_status[$_r_id]:-}"
+        # Find immediately previous task in same repo with same status
+        local _r_i
+        for (( _r_i=_list_cursor - 1; _r_i >= 0; _r_i-- )); do
+          local _r_prev="${_list_items[$_r_i]:-}"
+          [[ "$_r_prev" != task:* ]] && break  # Hit a group header; stop
+          local _r_pid="${_r_prev#task:}"
+          if [[ "${_task_repo[$_r_pid]:-}" == "$_r_repo" && "${_task_status[$_r_pid]:-}" == "$_r_st" ]]; then
+            _swap_tasks_in_state "$_r_id" "$_r_pid"
+            _list_cursor=$_r_i
+            _list_needs_rebuild=1
+            _list_follow_id="$_r_id"
+            break
+          fi
+          break  # Only check the immediately previous task item
+        done
+      fi
+      ;;
+
+    '"') # Move task down: swap with next same-status/same-repo task
+      local _r_item="${_list_items[$_list_cursor]:-}"
+      if [[ "$_r_item" == task:* ]]; then
+        local _r_id="${_r_item#task:}"
+        local _r_repo="${_task_repo[$_r_id]:-}"
+        local _r_st="${_task_status[$_r_id]:-}"
+        local _r_max=$((${#_list_items[@]} - 1))
+        local _r_i
+        for (( _r_i=_list_cursor + 1; _r_i <= _r_max; _r_i++ )); do
+          local _r_next="${_list_items[$_r_i]:-}"
+          [[ "$_r_next" != task:* ]] && break  # Hit a group header; stop
+          local _r_nid="${_r_next#task:}"
+          if [[ "${_task_repo[$_r_nid]:-}" == "$_r_repo" && "${_task_status[$_r_nid]:-}" == "$_r_st" ]]; then
+            _swap_tasks_in_state "$_r_id" "$_r_nid"
+            _list_cursor=$_r_i
+            _list_needs_rebuild=1
+            _list_follow_id="$_r_id"
+            break
+          fi
+          break  # Only check the immediately next task item
+        done
+      fi
+      ;;
+
     *) return 1 ;; # Key not handled; fall through to shared handlers
   esac
 
@@ -4595,11 +4973,22 @@ _split_build_cmd() {
 
     update_task_field "$task_id" "status" "active"
     update_task_field "$task_id" "started_at" "$(now_iso)"
-    update_task_field "$task_id" "session_uid" "$session_uid"
+    push_session_history "$task_id" "$session_uid"
   else
     # Resume existing session (active, paused, needs_review, done)
     _sbc_cmd=$(_build_claude_resume_cmd "$task_id")
   fi
+}
+
+# Kill all stale (dead Claude) windows for a task, keeping any live one.
+# Prevents duplicate windows from accumulating across split-pane switches.
+_purge_stale_windows() {
+  local name="$1"
+  local _pw_i=0
+  while [[ $_pw_i -lt 50 ]] && tmux_window_exists "$name" && ! _tmux_claude_alive "$name"; do
+    tmux_kill_window "$name"
+    _pw_i=$((_pw_i + 1))
+  done
 }
 
 # Install/remove tmux keybinding for returning to sidebar from the Claude pane.
@@ -4624,16 +5013,14 @@ _split_open() {
   _split_task_id="$task_id"
   _split_bind_sidebar_key
 
+  # Clean up stale windows before checking for a live one
+  _purge_stale_windows "$task_id"
+
   if tmux_window_exists "$task_id"; then
-    if _tmux_claude_alive "$task_id"; then
-      # Existing live session: join it into the dashboard as right pane
-      tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
-      tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
-      return 0
-    else
-      # Dead window (Claude exited, bare zsh): clean up first
-      tmux_kill_window "$task_id"
-    fi
+    # Live session found: join it into the dashboard as right pane
+    tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+    return 0
   fi
 
   # Build command and work directory
@@ -4655,6 +5042,8 @@ _split_switch_session() {
 
   # Preserve the current session by breaking it out to its own window
   if [[ -n "$_split_task_id" ]]; then
+    # Kill stale windows first so break-pane creates the only named window
+    _purge_stale_windows "$_split_task_id"
     tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null || true
   fi
 
@@ -4668,14 +5057,14 @@ _split_switch_session() {
     return 1
   fi
 
+  # Clean up stale windows for the target task
+  _purge_stale_windows "$new_task_id"
+
   if tmux_window_exists "$new_task_id"; then
-    if _tmux_claude_alive "$new_task_id"; then
-      tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
-      tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
-      return 0
-    else
-      tmux_kill_window "$new_task_id"
-    fi
+    # Live session found: join it
+    tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+    return 0
   fi
 
   # Build command and work directory for the new task
@@ -4694,6 +5083,8 @@ _split_switch_session() {
 # Close the split view, preserving the running session in its own tmux window.
 _split_close() {
   if [[ -n "$_split_task_id" ]]; then
+    # Kill stale windows first so break-pane creates the only named window
+    _purge_stale_windows "$_split_task_id"
     # Try to preserve as named window; fall back to killing the pane
     tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null \
       || tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null \
@@ -5473,26 +5864,30 @@ cmd__dash_loop() {
         fi
         ;;
       '') ;; # Timeout: just refresh
-      $'\t') # Tab: next filter
-        local total_filters=$(( ${#_repo_names[@]} + 1 ))
-        filter_idx=$(( (filter_idx + 1) % total_filters ))
-        if [[ $filter_idx -eq 0 ]]; then
-          filter_mode="all"
-          nav_mode="repo"
-        else
-          filter_mode="${_repo_names[$((filter_idx - 1))]}"
-          nav_mode="card"
+      $'\t') # Tab: next filter (kanban only; list handles its own)
+        if [[ "$_view_mode" == "kanban" ]]; then
+          local total_filters=$(( ${#_repo_names[@]} + 1 ))
+          filter_idx=$(( (filter_idx + 1) % total_filters ))
+          if [[ $filter_idx -eq 0 ]]; then
+            filter_mode="all"
+            nav_mode="repo"
+          else
+            filter_mode="${_repo_names[$((filter_idx - 1))]}"
+            nav_mode="card"
+          fi
         fi
         ;;
-      SHIFT_TAB) # Shift-Tab: previous filter
-        local total_filters=$(( ${#_repo_names[@]} + 1 ))
-        filter_idx=$(( (filter_idx - 1 + total_filters) % total_filters ))
-        if [[ $filter_idx -eq 0 ]]; then
-          filter_mode="all"
-          nav_mode="repo"
-        else
-          filter_mode="${_repo_names[$((filter_idx - 1))]}"
-          nav_mode="card"
+      SHIFT_TAB) # Shift-Tab: previous filter (kanban only)
+        if [[ "$_view_mode" == "kanban" ]]; then
+          local total_filters=$(( ${#_repo_names[@]} + 1 ))
+          filter_idx=$(( (filter_idx - 1 + total_filters) % total_filters ))
+          if [[ $filter_idx -eq 0 ]]; then
+            filter_mode="all"
+            nav_mode="repo"
+          else
+            filter_mode="${_repo_names[$((filter_idx - 1))]}"
+            nav_mode="card"
+          fi
         fi
         ;;
       ESC) # Escape: zoom out to repo mode
@@ -5512,8 +5907,10 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      $'\n'|$'\r') # Enter
-        if [[ $cron_row_selected -eq 1 ]]; then
+      $'\n'|$'\r') # Enter (kanban only; list mode handles its own Enter below)
+        if [[ "$_view_mode" != "kanban" ]]; then
+          : # handled by list mode dispatch below
+        elif [[ $cron_row_selected -eq 1 ]]; then
           # Handle cron row Enter
           if [[ "$nav_mode" == "repo" ]]; then
             nav_mode="card"
@@ -5639,7 +6036,7 @@ cmd__dash_loop() {
                 _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
                 update_task_field "$sel_id" "status" "active"
                 update_task_field "$sel_id" "started_at" "$(now_iso)"
-                update_task_field "$sel_id" "session_uid" "$dash_session_uid"
+                push_session_history "$sel_id" "$dash_session_uid"
                 tmux_select_window "$sel_id"
                 ;;
               paused)
@@ -5749,8 +6146,9 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      ':') # Move card up in column
-        if _get_selected_id; then
+      ':') # Move card up in column (kanban only; list handles its own)
+        if [[ "$_view_mode" != "kanban" ]]; then true
+        elif _get_selected_id; then
           local sel_id="$_tid"
           local active_repo
           if [[ "$filter_mode" != "all" ]]; then
@@ -5771,8 +6169,9 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      '"') # Move card down in column
-        if _get_selected_id; then
+      '"') # Move card down in column (kanban only; list handles its own)
+        if [[ "$_view_mode" != "kanban" ]]; then true
+        elif _get_selected_id; then
           local sel_id="$_tid"
           local active_repo
           if [[ "$filter_mode" != "all" ]]; then
@@ -5795,6 +6194,19 @@ cmd__dash_loop() {
         fi
         ;;
       c) # Create new task (modal) or cron job
+        if [[ "$_view_mode" == "list" ]]; then
+          local _c_item="${_list_items[$_list_cursor]:-}"
+          if [[ "$_c_item" == cron_group:* || "$_c_item" == cron:* ]]; then
+            cursor_show
+            stty echo
+            echo ""
+            echo "${C_CYAN}Creating new cron job...${C_RESET}"
+            (cmd_cron_add) 2>&1 || true
+            stty -echo
+            cursor_hide
+            continue
+          fi
+        fi
         if [[ $cron_row_selected -eq 1 ]]; then
           cursor_show
           stty echo
@@ -5906,7 +6318,36 @@ cmd__dash_loop() {
         fi
         ;;
       x) # Done/delete selected task OR cron toggle/review
-        if [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
+        if [[ "$_view_mode" == "list" ]] && _list_get_selected_cron_id; then
+          local cron_item="$_tid"
+          _list_get_cron_col
+          case $_list_cron_col in
+            0)  # Scheduled: toggle enable/disable
+              local is_enabled="${_cron_job_enabled[$cron_item]:-true}"
+              cursor_show
+              stty echo
+              if [[ "$is_enabled" == "true" ]]; then
+                printf "${C_YELLOW}Disable cron job ${cron_item}? [y/N]: ${C_RESET}"
+                local dconfirm=""
+                read -r dconfirm
+                [[ "$dconfirm" =~ ^[yY]$ ]] && (cmd_cron_disable "$cron_item") 2>&1 || true
+              else
+                printf "${C_CYAN}Enable cron job ${cron_item}? [Y/n]: ${C_RESET}"
+                local econfirm=""
+                read -r econfirm
+                [[ ! "$econfirm" =~ ^[nN]$ ]] && (cmd_cron_enable "$cron_item") 2>&1 || true
+              fi
+              stty -echo
+              cursor_hide
+              ;;
+            2)  # Needs Review: mark reviewed
+              (cmd_cron_review "$cron_item") 2>&1 || true
+              ;;
+            3)  # Done: archive
+              update_cron_run_field "$cron_item" "status" "archived"
+              ;;
+          esac
+        elif [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
           local cron_item="$_tid"
           case $cur_cron_col in
             0)  # Scheduled: toggle enable/disable
@@ -5944,24 +6385,14 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      d) # Show diff
+      d) # Toggle done (same as D for tasks)
         if _get_active_task_id; then
           local sel_id="$_tid"
-          local sel_repo="${_task_repo[$sel_id]}"
-          local sel_rpath
-          sel_rpath=$(repo_path "$sel_repo")
-          local diff_dir=""
-          if [[ "${_task_wtmode[$sel_id]}" == "none" ]]; then
-            diff_dir="$sel_rpath"
+          local sel_status="${_task_status[$sel_id]}"
+          if [[ "$sel_status" == "done" ]]; then
+            (cmd_rm "$sel_id") 2>&1 || true
           else
-            diff_dir=$(find_worktree_path "$sel_id" "$sel_rpath")
-          fi
-          if [[ -n "$diff_dir" && -d "$diff_dir" ]]; then
-            cursor_show
-            stty echo
-            (cd "$diff_dir" && git diff --stat && echo "" && git diff) | less
-            stty -echo
-            cursor_hide
+            (cmd_done "$sel_id") 2>&1 || true
           fi
         fi
         ;;
@@ -6126,7 +6557,7 @@ cmd__dash_loop() {
                 local new_uid
                 new_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
                 dash_claude_cmd="claude --session-id ${new_uid} --dangerously-skip-permissions '${escaped}'"
-                update_task_field "$sel_id" "session_uid" "$new_uid"
+                push_session_history "$sel_id" "$new_uid"
               else
                 dash_claude_cmd=$(_build_claude_resume_cmd "$sel_id")
               fi
@@ -6136,6 +6567,46 @@ cmd__dash_loop() {
               update_task_field_raw "$sel_id" "branch" "null"
               update_task_field_raw "$sel_id" "completed_at" "null"
               tmux_select_window "$sel_id"
+            fi
+          fi
+        fi
+        ;;
+      H) # Session history
+        if _get_active_task_id; then
+          local sel_id="$_tid"
+          if _session_history_modal "$sel_id"; then
+            # User selected a session; relaunch with updated session_uid
+            local sel_repo="${_task_repo[$sel_id]}"
+            local sel_rpath
+            sel_rpath=$(repo_path "$sel_repo")
+
+            # Close split pane if showing this task
+            local was_split=0
+            if [[ "${_split_active:-0}" == "1" && "$_split_task_id" == "$sel_id" ]]; then
+              _split_close
+              was_split=1
+            fi
+
+            # Kill existing window and relaunch with the selected session
+            tmux_kill_window "$sel_id"
+            local resume_cmd
+            resume_cmd=$(_build_claude_resume_cmd "$sel_id")
+            local wt_mode="${_task_wtmode[$sel_id]}"
+            if [[ "$wt_mode" == "none" ]]; then
+              _tmux_launch_claude "$sel_id" "$sel_rpath" "$resume_cmd"
+            else
+              local wt_p
+              wt_p=$(find_worktree_path "$sel_id" "$sel_rpath")
+              _tmux_launch_claude "$sel_id" "${wt_p:-$sel_rpath}" "$resume_cmd"
+            fi
+
+            if [[ $was_split -eq 1 ]]; then
+              # Re-open in split pane
+              _split_open "$sel_id"
+            else
+              cursor_show
+              tmux_select_window "$sel_id"
+              cursor_hide
             fi
           fi
         fi
@@ -6173,7 +6644,7 @@ cmd__dash_loop() {
     # ── List mode key dispatch (navigation + list-specific keys) ──
     if [[ "$_view_mode" == "list" ]]; then
       case "$key" in
-        j|k|$'\t'|SHIFT_TAB|D|b|ESC)
+        j|k|$'\t'|SHIFT_TAB|D|b|l|ESC|':'|'"')
           _list_handle_key "$key"
           ;;
         $'\n'|$'\r') # Enter in list mode
@@ -6375,6 +6846,7 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     t           Rename focused task
     p           Pause task
     r           Reopen done task (restart session)
+    H           Browse session history for selected task
     x           Done/remove task
     </>         Move task left/right (change status)
     :/"         Reorder card up/down within column
@@ -6398,6 +6870,7 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     Tab         Jump to next group header
     Shift-Tab   Jump to previous group header
     </>         Cycle task status left/right
+    H           Browse session history for selected task
     D           Toggle show/hide done tasks
     b           Toggle split view (sidebar + Claude session)
     v           Switch back to kanban view

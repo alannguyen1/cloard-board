@@ -60,3 +60,60 @@ _swap_tasks_in_state() {
   _unlock_state
 }
 
+# Push a session UID onto a task's history stack.
+# Prepends new_uid, deduplicates, caps at MAX_SESSION_HISTORY, syncs session_uid.
+push_session_history() {
+  local id="$1" new_uid="$2"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg id "$id" --arg uid "$new_uid" --argjson max "$MAX_SESSION_HISTORY" '
+    (.tasks[] | select(.id == $id)) |= (
+      ([$uid] + [(.session_history // [])[] | select(. != $uid)])[:$max] as $new |
+      .session_history = $new |
+      .session_uid = $new[0]
+    )
+  ' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
+# Return newline-delimited session UIDs (newest first) for a task.
+# Falls back to session_uid if session_history is absent (pre-migration).
+get_session_history() {
+  local id="$1"
+  local hist
+  hist=$(jq -r --arg id "$id" '
+    .tasks[] | select(.id == $id) |
+    if (.session_history // []) | length > 0 then
+      .session_history[]
+    elif .session_uid != null and .session_uid != "" then
+      .session_uid
+    else
+      empty
+    end
+  ' "$GLOBAL_STATE" 2>/dev/null)
+  [[ -n "$hist" ]] && echo "$hist"
+  return 0
+}
+
+# Promote a history entry to position 0 and update session_uid to match.
+set_session_uid_from_history() {
+  local id="$1" uid="$2"
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg id "$id" --arg uid "$uid" '
+    (.tasks[] | select(.id == $id)) |= (
+      (.session_history // []) as $old |
+      if ($old | index($uid)) != null then
+        ([$uid] + [$old[] | select(. != $uid)]) as $new |
+        .session_history = $new |
+        .session_uid = $uid
+      else . end
+    )
+  ' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+

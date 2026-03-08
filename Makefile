@@ -13,6 +13,7 @@ test: build
 	zsh tests/test_liveness.sh
 	zsh tests/test_list_mode.sh
 	zsh tests/test_list_render.sh
+	zsh tests/test_session_history.sh
 
 clean:
 	@echo "cloard-board is the built artifact; not cleaning"

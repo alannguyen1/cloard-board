@@ -13,17 +13,14 @@ _build_claude_resume_cmd() {
   fi
 }
 
-# Capture session_uid for a task by finding the most recent session file.
-# Called from the on-prompt hook as a backup for tasks started without session_uid.
+# Capture session_uid for a task by scanning all session files in the project dir.
+# Compares each UID against the task's existing history, pushing any new ones.
+# Called from the on-prompt hook on each prompt submission.
 cmd__capture_session_uid() {
   [[ -f "$GLOBAL_STATE" ]] || return 0
   local id="${1:-}"
   [[ -n "$id" ]] || return 0
   task_exists "$id" || return 0
-
-  local existing
-  existing=$(task_field "$id" "session_uid")
-  [[ -z "$existing" || "$existing" == "null" ]] || return 0  # already set
 
   local repo_name
   repo_name=$(task_repo "$id")
@@ -37,13 +34,44 @@ cmd__capture_session_uid() {
   local proj_dir="$HOME/.claude/projects/${encoded}"
   [[ -d "$proj_dir" ]] || return 0
 
-  local latest
-  latest=$(command ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
-  [[ -n "$latest" ]] || return 0
+  # Get all session files sorted by mtime (newest first)
+  local -a all_files=()
+  local _csf
+  while IFS= read -r _csf; do
+    [[ -n "$_csf" ]] && all_files+=("$_csf")
+  done < <(command ls -t "$proj_dir"/*.jsonl 2>/dev/null)
+  [[ ${#all_files[@]} -gt 0 ]] || return 0
 
-  local uid
-  uid=$(basename "$latest" .jsonl)
-  update_task_field "$id" "session_uid" "$uid"
+  # Build lookup set of UIDs already known to this task
+  local -A known_uids=()
+  local _csh
+  while IFS= read -r _csh; do
+    [[ -n "$_csh" ]] && known_uids[$_csh]=1
+  done < <(get_session_history "$id")
+  local existing_uid
+  existing_uid=$(task_field "$id" "session_uid")
+  [[ -n "$existing_uid" && "$existing_uid" != "null" ]] && known_uids[$existing_uid]=1
+
+  # Build collision set: UIDs claimed by other tasks in same repo
+  local -A collision_uids=()
+  local _csc
+  while IFS= read -r _csc; do
+    [[ -n "$_csc" ]] && collision_uids[$_csc]=1
+  done < <(jq -r --arg id "$id" --arg repo "$repo_name" '
+    .tasks[] | select(.id != $id and .repo == $repo) |
+    ((.session_history // [])[], .session_uid // empty)
+  ' "$GLOBAL_STATE" 2>/dev/null)
+
+  # Iterate from oldest to newest so the last push (newest by mtime) becomes active
+  local _csi uid
+  for (( _csi=${#all_files[@]}-1; _csi>=0; _csi-- )); do
+    uid=$(basename "${all_files[$_csi]}" .jsonl)
+    [[ -n "${known_uids[$uid]:-}" ]] && continue
+    [[ -n "${collision_uids[$uid]:-}" ]] && continue
+    push_session_history "$id" "$uid"
+    known_uids[$uid]=1
+  done
+  return 0
 }
 
 cmd_init() {
@@ -235,7 +263,8 @@ cmd_session() {
       started_at: $now,
       completed_at: null,
       claude_status: null,
-      session_uid: $uid
+      session_uid: $uid,
+      session_history: [$uid]
     }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
   _unlock_state
 
@@ -376,7 +405,7 @@ cmd_start() {
   # Update state
   update_task_field "$id" "status" "active"
   update_task_field "$id" "started_at" "$(now_iso)"
-  [[ -n "$session_uid" ]] && update_task_field "$id" "session_uid" "$session_uid"
+  [[ -n "$session_uid" ]] && push_session_history "$id" "$session_uid"
 
   # Try to discover worktree path
   local wt_path
