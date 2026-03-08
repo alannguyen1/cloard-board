@@ -34,8 +34,17 @@ _split_build_cmd() {
     update_task_field "$task_id" "status" "active"
     update_task_field "$task_id" "started_at" "$(now_iso)"
     push_session_history "$task_id" "$session_uid"
+  elif [[ "$tst" == "paused" ]]; then
+    update_task_field "$task_id" "status" "active"
+    _sbc_cmd=$(_build_claude_resume_cmd "$task_id")
+  elif [[ "$tst" == "done" ]]; then
+    update_task_field "$task_id" "status" "active"
+    update_task_field "$task_id" "worktree_mode" "none"
+    update_task_field_raw "$task_id" "branch" "null"
+    update_task_field_raw "$task_id" "completed_at" "null"
+    _sbc_cmd=$(_build_claude_resume_cmd "$task_id")
   else
-    # Resume existing session (active, paused, needs_review, done)
+    # active, needs_review: just resume
     _sbc_cmd=$(_build_claude_resume_cmd "$task_id")
   fi
 }

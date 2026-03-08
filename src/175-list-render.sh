@@ -551,134 +551,20 @@ _list_handle_key() {
           ;;
         task:*)
           local sel_id="${item#task:}"
-          if [[ "${_split_active:-0}" == "1" ]]; then
+          local repo_name="${_task_repo[$sel_id]}"
+          if [[ -n "${_repo_stale[$repo_name]:-}" ]]; then
+            cursor_show; stty echo
+            echo ""
+            echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${repo_name} <new-path>${C_RESET}"
+            sleep 2
+            stty -echo; cursor_hide
+          elif [[ "${_split_active:-0}" == "1" ]]; then
             if [[ "$sel_id" != "$_split_task_id" ]]; then
               _split_switch_session "$sel_id"
             fi
-            # Focus the Claude session pane
-            tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
+            # Keep focus on sidebar (pane 0); user presses l to move to Claude pane
           else
-            # Delegate to kanban-style Enter handling (start/resume/attach)
-            local cur_status="${_task_status[$sel_id]}"
-            local sel_repo="${_task_repo[$sel_id]}"
-            local sel_rpath
-            sel_rpath=$(repo_path "$sel_repo")
-
-            if [[ -n "${_repo_stale[$sel_repo]:-}" ]]; then
-              cursor_show; stty echo
-              echo ""
-              echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${sel_repo} <new-path>${C_RESET}"
-              sleep 2
-              stty -echo; cursor_hide
-            else
-              case "$cur_status" in
-                pending)
-                  cursor_show; stty echo
-                  local task_title="${_task_title[$sel_id]}"
-                  echo ""
-                  echo "${C_CYAN}Starting task '${sel_id}': ${task_title}${C_RESET}"
-                  printf "${C_CYAN}Prompt for Claude (or Enter to skip): ${C_RESET}"
-                  local task_prompt=""
-                  read -r task_prompt
-                  local dash_wt_mode="${_task_wtmode[$sel_id]}"
-                  local rtype="${_repo_types[$sel_repo]:-git}"
-                  if [[ "$rtype" == "dir" ]]; then
-                    dash_wt_mode="none"
-                  elif [[ "$dash_wt_mode" != "none" ]]; then
-                    printf "${C_CYAN}Use worktree? [Y/n]: ${C_RESET}"
-                    local wt_choice=""
-                    read -r wt_choice
-                    if [[ "$wt_choice" =~ ^[nN]$ ]]; then
-                      dash_wt_mode="none"
-                      update_task_field "$sel_id" "worktree_mode" "none"
-                      update_task_field_raw "$sel_id" "branch" "null"
-                    fi
-                  fi
-                  stty -echo; cursor_hide
-                  local dash_session_uid
-                  dash_session_uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
-                  local dash_claude_cmd
-                  if [[ "$dash_wt_mode" == "none" ]]; then
-                    dash_claude_cmd="claude --session-id ${dash_session_uid} --dangerously-skip-permissions"
-                  else
-                    dash_claude_cmd="claude --worktree ${sel_id} --session-id ${dash_session_uid} --dangerously-skip-permissions"
-                  fi
-                  if [[ -n "$task_prompt" ]]; then
-                    local escaped="${task_prompt//\'/\'\\\'\'}"
-                    dash_claude_cmd="${dash_claude_cmd} '${escaped}'"
-                  fi
-                  _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
-                  update_task_field "$sel_id" "status" "active"
-                  update_task_field "$sel_id" "started_at" "$(now_iso)"
-                  push_session_history "$sel_id" "$dash_session_uid"
-                  tmux_select_window "$sel_id"
-                  ;;
-                paused)
-                  if tmux_window_exists "$sel_id" && ! _tmux_claude_alive "$sel_id"; then
-                    tmux_kill_window "$sel_id"
-                  fi
-                  if ! tmux_window_exists "$sel_id"; then
-                    local wt_mode_paused="${_task_wtmode[$sel_id]}"
-                    local resume_cmd
-                    resume_cmd=$(_build_claude_resume_cmd "$sel_id")
-                    if [[ "$wt_mode_paused" == "none" ]]; then
-                      _tmux_launch_claude "$sel_id" "$sel_rpath" "$resume_cmd"
-                    else
-                      local wt_p
-                      wt_p=$(find_worktree_path "$sel_id" "$sel_rpath")
-                      [[ -n "$wt_p" ]] && _tmux_launch_claude "$sel_id" "$wt_p" "$resume_cmd"
-                    fi
-                  fi
-                  update_task_field "$sel_id" "status" "active"
-                  tmux_select_window "$sel_id"
-                  ;;
-                active|needs_review)
-                  if tmux_window_exists "$sel_id" && ! _tmux_claude_alive "$sel_id"; then
-                    tmux_kill_window "$sel_id"
-                  fi
-                  if ! tmux_window_exists "$sel_id"; then
-                    local wt_mode_act="${_task_wtmode[$sel_id]}"
-                    local resume_cmd
-                    resume_cmd=$(_build_claude_resume_cmd "$sel_id")
-                    if [[ "$wt_mode_act" == "none" ]]; then
-                      _tmux_launch_claude "$sel_id" "$sel_rpath" "$resume_cmd"
-                    else
-                      local wt_a
-                      wt_a=$(find_worktree_path "$sel_id" "$sel_rpath")
-                      [[ -n "$wt_a" ]] && _tmux_launch_claude "$sel_id" "$wt_a" "$resume_cmd"
-                    fi
-                  fi
-                  cursor_show
-                  tmux_select_window "$sel_id"
-                  cursor_hide
-                  ;;
-                done)
-                  cursor_show; stty echo
-                  local task_title_done="${_task_title[$sel_id]}"
-                  echo ""
-                  echo "${C_CYAN}Reopening '${sel_id}': ${task_title_done}${C_RESET}"
-                  printf "${C_CYAN}Prompt for Claude (or Enter to continue previous session): ${C_RESET}"
-                  local reopen_prompt=""
-                  read -r reopen_prompt
-                  stty -echo; cursor_hide
-                  local dash_claude_cmd
-                  if [[ -n "$reopen_prompt" ]]; then
-                    local escaped="${reopen_prompt//\'/\'\\\'\'}"
-                    dash_claude_cmd="claude --dangerously-skip-permissions '${escaped}'"
-                  else
-                    dash_claude_cmd=$(_build_claude_resume_cmd "$sel_id")
-                  fi
-                  _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
-                  update_task_field "$sel_id" "status" "active"
-                  update_task_field "$sel_id" "worktree_mode" "none"
-                  update_task_field_raw "$sel_id" "branch" "null"
-                  update_task_field_raw "$sel_id" "completed_at" "null"
-                  cursor_show
-                  tmux_select_window "$sel_id"
-                  cursor_hide
-                  ;;
-              esac
-            fi
+            _split_open "$sel_id"
           fi
           ;;
         cron:*)
