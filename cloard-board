@@ -1640,13 +1640,23 @@ cmd_repo_unarchive() {
 
 # ── Commands ───────────────────────────────────────────────────────────────────
 
+# Check if a Claude session exists on disk.
+# Sessions stored at ~/Library/Application Support/Claude/claude-code-sessions/*/UUID/
+_claude_session_exists() {
+  local uid="$1"
+  local sessions_root="${HOME}/Library/Application Support/Claude/claude-code-sessions"
+  [[ -d "$sessions_root" ]] || return 1
+  local matches=("${sessions_root}"/*/"${uid}"(N))
+  [[ ${#matches[@]} -gt 0 ]] && [[ -d "${matches[0]}" ]]
+}
+
 # Build the right Claude resume command for a task.
-# Uses --resume <session_uid> if available, falls back to --continue.
+# Uses --resume <session_uid> if the session exists on disk, falls back to --continue.
 _build_claude_resume_cmd() {
   local id="$1"
   local session_uid
   session_uid=$(task_field "$id" "session_uid")
-  if [[ -n "$session_uid" && "$session_uid" != "null" ]]; then
+  if [[ -n "$session_uid" && "$session_uid" != "null" ]] && _claude_session_exists "$session_uid"; then
     echo "claude --resume ${session_uid} --dangerously-skip-permissions"
   else
     echo "claude --continue --dangerously-skip-permissions"

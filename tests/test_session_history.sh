@@ -530,7 +530,7 @@ assert_match "list mode Enter dispatch present" \
   "$(grep '_list_handle_key.*ENTER' "$BOARD")"
 
 # H11: set_session_uid_from_history then _build_claude_resume_cmd flow
-# Verify the modal updates state, then resume reads from updated state
+# When session doesn't exist on disk, falls back to --continue
 result=$(run_zsh <<'SCRIPT'
 source "$2"
 GLOBAL_DIR=$(mktemp -d)
@@ -538,13 +538,32 @@ GLOBAL_STATE="$GLOBAL_DIR/state.json"
 cat > "$GLOBAL_STATE" <<'JSON'
 {"version":4,"next_task_id":2,"repos":[],"tasks":[{"id":"t-001","title":"test","repo":"r","status":"active","session_uid":"uid-c","session_history":["uid-c","uid-b","uid-a"]}],"cron_jobs":[],"cron_runs":[]}
 JSON
-# Simulate what the H handler does: modal sets uid, then resume reads it
 set_session_uid_from_history "t-001" "uid-a"
 _build_claude_resume_cmd "t-001"
 SCRIPT
 )
-assert_eq "resume cmd uses updated session_uid after history switch" \
-  "claude --resume uid-a --dangerously-skip-permissions" "$result"
+assert_eq "resume cmd falls back to --continue when session not on disk" \
+  "claude --continue --dangerously-skip-permissions" "$result"
+
+# H12: _build_claude_resume_cmd uses --resume when session exists on disk
+result=$(run_zsh <<'SCRIPT'
+source "$2"
+GLOBAL_DIR=$(mktemp -d)
+GLOBAL_STATE="$GLOBAL_DIR/state.json"
+# Create a fake session dir on disk
+SESSIONS_ROOT="${HOME}/Library/Application Support/Claude/claude-code-sessions"
+FAKE_PROJECT="${SESSIONS_ROOT}/test-project-$$"
+mkdir -p "${FAKE_PROJECT}/uid-real"
+cat > "$GLOBAL_STATE" <<'JSON'
+{"version":4,"next_task_id":2,"repos":[],"tasks":[{"id":"t-001","title":"test","repo":"r","status":"active","session_uid":"uid-real","session_history":["uid-real"]}],"cron_jobs":[],"cron_runs":[]}
+JSON
+result=$(_build_claude_resume_cmd "t-001")
+rm -rf "${FAKE_PROJECT}"
+echo "$result"
+SCRIPT
+)
+assert_eq "resume cmd uses --resume when session exists on disk" \
+  "claude --resume uid-real --dangerously-skip-permissions" "$result"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
