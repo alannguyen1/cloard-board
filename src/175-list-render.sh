@@ -771,15 +771,6 @@ _list_handle_key() {
       _list_needs_rebuild=1
       ;;
 
-    d) # Toggle show/hide done tasks
-      if [[ "$_show_done" == "1" ]]; then
-        _show_done=0
-      else
-        _show_done=1
-      fi
-      _list_needs_rebuild=1
-      ;;
-
     D) # Delete scheduled cron job
       local _d_item="${_list_items[$_list_cursor]:-}"
       if [[ "$_d_item" == cron:* ]]; then

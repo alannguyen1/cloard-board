@@ -449,9 +449,13 @@ assert_eq "list mode rendering branch present" "0" "$?"
 grep -q 'b).*Toggle split view' "$BOARD"
 assert_eq "b key handler for split toggle" "0" "$?"
 
-# D key for done toggle / cron delete in list mode
-grep -q 'D).*Delete scheduled cron.*toggle show done' "$BOARD"
-assert_eq "D key handler for done toggle" "0" "$?"
+# d key for show/hide done tasks (shared handler, not in _list_handle_key)
+grep -q '_show_done' "$BOARD"
+assert_eq "d key show done toggle variable present" "0" "$?"
+
+# D key for cron delete in list mode
+grep -q 'D).*Delete scheduled cron' "$BOARD"
+assert_eq "D key handler for cron delete" "0" "$?"
 
 # Tab cycles repo filter
 grep -q 'Tab.*cycle.*repo.*filter' "$BOARD"
