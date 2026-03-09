@@ -185,12 +185,12 @@ _render_cron_row() {
 
 # Render the key-hints footer bar at the bottom of the screen
 _render_footer() {
-  move_to "$((rows - 1))" 1
+  move_to "$((rows - ${_footer_lines:-1} + 1))" 1
   if [[ "${_view_mode:-kanban}" == "list" ]]; then
     if [[ ${_split_active:-0} -eq 1 ]]; then
-      printf "${C_DIM}  j/k: nav  Enter/l: focus  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: full list  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: nav  Enter/l: focus  Ctrl-F: toggle  F: fullscreen  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: full list  q: quit${C_RESET}"
     else
-      printf "${C_DIM}  j/k: nav  Tab: filter  Enter: open  </> status  :/\" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: split  v: kanban  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: nav  Tab: filter  Enter: open  </> status  :/\" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: split  F: fullscreen  v: kanban  q: quit${C_RESET}"
     fi
   elif [[ $cron_row_selected -eq 1 ]]; then
     printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: new cron  D: delete  Esc: back  v: list  q: quit${C_RESET}"

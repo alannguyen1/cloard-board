@@ -468,7 +468,7 @@ assert_match "modal contains _session_history_modal" "_session_history_modal" "$
 assert_match "H key in list mode help" "H.*Browse session history" "$(grep -A20 'List view:' "$BOARD" | grep 'H.*Browse session history')"
 
 # G6: cmd_session creates session_history in jq
-assert_match "cmd_session includes session_history" "session_history:.*uid" "$(grep 'session_history:' "$BOARD" | head -1)"
+assert_match "cmd_session includes session_history" "session_history:.*uid" "$(grep 'session_history:.*uid' "$BOARD" | head -1)"
 
 # G7: _session_file_mtime function exists
 assert_match "_session_file_mtime function exists" "_session_file_mtime" "$(grep '_session_file_mtime()' "$BOARD")"

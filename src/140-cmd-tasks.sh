@@ -184,7 +184,9 @@ cmd_add() {
       created_at: $now,
       started_at: null,
       completed_at: null,
-      claude_status: null
+      claude_status: null,
+      session_uid: null,
+      session_history: []
     }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
   _unlock_state
 

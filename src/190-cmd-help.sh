@@ -110,6 +110,9 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     H           Browse session history for selected task
     D           Toggle show/hide done tasks
     b           Toggle split view (sidebar + Claude session)
+    l           Focus Claude pane (split mode)
+    Ctrl-F      Toggle focus between sidebar and Claude pane
+    F           Full-screen the Claude session (exits split)
     v           Switch back to kanban view
     ESC         Close split view or collapse current group
 EOF

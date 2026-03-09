@@ -688,6 +688,14 @@ _list_handle_key() {
       fi
       ;;
 
+    F) # Full-screen the Claude session (exits split view)
+      if [[ "${_split_active:-0}" == "1" && -n "${_split_task_id:-}" ]]; then
+        local fs_task_id="$_split_task_id"
+        _split_close
+        tmux_select_window "$fs_task_id"
+      fi
+      ;;
+
     ESC) # Escape
       if [[ "${_split_active:-0}" == "1" ]]; then
         _split_close

@@ -59,6 +59,10 @@ _register_global_hooks() {
   local new_hooks
   new_hooks=$(jq -n --arg stop "$HOOKS_DIR/on-stop.sh" --arg prompt "$HOOKS_DIR/on-prompt.sh" '{
     "Stop": [{"hooks": [{"type": "command", "command": $stop}]}],
+    "PostToolUse": [
+      {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": $stop}]},
+      {"matcher": "ExitPlanMode", "hooks": [{"type": "command", "command": $stop}]}
+    ],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": $prompt}]}]
   }')
 

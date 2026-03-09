@@ -146,6 +146,11 @@ _modal_input_loop() {
                 [[ $_mf_dropdown_idx -lt $max_dd ]] && _mf_dropdown_idx=$((_mf_dropdown_idx + 1))
               fi
               ;;
+            C|D) # Left/Right arrow: toggle worktree when focused
+              if [[ $_mf_focus -eq 2 && $_mf_wt_locked -eq 0 ]]; then
+                _mf_worktree=$(( 1 - _mf_worktree ))
+              fi
+              ;;
             Z) # Shift-Tab
               _modal_handle_shift_tab
               ;;

@@ -14,7 +14,7 @@ readonly GLOBAL_DIR="$HOME/.cloard-board"
 readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
 readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
-readonly HOOK_VERSION="2"
+readonly HOOK_VERSION="3"
 readonly MAX_SESSION_HISTORY=10
 
 # ── Colours (ANSI) ────────────────────────────────────────────────────────────
@@ -537,6 +537,10 @@ _register_global_hooks() {
   local new_hooks
   new_hooks=$(jq -n --arg stop "$HOOKS_DIR/on-stop.sh" --arg prompt "$HOOKS_DIR/on-prompt.sh" '{
     "Stop": [{"hooks": [{"type": "command", "command": $stop}]}],
+    "PostToolUse": [
+      {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": $stop}]},
+      {"matcher": "ExitPlanMode", "hooks": [{"type": "command", "command": $stop}]}
+    ],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": $prompt}]}]
   }')
 
@@ -1824,7 +1828,9 @@ cmd_add() {
       created_at: $now,
       started_at: null,
       completed_at: null,
-      claude_status: null
+      claude_status: null,
+      session_uid: null,
+      session_history: []
     }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
   _unlock_state
 
@@ -2774,6 +2780,11 @@ _modal_input_loop() {
               if [[ $_mf_dropdown_open -eq 1 ]]; then
                 local max_dd=$(( ${#_mf_repo_list[@]} - 1 ))
                 [[ $_mf_dropdown_idx -lt $max_dd ]] && _mf_dropdown_idx=$((_mf_dropdown_idx + 1))
+              fi
+              ;;
+            C|D) # Left/Right arrow: toggle worktree when focused
+              if [[ $_mf_focus -eq 2 && $_mf_wt_locked -eq 0 ]]; then
+                _mf_worktree=$(( 1 - _mf_worktree ))
               fi
               ;;
             Z) # Shift-Tab
@@ -4027,12 +4038,12 @@ _render_cron_row() {
 
 # Render the key-hints footer bar at the bottom of the screen
 _render_footer() {
-  move_to "$((rows - 1))" 1
+  move_to "$((rows - ${_footer_lines:-1} + 1))" 1
   if [[ "${_view_mode:-kanban}" == "list" ]]; then
     if [[ ${_split_active:-0} -eq 1 ]]; then
-      printf "${C_DIM}  j/k: nav  Enter/l: focus  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: full list  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: nav  Enter/l: focus  Ctrl-F: toggle  F: fullscreen  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: full list  q: quit${C_RESET}"
     else
-      printf "${C_DIM}  j/k: nav  Tab: filter  Enter: open  </> status  :/\" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: split  v: kanban  q: quit${C_RESET}"
+      printf "${C_DIM}  j/k: nav  Tab: filter  Enter: open  </> status  :/\" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: split  F: fullscreen  v: kanban  q: quit${C_RESET}"
     fi
   elif [[ $cron_row_selected -eq 1 ]]; then
     printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: new cron  D: delete  Esc: back  v: list  q: quit${C_RESET}"
@@ -4737,6 +4748,14 @@ _list_handle_key() {
       fi
       ;;
 
+    F) # Full-screen the Claude session (exits split view)
+      if [[ "${_split_active:-0}" == "1" && -n "${_split_task_id:-}" ]]; then
+        local fs_task_id="$_split_task_id"
+        _split_close
+        tmux_select_window "$fs_task_id"
+      fi
+      ;;
+
     ESC) # Escape
       if [[ "${_split_active:-0}" == "1" ]]; then
         _split_close
@@ -4831,11 +4850,21 @@ _list_handle_key() {
 # Sets dynamic-scoped variables _sbc_cmd and _sbc_dir for the caller.
 _split_build_cmd() {
   local task_id="$1"
-  local tst="${_task_status[$task_id]}"
-  local repo_name="${_task_repo[$task_id]}"
+  local tst="${_task_status[$task_id]:-}"
+  # Fallback to live state when snapshot is stale (e.g. task just created by modal)
+  if [[ -z "$tst" ]]; then
+    tst=$(task_status "$task_id")
+  fi
+  local repo_name="${_task_repo[$task_id]:-}"
+  if [[ -z "$repo_name" ]]; then
+    repo_name=$(task_field "$task_id" "repo")
+  fi
   local rpath
   rpath=$(repo_path "$repo_name")
-  local wt_mode="${_task_wtmode[$task_id]}"
+  local wt_mode="${_task_wtmode[$task_id]:-}"
+  if [[ -z "$wt_mode" ]]; then
+    wt_mode=$(task_field "$task_id" "worktree_mode")
+  fi
 
   # Default work directory to repo root
   _sbc_dir="$rpath"
@@ -4856,6 +4885,12 @@ _split_build_cmd() {
       _sbc_cmd="claude --session-id ${session_uid} --dangerously-skip-permissions"
     else
       _sbc_cmd="claude --worktree ${task_id} --session-id ${session_uid} --dangerously-skip-permissions"
+    fi
+
+    # Append initial prompt if set by caller (dynamic-scoped)
+    if [[ -n "${_split_initial_prompt:-}" ]]; then
+      local escaped_prompt="${_split_initial_prompt//\'/\'\\\'\'}"
+      _sbc_cmd="${_sbc_cmd} '${escaped_prompt}'"
     fi
 
     update_task_field "$task_id" "status" "active"
@@ -4889,16 +4924,19 @@ _purge_stale_windows() {
 
 # Install/remove tmux keybinding for returning to sidebar from the Claude pane.
 _split_bind_sidebar_key() {
-  tmux_cmd bind-key -T prefix h select-pane -t "board:dashboard.0" 2>/dev/null || true
+  tmux_cmd bind-key -T root C-f if-shell -F "#{>:#{window_panes},1}" "last-pane" 2>/dev/null || true
 }
 _split_unbind_sidebar_key() {
-  tmux_cmd unbind-key -T prefix h 2>/dev/null || true
+  tmux_cmd unbind-key -T root C-f 2>/dev/null || true
 }
 
 # Open a split pane with the task's Claude session on the right side.
 _split_open() {
   local task_id="$1"
-  local repo_name="${_task_repo[$task_id]}"
+  local repo_name="${_task_repo[$task_id]:-}"
+  if [[ -z "$repo_name" ]]; then
+    repo_name=$(task_field "$task_id" "repo")
+  fi
 
   # Bail if repo is stale (directory missing)
   if [[ "${_repo_stale[$repo_name]}" == "1" ]]; then
@@ -4933,18 +4971,16 @@ _split_open() {
 }
 
 # Switch the right pane to a different task's session.
+# Uses swap-pane for atomic switching (no layout change = no flicker).
 _split_switch_session() {
   local new_task_id="$1"
-
-  # Preserve the current session by breaking it out to its own window
-  if [[ -n "$_split_task_id" ]]; then
-    # Kill stale windows first so break-pane creates the only named window
-    _purge_stale_windows "$_split_task_id"
-    tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null || true
-  fi
+  local old_task_id="$_split_task_id"
 
   _split_task_id="$new_task_id"
-  local repo_name="${_task_repo[$new_task_id]}"
+  local repo_name="${_task_repo[$new_task_id]:-}"
+  if [[ -z "$repo_name" ]]; then
+    repo_name=$(task_field "$new_task_id" "repo")
+  fi
 
   # Bail if repo is stale
   if [[ "${_repo_stale[$repo_name]}" == "1" ]]; then
@@ -4957,13 +4993,38 @@ _split_switch_session() {
   _purge_stale_windows "$new_task_id"
 
   if tmux_window_exists "$new_task_id"; then
-    # Live session found: join it
+    # Live session found: atomic swap into the right pane
+    if tmux_cmd swap-pane -d -s "board:dashboard.1" -t "board:${new_task_id}.0" 2>/dev/null; then
+      # The window formerly named $new_task_id now holds the old pane content;
+      # rename it to the old task ID so it can be found later.
+      if [[ -n "$old_task_id" ]]; then
+        tmux_cmd rename-window -t "board:${new_task_id}" "$old_task_id" 2>/dev/null || true
+        _purge_stale_windows "$old_task_id"
+      fi
+      tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+      return 0
+    fi
+    # swap-pane failed; fall through to break+join fallback
+  fi
+
+  # -- Fallback / no existing window --
+  # Preserve the current session by breaking it out to its own window
+  if [[ -n "$old_task_id" ]]; then
+    _purge_stale_windows "$old_task_id"
+    tmux_cmd break-pane -d -s "board:dashboard.1" -n "$old_task_id" 2>/dev/null || true
+  fi
+
+  # Re-check: purge may have cleaned up, and a window might still exist
+  _purge_stale_windows "$new_task_id"
+
+  if tmux_window_exists "$new_task_id"; then
+    # Live session found after fallback: join it
     tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
     tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
     return 0
   fi
 
-  # Build command and work directory for the new task
+  # No existing window: build command and create a new split
   local _sbc_cmd="" _sbc_dir=""
   _split_build_cmd "$new_task_id"
 
@@ -5059,7 +5120,7 @@ cmd__dash_loop() {
   typeset -A _repo_collapsed
 
   # ── List mode state ──
-  local _view_mode="kanban"       # "kanban" or "list"
+  local _view_mode="list"          # "kanban" or "list"
   local -i _split_active=0        # 1 when sidebar+session split is open
   local -i _show_done=0           # 1 when done tasks visible in list mode
   local -i _list_cursor=0         # index into _list_items[]
@@ -5576,8 +5637,19 @@ cmd__dash_loop() {
       _render_cron_row
     fi
 
-    # Clip frame to terminal height (header always visible; reserve 1 for footer)
-    local _max_lines=$((rows - 1))
+    # Compute how many terminal lines the footer will occupy after wrapping
+    local _footer_len
+    if [[ "${_view_mode:-kanban}" == "list" ]]; then
+      if [[ ${_split_active:-0} -eq 1 ]]; then _footer_len=172
+      else _footer_len=181; fi
+    elif [[ $cron_row_selected -eq 1 ]]; then _footer_len=112
+    elif [[ "$filter_mode" == "all" ]]; then _footer_len=111
+    else _footer_len=154; fi
+    local _footer_lines=$(( (_footer_len + cols - 1) / cols ))
+    (( _footer_lines < 1 )) && _footer_lines=1
+
+    # Clip frame to terminal height (header always visible; reserve footer lines)
+    local _max_lines=$((rows - _footer_lines))
     local -a _flines
     _flines=("${(@f)_frame}")
     if [[ ${#_flines[@]} -gt $_max_lines ]]; then
@@ -5585,8 +5657,8 @@ cmd__dash_loop() {
       _frame="${(pj:\n:)_flines[@]}"$'\n'
     fi
 
-    # Output frame
-    printf '\033[H%s\033[J' "$_frame"
+    # Output frame (CSI 3 J clears tmux pane scrollback inline to prevent stale frames on scroll-up)
+    printf '\033[3J\033[H%s\033[J' "$_frame"
 
     # Deferred scrollbar (list mode, rendered after frame to use move_to positioning)
     if [[ "$_view_mode" == "list" && $_list_scrollbar_vh -gt 0 ]]; then
@@ -6208,8 +6280,20 @@ cmd__dash_loop() {
           if [[ -n "$new_id" ]]; then
             _modal_render_success "$new_id"
             sleep 1
-            local start_output
-            start_output=$( (cmd_start "$new_id" "$_mf_prompt") 2>&1 ) || true
+            if [[ "$_view_mode" == "list" ]]; then
+              # Open in split pane instead of full-screen window
+              local _split_initial_prompt="$_mf_prompt"
+              _list_follow_id="$new_id"
+              _list_needs_rebuild=1
+              if [[ "${_split_active:-0}" == "1" ]]; then
+                _split_switch_session "$new_id"
+              else
+                _split_open "$new_id"
+              fi
+            else
+              local start_output
+              start_output=$( (cmd_start "$new_id" "$_mf_prompt") 2>&1 ) || true
+            fi
           fi
         fi
         ;;
@@ -6539,7 +6623,7 @@ cmd__dash_loop() {
     # ── List mode key dispatch (navigation + list-specific keys) ──
     if [[ "$_view_mode" == "list" ]]; then
       case "$key" in
-        j|k|$'\t'|SHIFT_TAB|D|b|l|ESC|':'|'"')
+        j|k|$'\t'|SHIFT_TAB|D|b|l|F|ESC|':'|'"')
           _list_handle_key "$key"
           ;;
         $'\n'|$'\r') # Enter in list mode
@@ -6768,6 +6852,9 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
     H           Browse session history for selected task
     D           Toggle show/hide done tasks
     b           Toggle split view (sidebar + Claude session)
+    l           Focus Claude pane (split mode)
+    Ctrl-F      Toggle focus between sidebar and Claude pane
+    F           Full-screen the Claude session (exits split)
     v           Switch back to kanban view
     ESC         Close split view or collapse current group
 EOF

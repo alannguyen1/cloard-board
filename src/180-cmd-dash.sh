@@ -67,7 +67,7 @@ cmd__dash_loop() {
   typeset -A _repo_collapsed
 
   # ── List mode state ──
-  local _view_mode="kanban"       # "kanban" or "list"
+  local _view_mode="list"          # "kanban" or "list"
   local -i _split_active=0        # 1 when sidebar+session split is open
   local -i _show_done=0           # 1 when done tasks visible in list mode
   local -i _list_cursor=0         # index into _list_items[]
@@ -584,8 +584,19 @@ cmd__dash_loop() {
       _render_cron_row
     fi
 
-    # Clip frame to terminal height (header always visible; reserve 1 for footer)
-    local _max_lines=$((rows - 1))
+    # Compute how many terminal lines the footer will occupy after wrapping
+    local _footer_len
+    if [[ "${_view_mode:-kanban}" == "list" ]]; then
+      if [[ ${_split_active:-0} -eq 1 ]]; then _footer_len=172
+      else _footer_len=181; fi
+    elif [[ $cron_row_selected -eq 1 ]]; then _footer_len=112
+    elif [[ "$filter_mode" == "all" ]]; then _footer_len=111
+    else _footer_len=154; fi
+    local _footer_lines=$(( (_footer_len + cols - 1) / cols ))
+    (( _footer_lines < 1 )) && _footer_lines=1
+
+    # Clip frame to terminal height (header always visible; reserve footer lines)
+    local _max_lines=$((rows - _footer_lines))
     local -a _flines
     _flines=("${(@f)_frame}")
     if [[ ${#_flines[@]} -gt $_max_lines ]]; then
@@ -593,8 +604,8 @@ cmd__dash_loop() {
       _frame="${(pj:\n:)_flines[@]}"$'\n'
     fi
 
-    # Output frame
-    printf '\033[H%s\033[J' "$_frame"
+    # Output frame (CSI 3 J clears tmux pane scrollback inline to prevent stale frames on scroll-up)
+    printf '\033[3J\033[H%s\033[J' "$_frame"
 
     # Deferred scrollbar (list mode, rendered after frame to use move_to positioning)
     if [[ "$_view_mode" == "list" && $_list_scrollbar_vh -gt 0 ]]; then
@@ -1216,8 +1227,20 @@ cmd__dash_loop() {
           if [[ -n "$new_id" ]]; then
             _modal_render_success "$new_id"
             sleep 1
-            local start_output
-            start_output=$( (cmd_start "$new_id" "$_mf_prompt") 2>&1 ) || true
+            if [[ "$_view_mode" == "list" ]]; then
+              # Open in split pane instead of full-screen window
+              local _split_initial_prompt="$_mf_prompt"
+              _list_follow_id="$new_id"
+              _list_needs_rebuild=1
+              if [[ "${_split_active:-0}" == "1" ]]; then
+                _split_switch_session "$new_id"
+              else
+                _split_open "$new_id"
+              fi
+            else
+              local start_output
+              start_output=$( (cmd_start "$new_id" "$_mf_prompt") 2>&1 ) || true
+            fi
           fi
         fi
         ;;
@@ -1547,7 +1570,7 @@ cmd__dash_loop() {
     # ── List mode key dispatch (navigation + list-specific keys) ──
     if [[ "$_view_mode" == "list" ]]; then
       case "$key" in
-        j|k|$'\t'|SHIFT_TAB|D|b|l|ESC|':'|'"')
+        j|k|$'\t'|SHIFT_TAB|D|b|l|F|ESC|':'|'"')
           _list_handle_key "$key"
           ;;
         $'\n'|$'\r') # Enter in list mode

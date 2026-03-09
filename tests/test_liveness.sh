@@ -111,18 +111,38 @@ assert_eq "grep matches claude among multiple children" "alive" "$result"
 result=$(echo "" | grep -qE 'claude|node' && echo "alive" || echo "dead")
 assert_eq "grep rejects empty child list" "dead" "$result"
 
-# ── Fix B: Hook versioning ─────────────────────────────────────────────────
+# ── Fix B: Ctrl-F binding structure ────────────────────────────────────────
 
 echo ""
-echo "Fix B: Hook versioning"
+echo "Fix B: Ctrl-F binding structure"
+
+# Ctrl-F binding uses if-shell guard for multi-pane safety
+grep -q 'C-f.*if-shell' "$BOARD"
+assert_eq "Ctrl-F binding has if-shell guard" "0" "$?"
+
+# Ctrl-F binding uses last-pane for toggling
+grep -q 'last-pane' "$BOARD"
+assert_eq "Ctrl-F uses last-pane" "0" "$?"
+
+# No stale C-s bindings remain
+result_cs=$(grep -c 'bind-key.*C-s' "$BOARD" || true)
+assert_eq "no C-s bind-key remains" "0" "$result_cs"
+
+result_us=$(grep -c 'unbind-key.*C-s' "$BOARD" || true)
+assert_eq "no C-s unbind-key remains" "0" "$result_us"
+
+# ── Fix C: Hook versioning ─────────────────────────────────────────────────
+
+echo ""
+echo "Fix C: Hook versioning"
 
 # Test: HOOK_VERSION constant exists
 grep -q 'readonly HOOK_VERSION=' "$BOARD"
 assert_eq "HOOK_VERSION constant defined" "0" "$?"
 
 # Test: HOOK_VERSION is set to "2"
-grep -q 'readonly HOOK_VERSION="2"' "$BOARD"
-assert_eq "HOOK_VERSION is 2" "0" "$?"
+grep -q 'readonly HOOK_VERSION="3"' "$BOARD"
+assert_eq "HOOK_VERSION is 3" "0" "$?"
 
 # Test: on-stop.sh template includes hook-version marker
 grep -q 'hook-version:\${HOOK_VERSION}' "$BOARD"
@@ -145,6 +165,16 @@ assert_eq "bootstrap compares version against HOOK_VERSION" "0" "$?"
 grep -q '_install_hook_scripts' "$BOARD"
 assert_eq "_install_hook_scripts called on version mismatch" "0" "$?"
 
+# Test: PostToolUse hooks registered for AskUserQuestion and ExitPlanMode
+grep -q '"PostToolUse"' "$BOARD"
+assert_eq "PostToolUse hook type registered" "0" "$?"
+
+grep -q '"matcher": "AskUserQuestion"' "$BOARD"
+assert_eq "AskUserQuestion matcher registered" "0" "$?"
+
+grep -q '"matcher": "ExitPlanMode"' "$BOARD"
+assert_eq "ExitPlanMode matcher registered" "0" "$?"
+
 # ── Fix B: Functional version extraction simulation ────────────────────────
 
 echo ""
@@ -155,7 +185,7 @@ mock_hook="$TMPDIR_TEST/on-prompt.sh"
 cat > "$mock_hook" <<'EOF'
 #!/usr/bin/env bash
 # cloard-board hook: set task status to "working" when user submits a prompt
-# hook-version:2
+# hook-version:3
 [[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
 cloard-board signal "$CLOARD_TASK_ID" working &>/dev/null &
 cloard-board _capture-session-uid "$CLOARD_TASK_ID" &>/dev/null &
@@ -163,7 +193,7 @@ EOF
 
 # Extract version
 extracted=$(grep -o 'hook-version:[0-9]*' "$mock_hook" 2>/dev/null | cut -d: -f2)
-assert_eq "extracts version 2 from hook file" "2" "$extracted"
+assert_eq "extracts version 3 from hook file" "3" "$extracted"
 
 # Create a hook WITHOUT version marker (simulates old/stale hook)
 mock_old="$TMPDIR_TEST/on-prompt-old.sh"
@@ -178,11 +208,11 @@ extracted_old=$(grep -o 'hook-version:[0-9]*' "$mock_old" 2>/dev/null | cut -d: 
 assert_eq "old hook returns empty version" "" "$extracted_old"
 
 # Version mismatch detection
-[[ "$extracted_old" != "2" ]]
+[[ "$extracted_old" != "3" ]]
 assert_eq "stale hook triggers reinstall" "0" "$?"
 
 # Version match: no reinstall needed
-[[ "$extracted" != "2" ]] && result="mismatch" || result="match"
+[[ "$extracted" != "3" ]] && result="mismatch" || result="match"
 assert_eq "current hook passes version check" "match" "$result"
 
 # ── Summary ────────────────────────────────────────────────────────────────

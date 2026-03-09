@@ -583,10 +583,71 @@ assert_eq "cron items: active first, then review, then scheduled" "$expected_cro
 grep -q '_view_mode.*==.*kanban.*&&.*_has_cron_data' "$BOARD"
 assert_eq "cron row only renders in kanban mode" "0" "$?"
 
-# ── I: Stale window cleanup ────────────────────────────────────────────────
+# ── I: Split pane UX improvements ──────────────────────────────────────────
 
 echo ""
-echo "I: Stale window cleanup"
+echo "I: Split pane UX improvements"
+
+# F key handler in _list_handle_key
+grep -q 'F).*Full-screen the Claude session' "$BOARD"
+assert_eq "F key handler present in list mode" "0" "$?"
+
+# F key calls _split_close then tmux_select_window
+result_F=$(sed -n '/F).*Full-screen/,/;;/p' "$BOARD")
+echo "$result_F" | grep -q '_split_close'
+assert_eq "F key calls _split_close" "0" "$?"
+echo "$result_F" | grep -q 'tmux_select_window'
+assert_eq "F key calls tmux_select_window" "0" "$?"
+
+# F key in list-mode dispatch table
+grep -qE 'j\|k\|.*\|F\|' "$BOARD"
+assert_eq "F key in list mode dispatch table" "0" "$?"
+
+# Ctrl-F binding (changed from Ctrl-S to avoid Claude Code clash)
+grep -q 'C-f.*if-shell.*last-pane' "$BOARD"
+assert_eq "Ctrl-F binding with if-shell guard" "0" "$?"
+
+# Ctrl-F unbind
+grep -q 'unbind-key.*C-f' "$BOARD"
+assert_eq "Ctrl-F unbind present" "0" "$?"
+
+# No Ctrl-S tmux bindings remain (replaced by Ctrl-F)
+result_cs=$(grep -c 'bind.*C-s\|unbind.*C-s' "$BOARD" || true)
+assert_eq "no C-s bindings remain" "0" "$result_cs"
+
+# _split_initial_prompt support in _split_build_cmd
+grep -q '_split_initial_prompt' "$BOARD"
+assert_eq "_split_initial_prompt support in _split_build_cmd" "0" "$?"
+
+# c key in list mode routes through split pane
+grep -qE '_view_mode.*==.*list.*_split_initial_prompt' "$BOARD" || \
+  result_c=$(sed -n '/new_id.*then/,/fi.*fi/p' "$BOARD" | grep -c '_split_initial_prompt')
+assert_eq "c key routes through split pane in list mode" "1" "$(( result_c >= 1 ? 1 : 0 ))"
+
+# Default view mode is list
+grep -q '_view_mode="list"' "$BOARD"
+assert_eq "default view mode is list" "0" "$?"
+
+# Footer shows F: fullscreen in split mode
+grep -q 'F: fullscreen' "$BOARD"
+assert_eq "footer shows F: fullscreen" "0" "$?"
+
+# Footer shows Ctrl-F: toggle in split mode
+grep -q 'Ctrl-F: toggle' "$BOARD"
+assert_eq "footer shows Ctrl-F: toggle" "0" "$?"
+
+# Help text has F key entry
+grep -q 'F.*Full-screen the Claude session' "$BOARD"
+assert_eq "help text has F key entry" "0" "$?"
+
+# Help text has Ctrl-F entry
+grep -q 'Ctrl-F.*Toggle focus' "$BOARD"
+assert_eq "help text has Ctrl-F entry" "0" "$?"
+
+# ── J: Stale window cleanup ────────────────────────────────────────────────
+
+echo ""
+echo "J: Stale window cleanup"
 
 # _purge_stale_windows function present
 grep -q '_purge_stale_windows()' "$BOARD"
@@ -600,9 +661,9 @@ assert_eq "_purge_stale_windows has iteration limit" "0" "$?"
 result_open=$(sed -n '/_split_open()/,/^}/p' "$BOARD" | grep '_purge_stale_windows')
 assert_match "_split_open purges stale windows" '_purge_stale_windows' "$result_open"
 
-# _split_switch_session calls _purge_stale_windows for both old and new task
+# _split_switch_session calls _purge_stale_windows for old and new task (swap + fallback paths)
 result_switch=$(sed -n '/_split_switch_session()/,/^}/p' "$BOARD" | grep -c '_purge_stale_windows')
-assert_eq "_split_switch_session purges both old and new task" "2" "$result_switch"
+assert_eq "_split_switch_session purges both old and new task" "4" "$result_switch"
 
 # _split_close calls _purge_stale_windows
 result_close=$(sed -n '/_split_close()/,/^}/p' "$BOARD" | grep '_purge_stale_windows')
