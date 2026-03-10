@@ -47,14 +47,14 @@ _split_build_cmd() {
       _sbc_cmd="${_sbc_cmd} '${escaped_prompt}'"
     fi
 
-    update_task_field "$task_id" "status" "active"
+    set_task_status "$task_id" "active"
     update_task_field "$task_id" "started_at" "$(now_iso)"
     push_session_history "$task_id" "$session_uid"
   elif [[ "$tst" == "paused" ]]; then
-    update_task_field "$task_id" "status" "active"
+    set_task_status "$task_id" "active"
     _sbc_cmd=$(_build_claude_resume_cmd "$task_id")
   elif [[ "$tst" == "done" ]]; then
-    update_task_field "$task_id" "status" "active"
+    set_task_status "$task_id" "active"
     update_task_field "$task_id" "worktree_mode" "none"
     update_task_field_raw "$task_id" "branch" "null"
     update_task_field_raw "$task_id" "completed_at" "null"
@@ -107,7 +107,7 @@ _split_open() {
   if tmux_window_exists "$task_id"; then
     # Live session found: join it into the dashboard as right pane
     tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
-    tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+    tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
 
@@ -121,7 +121,7 @@ _split_open() {
   tmux_cmd split-window -h -t "board:dashboard" -p 60 \
     "export CLOARD_TASK_ID=${task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
 
-  tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+  tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
 }
 
 # Switch the right pane to a different task's session.
@@ -155,7 +155,7 @@ _split_switch_session() {
         tmux_cmd rename-window -t "board:${new_task_id}" "$old_task_id" 2>/dev/null || true
         _purge_stale_windows "$old_task_id"
       fi
-      tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+      tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
     # swap-pane failed; fall through to break+join fallback
@@ -174,7 +174,7 @@ _split_switch_session() {
   if tmux_window_exists "$new_task_id"; then
     # Live session found after fallback: join it
     tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
-    tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+    tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
 
@@ -188,7 +188,7 @@ _split_switch_session() {
   tmux_cmd split-window -h -t "board:dashboard" -p 60 \
     "export CLOARD_TASK_ID=${new_task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
 
-  tmux_cmd select-pane -t "board:dashboard.0" 2>/dev/null || true
+  tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
 }
 
 # Close the split view, preserving the running session in its own tmux window.

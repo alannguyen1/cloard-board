@@ -157,7 +157,7 @@ ensure_global_state >/dev/null
 jq -r '.version' "$GLOBAL_STATE"
 SCRIPT
 )
-assert_eq "ensure_global_state creates v4 for new state" "4" "$result"
+assert_eq "ensure_global_state creates v5 for new state" "5" "$result"
 
 # B6: ensure_global_state migrates v3 to v4
 result=$(run_zsh <<'SCRIPT'
@@ -176,7 +176,7 @@ ensure_global_state >/dev/null
 jq -r '.version' "$GLOBAL_STATE"
 SCRIPT
 )
-assert_eq "ensure_global_state migrates v3 to v4" "4" "$result"
+assert_eq "ensure_global_state migrates v3 to v5" "5" "$result"
 
 # ── C: push_session_history ──────────────────────────────────────────────────
 echo ""

@@ -9,6 +9,7 @@ _snapshot_tasks() {
   _task_claude=()
   _task_wtmode=()
   _task_repo=()
+  _task_status_at=()
   _repo_names=()
   _repo_paths=()
   _repo_types=()
@@ -37,12 +38,12 @@ _snapshot_tasks() {
   _snap=$(jq -r '
     ("H\u001e" + (.next_task_id | tostring) + "\u001e" + (.repos | length | tostring) + "\u001e" + (.tasks | length | tostring)),
     (.repos[] | "R\u001e" + .name + "\u001e" + .path + "\u001e" + (.type // "git") + "\u001e" + (if .archived == true then "1" else "0" end)),
-    (.tasks[] | "T\u001e" + .id + "\u001e" + .status + "\u001e" + (.title // "") + "\u001e" + (.pr_url // "") + "\u001e" + (.claude_status // "") + "\u001e" + (.worktree_mode // "worktree") + "\u001e" + (.repo // "")),
+    (.tasks[] | "T\u001e" + .id + "\u001e" + .status + "\u001e" + (.title // "") + "\u001e" + (.pr_url // "") + "\u001e" + (.claude_status // "") + "\u001e" + (.worktree_mode // "worktree") + "\u001e" + (.repo // "") + "\u001e" + (.status_changed_at // "")),
     (.cron_jobs[]? | "CJ\u001e" + .id + "\u001e" + .name + "\u001e" + (if .enabled then "true" else "false" end) + "\u001e" + (.schedule_desc // "")),
     (.cron_runs[]? | select(.status == "active" or .status == "needs_review" or .status == "reviewed") | "CR\u001e" + .run_id + "\u001e" + .cron_job_id + "\u001e" + .status + "\u001e" + (.exit_code | tostring) + "\u001e" + (.started_at // "") + "\u001e" + (.session_id // "") + "\u001e" + (.tmux_window // ""))
   ' "$GLOBAL_STATE" 2>/dev/null) || return 0
 
-  while IFS=$'\x1e' read -r _type _f1 _f2 _f3 _f4 _f5 _f6 _f7; do
+  while IFS=$'\x1e' read -r _type _f1 _f2 _f3 _f4 _f5 _f6 _f7 _f8; do
     case "$_type" in
       H)
         _total_task_count="$_f3"
@@ -64,13 +65,14 @@ _snapshot_tasks() {
         fi
         ;;
       T)
-        # _f1=id, _f2=status, _f3=title, _f4=pr_url, _f5=claude_status, _f6=worktree_mode, _f7=repo
+        # _f1=id, _f2=status, _f3=title, _f4=pr_url, _f5=claude_status, _f6=worktree_mode, _f7=repo, _f8=status_changed_at
         _task_status[$_f1]="$_f2"
         _task_title[$_f1]="$_f3"
         _task_pr[$_f1]="$_f4"
         _task_claude[$_f1]="$_f5"
         _task_wtmode[$_f1]="$_f6"
         _task_repo[$_f1]="$_f7"
+        _task_status_at[$_f1]="$_f8"
 
         [[ "$_f2" == "active" ]] && _active_count=$((_active_count + 1))
         [[ "$_f2" == "needs_review" ]] && _review_count=$((_review_count + 1))

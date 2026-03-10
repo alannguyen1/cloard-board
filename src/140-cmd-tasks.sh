@@ -184,6 +184,7 @@ cmd_add() {
       created_at: $now,
       started_at: null,
       completed_at: null,
+      status_changed_at: $now,
       claude_status: null,
       session_uid: null,
       session_history: []
@@ -274,6 +275,7 @@ cmd_session() {
       created_at: $now,
       started_at: $now,
       completed_at: null,
+      status_changed_at: $now,
       claude_status: null,
       session_uid: $uid,
       session_history: [$uid]
@@ -415,7 +417,7 @@ cmd_start() {
   fi
 
   # Update state
-  update_task_field "$id" "status" "active"
+  set_task_status "$id" "active"
   update_task_field "$id" "started_at" "$(now_iso)"
   [[ -n "$session_uid" ]] && push_session_history "$id" "$session_uid"
 
@@ -483,7 +485,7 @@ cmd_advance() {
       cmd_resume "$id"
       ;;
     active)
-      update_task_field "$id" "status" "needs_review"
+      set_task_status "$id" "needs_review"
       update_task_field_raw "$id" "claude_status" "null"
       ok "advanced '${id}': active -> needs_review"
       ;;
@@ -530,7 +532,7 @@ cmd_done() {
     fi
   fi
 
-  update_task_field "$id" "status" "done"
+  set_task_status "$id" "done"
   update_task_field "$id" "completed_at" "$(now_iso)"
   update_task_field_raw "$id" "claude_status" "null"
 
@@ -578,7 +580,7 @@ cmd_reopen() {
   fi
 
   # Update state: reactivate the task
-  update_task_field "$id" "status" "active"
+  set_task_status "$id" "active"
   update_task_field "$id" "worktree_mode" "none"
   update_task_field_raw "$id" "branch" "null"
   update_task_field_raw "$id" "completed_at" "null"
@@ -603,7 +605,7 @@ cmd_pause() {
     die "task '$id' is '${tsk_status}'; must be 'active' or 'needs_review' to pause"
 
   tmux_kill_window "$id"
-  update_task_field "$id" "status" "paused"
+  set_task_status "$id" "paused"
   update_task_field_raw "$id" "claude_status" "null"
 
   ok "paused task '${id}'; worktree and branch preserved"
@@ -661,7 +663,7 @@ cmd_resume() {
 
   # Ensure status is active
   if [[ "$tsk_status" != "active" ]]; then
-    update_task_field "$id" "status" "active"
+    set_task_status "$id" "active"
   fi
 
   if [[ -z "${TMUX:-}" ]]; then
@@ -756,7 +758,7 @@ cmd_signal() {
         update_task_field "$id" "claude_status" "$signal"
         # If task was moved to needs_review by a previous "waiting" signal, move it back
         if [[ "$tsk_status" == "needs_review" ]]; then
-          update_task_field "$id" "status" "active"
+          set_task_status "$id" "active"
         fi
       fi
       ;;
@@ -766,7 +768,7 @@ cmd_signal() {
       if [[ "$tsk_status" == "active" ]]; then
         update_task_field "$id" "claude_status" "$signal"
         # Auto-move to needs_review when Claude is waiting
-        update_task_field "$id" "status" "needs_review"
+        set_task_status "$id" "needs_review"
       fi
       ;;
     clear)

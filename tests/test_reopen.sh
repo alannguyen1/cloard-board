@@ -77,7 +77,7 @@ assert_file_match "cmd_reopen uses claude --continue" \
   'claude --continue --dangerously-skip-permissions' "$BOARD"
 
 assert_file_match "cmd_reopen updates status to active" \
-  'update_task_field.*status.*active' "$BOARD"
+  'set_task_status.*active' "$BOARD"
 
 assert_file_match "cmd_reopen clears completed_at" \
   'update_task_field_raw.*completed_at.*null' "$BOARD"

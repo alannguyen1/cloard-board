@@ -80,7 +80,7 @@ cmd__dash_loop() {
   local -i _list_scrollbar_total=0
 
   # Declare snapshot arrays (persist across loop, modified by _snapshot_tasks via dynamic scope)
-  typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo
+  typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
   typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
   typeset -A _repo_cols _repo_col_cnt
   local -a _repo_names
@@ -949,7 +949,7 @@ cmd__dash_loop() {
                   dash_claude_cmd="${dash_claude_cmd} '${escaped}'"
                 fi
                 _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
-                update_task_field "$sel_id" "status" "active"
+                set_task_status "$sel_id" "active"
                 update_task_field "$sel_id" "started_at" "$(now_iso)"
                 push_session_history "$sel_id" "$dash_session_uid"
                 tmux_select_window "$sel_id"
@@ -970,7 +970,7 @@ cmd__dash_loop() {
                     [[ -n "$wt_p" ]] && _tmux_launch_claude "$sel_id" "$wt_p" "$resume_cmd"
                   fi
                 fi
-                update_task_field "$sel_id" "status" "active"
+                set_task_status "$sel_id" "active"
                 tmux_select_window "$sel_id"
                 ;;
               active|needs_review)
@@ -1013,7 +1013,7 @@ cmd__dash_loop() {
                   dash_claude_cmd=$(_build_claude_resume_cmd "$sel_id")
                 fi
                 _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
-                update_task_field "$sel_id" "status" "active"
+                set_task_status "$sel_id" "active"
                 update_task_field "$sel_id" "worktree_mode" "none"
                 update_task_field_raw "$sel_id" "branch" "null"
                 update_task_field_raw "$sel_id" "completed_at" "null"
@@ -1039,7 +1039,7 @@ cmd__dash_loop() {
             if [[ "$mv_status" == "needs_review" && "$next_status" == "done" ]]; then
               (cmd_done "$sel_id") 2>&1 || true
             else
-              update_task_field "$sel_id" "status" "$next_status"
+              set_task_status "$sel_id" "$next_status"
             fi
             [[ "$_view_mode" == "list" ]] && _list_follow_id="$sel_id"
           fi
@@ -1056,7 +1056,7 @@ cmd__dash_loop() {
           done
           if [[ $mv_idx -gt 0 ]]; then
             local prev_status="${status_order[$((mv_idx - 1))]}"
-            update_task_field "$sel_id" "status" "$prev_status"
+            set_task_status "$sel_id" "$prev_status"
             [[ "$_view_mode" == "list" ]] && _list_follow_id="$sel_id"
           fi
         fi
@@ -1445,7 +1445,7 @@ cmd__dash_loop() {
           local p_status="${_task_status[$sel_id]}"
           if [[ "$p_status" == "active" || "$p_status" == "needs_review" ]]; then
             tmux_kill_window "$sel_id"
-            update_task_field "$sel_id" "status" "paused"
+            set_task_status "$sel_id" "paused"
             update_task_field_raw "$sel_id" "claude_status" "null"
           fi
         fi
@@ -1488,7 +1488,7 @@ cmd__dash_loop() {
                 dash_claude_cmd=$(_build_claude_resume_cmd "$sel_id")
               fi
               _tmux_launch_claude "$sel_id" "$sel_rpath" "$dash_claude_cmd"
-              update_task_field "$sel_id" "status" "active"
+              set_task_status "$sel_id" "active"
               update_task_field "$sel_id" "worktree_mode" "none"
               update_task_field_raw "$sel_id" "branch" "null"
               update_task_field_raw "$sel_id" "completed_at" "null"

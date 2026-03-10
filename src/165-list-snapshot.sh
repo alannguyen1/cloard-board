@@ -2,6 +2,25 @@
 # Builds _list_items[] for the list view. Relies on zsh dynamic scoping to
 # access snapshot arrays and list state declared in cmd__dash_loop.
 
+# Sort an array of task IDs by _task_status_at descending (newest first).
+# ISO 8601 timestamps sort correctly as plain strings.
+# Sets reply=() with the sorted result.
+_sort_by_status_at() {
+  reply=("${@}")
+  local n=${#reply[@]}
+  [[ $n -le 1 ]] && return
+  local i j tmp
+  for (( i=0; i<n-1; i++ )); do
+    for (( j=i+1; j<n; j++ )); do
+      if [[ "${_task_status_at[${reply[$i]}]:-}" < "${_task_status_at[${reply[$j]}]:-}" ]]; then
+        tmp="${reply[$i]}"
+        reply[$i]="${reply[$j]}"
+        reply[$j]="$tmp"
+      fi
+    done
+  done
+}
+
 _list_build_items() {
   _list_items=()
 
@@ -59,8 +78,16 @@ _list_build_items() {
       esac
     done
 
-    # Append in priority order
+    # Sort each priority group by status_changed_at descending, then append
     local _lb_id
+    local -a reply=()
+    if [[ ${#_lb_pri_0[@]} -gt 1 ]]; then _sort_by_status_at "${_lb_pri_0[@]}"; _lb_pri_0=("${reply[@]}"); fi
+    if [[ ${#_lb_pri_1[@]} -gt 1 ]]; then _sort_by_status_at "${_lb_pri_1[@]}"; _lb_pri_1=("${reply[@]}"); fi
+    if [[ ${#_lb_pri_2[@]} -gt 1 ]]; then _sort_by_status_at "${_lb_pri_2[@]}"; _lb_pri_2=("${reply[@]}"); fi
+    if [[ ${#_lb_pri_3[@]} -gt 1 ]]; then _sort_by_status_at "${_lb_pri_3[@]}"; _lb_pri_3=("${reply[@]}"); fi
+    if [[ ${#_lb_pri_4[@]} -gt 1 ]]; then _sort_by_status_at "${_lb_pri_4[@]}"; _lb_pri_4=("${reply[@]}"); fi
+    if [[ ${#_lb_pri_5[@]} -gt 1 ]]; then _sort_by_status_at "${_lb_pri_5[@]}"; _lb_pri_5=("${reply[@]}"); fi
+    if [[ ${#_lb_pri_6[@]} -gt 1 ]]; then _sort_by_status_at "${_lb_pri_6[@]}"; _lb_pri_6=("${reply[@]}"); fi
     for _lb_id in "${_lb_pri_0[@]}"; do _list_items+=("task:${_lb_id}"); done
     for _lb_id in "${_lb_pri_1[@]}"; do _list_items+=("task:${_lb_id}"); done
     for _lb_id in "${_lb_pri_2[@]}"; do _list_items+=("task:${_lb_id}"); done

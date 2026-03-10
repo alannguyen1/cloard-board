@@ -19,6 +19,18 @@ task_field() {
   jq -r --arg id "$id" --arg f "$field" '.tasks[] | select(.id == $id) | .[$f] // ""' "$GLOBAL_STATE" 2>/dev/null
 }
 
+set_task_status() {
+  local id="$1" new_status="$2"
+  _lock_state || return 1
+  local tmp now
+  now=$(now_iso)
+  tmp=$(mktemp "${GLOBAL_DIR}/.tasks.XXXXXX")
+  jq --arg id "$id" --arg st "$new_status" --arg now "$now" \
+    '(.tasks[] | select(.id == $id)) |= (.status = $st | .status_changed_at = $now)' \
+    "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+}
+
 update_task_field() {
   local id="$1" field="$2" value="$3"
   _lock_state || return 1

@@ -3,7 +3,7 @@ ensure_global_state() {
   mkdir -p "$GLOBAL_DIR"
 
   if [[ ! -f "$GLOBAL_STATE" ]]; then
-    jq -n '{version: 4, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
+    jq -n '{version: 5, next_task_id: 1, next_cron_id: 1, next_run_id: 1, repos: [], tasks: [], cron_jobs: [], cron_runs: []}' > "$GLOBAL_STATE"
   else
     # Check for schema migrations
     local _ver
@@ -14,6 +14,10 @@ ensure_global_state() {
     fi
     if [[ "$_ver" == "3" ]]; then
       _migrate_v3_to_v4
+      _ver=4
+    fi
+    if [[ "$_ver" == "4" ]]; then
+      _migrate_v4_to_v5
     fi
   fi
 
@@ -120,6 +124,28 @@ _migrate_v3_to_v4() {
   ok "state schema migrated to v4"
 }
 
+_migrate_v4_to_v5() {
+  info "migrating state schema v4 -> v5 (adding status_changed_at)..."
+  _lock_state || return 1
+  local tmp
+  tmp=$(mktemp "${GLOBAL_DIR}/.migrate.XXXXXX")
+  jq '.version = 5
+    | .tasks = [.tasks[] |
+        .status_changed_at = (
+          if .status == "done" and .completed_at and .completed_at != null then
+            .completed_at
+          elif (.status == "active" or .status == "needs_review" or .status == "paused") and .started_at and .started_at != null then
+            .started_at
+          else
+            .created_at
+          end
+        )
+      ]' "$GLOBAL_STATE" > "$tmp" \
+    && mv "$tmp" "$GLOBAL_STATE"
+  _unlock_state
+  ok "state schema migrated to v5"
+}
+
 # Auto-migrate old per-repo state on first run from that directory
 check_and_migrate() {
   local local_state=".cloard-board/tasks.json"
@@ -196,6 +222,7 @@ check_and_migrate() {
         created_at: $now,
         started_at: (if $started == "" then null else $started end),
         completed_at: (if $completed == "" then null else $completed end),
+        status_changed_at: $now,
         legacy_id: $old_id
       }]' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
   done <<< "$old_tasks"
