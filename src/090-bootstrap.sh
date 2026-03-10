@@ -67,6 +67,10 @@ _register_global_hooks() {
       {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": $stop}]},
       {"matcher": "ExitPlanMode", "hooks": [{"type": "command", "command": $stop}]}
     ],
+    "Notification": [
+      {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": $stop}]},
+      {"matcher": "permission_prompt", "hooks": [{"type": "command", "command": $stop}]}
+    ],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": $prompt}]}]
   }')
 

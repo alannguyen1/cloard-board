@@ -140,9 +140,9 @@ echo "Fix C: Hook versioning"
 grep -q 'readonly HOOK_VERSION=' "$BOARD"
 assert_eq "HOOK_VERSION constant defined" "0" "$?"
 
-# Test: HOOK_VERSION is set to "2"
-grep -q 'readonly HOOK_VERSION="3"' "$BOARD"
-assert_eq "HOOK_VERSION is 3" "0" "$?"
+# Test: HOOK_VERSION is set to "4"
+grep -q 'readonly HOOK_VERSION="4"' "$BOARD"
+assert_eq "HOOK_VERSION is 4" "0" "$?"
 
 # Test: on-stop.sh template includes hook-version marker
 grep -q 'hook-version:\${HOOK_VERSION}' "$BOARD"
@@ -175,6 +175,16 @@ assert_eq "AskUserQuestion matcher registered" "0" "$?"
 grep -q '"matcher": "ExitPlanMode"' "$BOARD"
 assert_eq "ExitPlanMode matcher registered" "0" "$?"
 
+# Test: Notification hooks registered for idle_prompt and permission_prompt
+grep -q '"Notification"' "$BOARD"
+assert_eq "Notification hook type registered" "0" "$?"
+
+grep -q '"matcher": "idle_prompt"' "$BOARD"
+assert_eq "idle_prompt matcher registered" "0" "$?"
+
+grep -q '"matcher": "permission_prompt"' "$BOARD"
+assert_eq "permission_prompt matcher registered" "0" "$?"
+
 # ── Fix B: Functional version extraction simulation ────────────────────────
 
 echo ""
@@ -185,7 +195,7 @@ mock_hook="$TMPDIR_TEST/on-prompt.sh"
 cat > "$mock_hook" <<'EOF'
 #!/usr/bin/env bash
 # cloard-board hook: set task status to "working" when user submits a prompt
-# hook-version:3
+# hook-version:4
 [[ -n "${CLOARD_TASK_ID:-}" ]] || exit 0
 cloard-board signal "$CLOARD_TASK_ID" working &>/dev/null &
 cloard-board _capture-session-uid "$CLOARD_TASK_ID" &>/dev/null &
@@ -193,7 +203,7 @@ EOF
 
 # Extract version
 extracted=$(grep -o 'hook-version:[0-9]*' "$mock_hook" 2>/dev/null | cut -d: -f2)
-assert_eq "extracts version 3 from hook file" "3" "$extracted"
+assert_eq "extracts version 4 from hook file" "4" "$extracted"
 
 # Create a hook WITHOUT version marker (simulates old/stale hook)
 mock_old="$TMPDIR_TEST/on-prompt-old.sh"
@@ -208,11 +218,11 @@ extracted_old=$(grep -o 'hook-version:[0-9]*' "$mock_old" 2>/dev/null | cut -d: 
 assert_eq "old hook returns empty version" "" "$extracted_old"
 
 # Version mismatch detection
-[[ "$extracted_old" != "3" ]]
+[[ "$extracted_old" != "4" ]]
 assert_eq "stale hook triggers reinstall" "0" "$?"
 
 # Version match: no reinstall needed
-[[ "$extracted" != "3" ]] && result="mismatch" || result="match"
+[[ "$extracted" != "4" ]] && result="mismatch" || result="match"
 assert_eq "current hook passes version check" "match" "$result"
 
 # ── Summary ────────────────────────────────────────────────────────────────

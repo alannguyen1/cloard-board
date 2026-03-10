@@ -14,7 +14,7 @@ readonly GLOBAL_DIR="$HOME/.cloard-board"
 readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
 readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
-readonly HOOK_VERSION="3"
+readonly HOOK_VERSION="4"
 readonly MAX_SESSION_HISTORY=10
 
 # ── Colours (ANSI) ────────────────────────────────────────────────────────────
@@ -556,6 +556,10 @@ _register_global_hooks() {
     "PostToolUse": [
       {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": $stop}]},
       {"matcher": "ExitPlanMode", "hooks": [{"type": "command", "command": $stop}]}
+    ],
+    "Notification": [
+      {"matcher": "idle_prompt", "hooks": [{"type": "command", "command": $stop}]},
+      {"matcher": "permission_prompt", "hooks": [{"type": "command", "command": $stop}]}
     ],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": $prompt}]}]
   }')
