@@ -143,7 +143,7 @@ Schedule and manage recurring Claude Code tasks via macOS LaunchAgents.
 
 ### List view
 
-Press `v` to switch between kanban and list views. The list view shows all tasks in a flat, scrollable list grouped by repo with status-based sorting (active first, then needs review, pending, paused, done).
+Press `v` to switch between kanban and list views. The list view shows all tasks in a flat, scrollable list grouped by repo with priority sorting: active+working, active+waiting, active, needs review, pending, paused, done. Within each priority group, tasks are sorted by most recently changed first.
 
 #### Full list mode
 
@@ -168,7 +168,7 @@ Press `v` to switch between kanban and list views. The list view shows all tasks
 
 #### Sidebar mode (split view)
 
-Press `b` in list mode to open a split pane: a narrow task sidebar on the left (40%) and the selected task's Claude session on the right (60%).
+Press `b` in list mode to open a split pane: a narrow task sidebar on the left (40%) and the selected task's Claude session on the right (60%). The split pane also opens automatically when you press `Enter` on a task in list mode.
 
 | Key | Action |
 |---|---|
@@ -297,6 +297,10 @@ On first run, cloard-board installs global hook scripts in `~/.cloard-board/hook
 
 - **UserPromptSubmit**: sets the task to "working" when you send a prompt
 - **Stop**: sets the task to "waiting" when Claude finishes a turn
+- **PostToolUse** (`AskUserQuestion`, `ExitPlanMode`): sets the task to "waiting" when Claude asks the user a question or exits plan mode
+- **Notification** (`idle_prompt`, `permission_prompt`): sets the task to "waiting" when Claude is idle or awaiting permission approval
+
+Hook scripts are versioned and auto-update when cloard-board detects an outdated version.
 
 Each tmux window exports `CLOARD_TASK_ID`, `CLOARD_BOARD_DIR`, and `CLOARD_REPO_PATH` environment variables so hooks know which task to update. The hooks run asynchronously to avoid blocking Claude.
 
@@ -316,7 +320,7 @@ All state is stored globally at `~/.cloard-board/state.json`:
 
 ```json
 {
-  "version": 4,
+  "version": 5,
   "next_task_id": 4,
   "next_cron_id": 1,
   "next_run_id": 1,
@@ -326,7 +330,8 @@ All state is stored globally at `~/.cloard-board/state.json`:
   "tasks": [
     {
       "id": "t-001", "title": "Fix auth bug", "repo": "my-api", "status": "active",
-      "session_uid": "abc-123", "session_history": ["abc-123"]
+      "session_uid": "abc-123", "session_history": ["abc-123"],
+      "status_changed_at": "2026-03-10T10:00:00Z"
     }
   ],
   "cron_jobs": [],
@@ -336,7 +341,7 @@ All state is stored globally at `~/.cloard-board/state.json`:
 
 Task IDs are auto-generated (`t-001`, `t-002`, ...) and globally unique across all repos. Cron job IDs follow the same pattern (`cj-001`, `cj-002`, ...) with run IDs as `cr-001`, `cr-002`, etc.
 
-Each task stores a `session_history` array (up to 10 entries, newest first) so you can switch between previous Claude sessions using the `H` key in the dashboard.
+Each task stores a `session_history` array (up to 10 entries, newest first) so you can switch between previous Claude sessions using the `H` key in the dashboard. The `status_changed_at` timestamp tracks when a task last changed status and is used for priority sorting in list mode (newest first within each priority group).
 
 ## Dependencies
 
