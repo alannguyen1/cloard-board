@@ -103,7 +103,7 @@ _list_build_items() {
   if [[ "${_list_group_collapsed[__cron]:-}" != "1" ]]; then
     # Cron items: active (col 1), then needs_review (col 2), then scheduled (col 0)
     local _lb_cron_col _lb_cron_ids
-    for _lb_cron_col in 1 2 0; do
+    for _lb_cron_col in 1 2 3 0; do
       _lb_cron_ids="${_cron_col_ids[__cron:${_lb_cron_col}]:-}"
       [[ -z "$_lb_cron_ids" ]] && continue
       local -a _lb_cron_arr=(${(s: :)_lb_cron_ids})

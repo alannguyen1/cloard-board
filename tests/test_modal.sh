@@ -119,8 +119,8 @@ fi
 grep -q 'c: new' "$BOARD"
 assert_eq "c: new present in footer" "0" "$?"
 
-grep -q 'c: new cron' "$BOARD"
-assert_eq "c: new cron present in footer" "0" "$?"
+grep -q 'c: create' "$BOARD"
+assert_eq "c: create present in cron footer" "0" "$?"
 
 # ── Rendering structure ──────────────────────────────────────────────────────
 

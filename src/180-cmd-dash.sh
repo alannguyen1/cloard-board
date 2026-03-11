@@ -122,6 +122,14 @@ cmd__dash_loop() {
 
     # Build list items (needed for list mode; cheap no-op data if in kanban)
     if [[ "$_view_mode" == "list" ]]; then
+      # Detect dead split pane (ghost state cleanup)
+      if [[ $_split_active -eq 1 ]]; then
+        if ! tmux_cmd display-message -t "board:dashboard.1" -p '' 2>/dev/null; then
+          _split_active=0
+          _split_task_id=""
+          _split_unbind_sidebar_key
+        fi
+      fi
       _list_build_items
       # Clamp list cursor
       if [[ ${#_list_items[@]} -gt 0 ]]; then
@@ -1108,29 +1116,16 @@ cmd__dash_loop() {
           fi
         fi
         ;;
-      c) # Create new task (modal) or cron job
+      c) # Create new task or cron job (unified modal)
+        # Determine context-aware type default
+        local -i _mf_type=0  # 0=task, 1=cron
         if [[ "$_view_mode" == "list" ]]; then
           local _c_item="${_list_items[$_list_cursor]:-}"
           if [[ "$_c_item" == cron_group:* || "$_c_item" == cron:* ]]; then
-            cursor_show
-            stty echo
-            echo ""
-            echo "${C_CYAN}Creating new cron job...${C_RESET}"
-            (cmd_cron_add) 2>&1 || true
-            stty -echo
-            cursor_hide
-            continue
+            _mf_type=1
           fi
-        fi
-        if [[ $cron_row_selected -eq 1 ]]; then
-          cursor_show
-          stty echo
-          echo ""
-          echo "${C_CYAN}Creating new cron job...${C_RESET}"
-          (cmd_cron_add) 2>&1 || true
-          stty -echo
-          cursor_hide
-          continue
+        elif [[ $cron_row_selected -eq 1 ]]; then
+          _mf_type=1
         fi
 
         # Small terminal fallback (< 40 cols): sequential prompts
@@ -1140,65 +1135,165 @@ cmd__dash_loop() {
           cursor_show
           stty echo
           echo ""
-          local new_repo="" _cancelled=false
-          if [[ "$filter_mode" != "all" ]]; then
-            new_repo="$filter_mode"
-          else
-            echo "${C_CYAN}Select repo (Esc to cancel):${C_RESET}"
-            local -a picker_repos=()
-            local picker_idx=1
-            for rn in "${_repo_names[@]}"; do
-              [[ -n "${_repo_stale[$rn]:-}" ]] && continue
-              picker_repos+=("$rn")
-              echo "  ${picker_idx}) ${rn}"
-              picker_idx=$((picker_idx + 1))
-            done
-            if [[ ${#picker_repos[@]} -eq 0 ]]; then
-              echo "${C_RED}No repos available${C_RESET}"
-              sleep 1
-              stty -echo
-              cursor_hide
-              continue
-            elif [[ ${#picker_repos[@]} -eq 1 ]]; then
-              new_repo="${picker_repos[0]}"
+          local _cancelled=false
+
+          # Type selection
+          echo "${C_CYAN}What to create (Esc to cancel):${C_RESET}"
+          echo "  1) Task"
+          echo "  2) Cron Job"
+          printf "${C_CYAN}Choice [1]: ${C_RESET}"
+          local _st_choice=""
+          if ! _read_or_esc _st_choice; then _cancelled=true; fi
+          [[ -z "$_st_choice" ]] && _st_choice="1"
+          if [[ "$_st_choice" == "2" ]]; then _mf_type=1; fi
+
+          # Repo selection
+          local new_repo=""
+          if ! $_cancelled; then
+            if [[ "$filter_mode" != "all" ]]; then
+              new_repo="$filter_mode"
             else
-              printf "${C_CYAN}Choice: ${C_RESET}"
-              local pchoice=""
-              if ! _read_or_esc pchoice; then _cancelled=true; fi
-              if ! $_cancelled && [[ -n "$pchoice" ]]; then
-                if [[ "$pchoice" =~ ^[0-9]+$ ]]; then
-                  pchoice=$((pchoice - 1))
-                  if [[ $pchoice -ge 0 && $pchoice -lt ${#picker_repos[@]} ]]; then
-                    new_repo="${picker_repos[$pchoice]}"
+              echo "${C_CYAN}Select repo (Esc to cancel):${C_RESET}"
+              local -a picker_repos=()
+              local picker_idx=1
+              for rn in "${_repo_names[@]}"; do
+                [[ -n "${_repo_stale[$rn]:-}" ]] && continue
+                picker_repos+=("$rn")
+                echo "  ${picker_idx}) ${rn}"
+                picker_idx=$((picker_idx + 1))
+              done
+              if [[ ${#picker_repos[@]} -eq 0 ]]; then
+                echo "${C_RED}No repos available${C_RESET}"
+                sleep 1
+                stty -echo
+                cursor_hide
+                continue
+              elif [[ ${#picker_repos[@]} -eq 1 ]]; then
+                new_repo="${picker_repos[0]}"
+              else
+                printf "${C_CYAN}Choice: ${C_RESET}"
+                local pchoice=""
+                if ! _read_or_esc pchoice; then _cancelled=true; fi
+                if ! $_cancelled && [[ -n "$pchoice" ]]; then
+                  if [[ "$pchoice" =~ ^[0-9]+$ ]]; then
+                    pchoice=$((pchoice - 1))
+                    if [[ $pchoice -ge 0 && $pchoice -lt ${#picker_repos[@]} ]]; then
+                      new_repo="${picker_repos[$pchoice]}"
+                    else
+                      echo "${C_RED}Invalid choice (out of range)${C_RESET}"
+                      sleep 1
+                    fi
                   else
-                    echo "${C_RED}Invalid choice (out of range)${C_RESET}"
+                    echo "${C_RED}Invalid choice (not a number)${C_RESET}"
                     sleep 1
                   fi
-                else
-                  echo "${C_RED}Invalid choice (not a number)${C_RESET}"
-                  sleep 1
                 fi
               fi
             fi
           fi
+
           if ! $_cancelled && [[ -n "$new_repo" ]]; then
-            printf "${C_CYAN}Title (Enter to skip, Esc to cancel): ${C_RESET}"
-            local new_title=""
-            if ! _read_or_esc new_title; then _cancelled=true; fi
-          fi
-          if ! $_cancelled && [[ -n "$new_repo" ]]; then
-            local add_output
-            add_output=$( (cmd_add --title "$new_title" --repo "$new_repo" --no-worktree) 2>&1 ) || true
-            [[ -n "$add_output" ]] && echo "$add_output"
-            local new_id=""
-            new_id=$(echo "$add_output" | grep -oE 't-[0-9]+' | head -1)
-            if [[ -n "$new_id" ]]; then
-              printf "${C_CYAN}Prompt (Enter to skip, Esc to cancel): ${C_RESET}"
-              local new_prompt=""
-              if _read_or_esc new_prompt; then
-                local start_output
-                start_output=$( (cmd_start "$new_id" "$new_prompt") 2>&1 ) || true
-                [[ -n "$start_output" ]] && echo "$start_output"
+            if [[ $_mf_type -eq 0 ]]; then
+              # === Task creation (existing path) ===
+              printf "${C_CYAN}Title (Enter to skip, Esc to cancel): ${C_RESET}"
+              local new_title=""
+              if ! _read_or_esc new_title; then _cancelled=true; fi
+              if ! $_cancelled; then
+                local add_output
+                add_output=$( (cmd_add --title "$new_title" --repo "$new_repo" --no-worktree) 2>&1 ) || true
+                [[ -n "$add_output" ]] && echo "$add_output"
+                local new_id=""
+                new_id=$(echo "$add_output" | grep -oE 't-[0-9]+' | head -1)
+                if [[ -n "$new_id" ]]; then
+                  printf "${C_CYAN}Prompt (Enter to skip, Esc to cancel): ${C_RESET}"
+                  local new_prompt=""
+                  if _read_or_esc new_prompt; then
+                    local start_output
+                    start_output=$( (cmd_start "$new_id" "$new_prompt") 2>&1 ) || true
+                    [[ -n "$start_output" ]] && echo "$start_output"
+                  fi
+                fi
+              fi
+            else
+              # === Cron creation (small terminal) ===
+              printf "${C_CYAN}Job name (e.g. morning-routine, Esc to cancel): ${C_RESET}"
+              local _st_name=""
+              if ! _read_or_esc _st_name; then _cancelled=true; fi
+              if ! $_cancelled && [[ -n "$_st_name" ]]; then
+                echo "${C_CYAN}Schedule type:${C_RESET}"
+                echo "  1) Daily at HH:MM"
+                echo "  2) Weekdays at HH:MM"
+                echo "  3) Hourly (within a time range)"
+                echo "  4) Every N minutes (within a time range)"
+                printf "${C_CYAN}Choice [1-4]: ${C_RESET}"
+                local _st_sched=""
+                if ! _read_or_esc _st_sched; then _cancelled=true; fi
+                [[ -z "$_st_sched" ]] && _st_sched="1"
+                local -i _st_sched_type=0
+                case "$_st_sched" in
+                  2) _st_sched_type=1 ;; 3) _st_sched_type=2 ;; 4) _st_sched_type=3 ;; *) _st_sched_type=0 ;;
+                esac
+              fi
+              if ! $_cancelled && [[ -n "$_st_name" ]]; then
+                # Gather schedule sub-fields
+                local _st_time="" _st_start_h="" _st_end_h="" _st_at_min="" _st_interval=""
+                case $_st_sched_type in
+                  0|1)
+                    printf "${C_CYAN}Time (HH:MM, 24h) [09:00]: ${C_RESET}"
+                    _read_or_esc _st_time || _cancelled=true
+                    [[ -z "$_st_time" ]] && _st_time="09:00"
+                    ;;
+                  2)
+                    printf "${C_CYAN}Start hour (0-23) [9]: ${C_RESET}"
+                    _read_or_esc _st_start_h || _cancelled=true
+                    [[ -z "$_st_start_h" ]] && _st_start_h="9"
+                    if ! $_cancelled; then
+                      printf "${C_CYAN}End hour (0-23) [17]: ${C_RESET}"
+                      _read_or_esc _st_end_h || _cancelled=true
+                      [[ -z "$_st_end_h" ]] && _st_end_h="17"
+                    fi
+                    if ! $_cancelled; then
+                      printf "${C_CYAN}At minute (0-59) [0]: ${C_RESET}"
+                      _read_or_esc _st_at_min || _cancelled=true
+                      [[ -z "$_st_at_min" ]] && _st_at_min="0"
+                    fi
+                    ;;
+                  3)
+                    printf "${C_CYAN}Interval in minutes (1-59) [30]: ${C_RESET}"
+                    _read_or_esc _st_interval || _cancelled=true
+                    [[ -z "$_st_interval" ]] && _st_interval="30"
+                    if ! $_cancelled; then
+                      printf "${C_CYAN}Start hour (0-23) [9]: ${C_RESET}"
+                      _read_or_esc _st_start_h || _cancelled=true
+                      [[ -z "$_st_start_h" ]] && _st_start_h="9"
+                    fi
+                    if ! $_cancelled; then
+                      printf "${C_CYAN}End hour (0-23) [17]: ${C_RESET}"
+                      _read_or_esc _st_end_h || _cancelled=true
+                      [[ -z "$_st_end_h" ]] && _st_end_h="17"
+                    fi
+                    ;;
+                esac
+              fi
+              if ! $_cancelled && [[ -n "$_st_name" ]]; then
+                printf "${C_CYAN}Prompt (Esc to cancel): ${C_RESET}"
+                local _st_prompt=""
+                if ! _read_or_esc _st_prompt; then _cancelled=true; fi
+              fi
+              if ! $_cancelled && [[ -n "$_st_name" && -n "$_st_prompt" ]]; then
+                # Set modal vars and create via _modal_create_cron
+                _mf_repo="$new_repo"
+                _mf_name="$_st_name"
+                _mf_prompt="$_st_prompt"
+                _mf_sched_type=$_st_sched_type
+                _mf_sched_time="$_st_time"
+                _mf_sched_start_h="$_st_start_h"
+                _mf_sched_end_h="$_st_end_h"
+                _mf_sched_at_min="$_st_at_min"
+                _mf_sched_interval="$_st_interval"
+                local cron_output
+                cron_output=$(_modal_create_cron 2>&1) || true
+                [[ -n "$cron_output" ]] && echo "$cron_output"
               fi
             fi
           fi
@@ -1214,35 +1309,58 @@ cmd__dash_loop() {
         local -i _mf_dropdown_open=0 _mf_dropdown_idx=0
         local -i _mf_prev_top=0 _mf_prev_height=0
         local -a _mf_repo_list=()
+        # Cron modal state
+        local _mf_name=""
+        local -i _mf_sched_type=0 _mf_sched_dd_open=0 _mf_sched_dd_idx=0
+        local _mf_sched_time="" _mf_sched_start_h="" _mf_sched_end_h=""
+        local _mf_sched_at_min="" _mf_sched_interval=""
 
         if _modal_open; then
-          local add_args=(--title "$_mf_title" --repo "$_mf_repo")
-          [[ $_mf_worktree -eq 0 ]] && add_args+=(--no-worktree)
+          if [[ $_mf_type -eq 0 ]]; then
+            # === Task creation (existing path) ===
+            local add_args=(--title "$_mf_title" --repo "$_mf_repo")
+            [[ $_mf_worktree -eq 0 ]] && add_args+=(--no-worktree)
 
-          local add_output
-          add_output=$( (cmd_add "${add_args[@]}") 2>&1 ) || true
-          local new_id=""
-          new_id=$(echo "$add_output" | grep -oE 't-[0-9]+' | head -1)
+            local add_output
+            add_output=$( (cmd_add "${add_args[@]}") 2>&1 ) || true
+            local new_id=""
+            new_id=$(echo "$add_output" | grep -oE 't-[0-9]+' | head -1)
 
-          if [[ -n "$new_id" ]]; then
-            _modal_render_success "$new_id"
-            sleep 1
-            if [[ "$_view_mode" == "list" ]]; then
-              # Open in split pane instead of full-screen window
-              local _split_initial_prompt="$_mf_prompt"
-              _list_follow_id="$new_id"
-              _list_needs_rebuild=1
-              if [[ "${_split_active:-0}" == "1" ]]; then
-                _split_switch_session "$new_id"
+            if [[ -n "$new_id" ]]; then
+              _modal_render_success "$new_id"
+              sleep 1
+              if [[ "$_view_mode" == "list" ]]; then
+                # Open in split pane instead of full-screen window
+                local _split_initial_prompt="$_mf_prompt"
+                _list_follow_id="$new_id"
+                _list_needs_rebuild=1
+                if [[ "${_split_active:-0}" == "1" ]]; then
+                  _split_switch_session "$new_id"
+                else
+                  _split_open "$new_id"
+                fi
               else
-                _split_open "$new_id"
+                local start_output
+                start_output=$( (cmd_start "$new_id" "$_mf_prompt") 2>&1 ) || true
               fi
-            else
-              local start_output
-              start_output=$( (cmd_start "$new_id" "$_mf_prompt") 2>&1 ) || true
+            fi
+          else
+            # === Cron creation (modal) ===
+            local cron_output
+            cron_output=$(_modal_create_cron 2>&1) || true
+            local new_cron_id=""
+            new_cron_id=$(echo "$cron_output" | grep -oE 'cj-[0-9]+' | head -1)
+            if [[ -n "$new_cron_id" ]]; then
+              _modal_render_cron_success "$new_cron_id"
+              sleep 1
+              # Navigate to cron row, Scheduled column
+              cron_row_selected=1
+              cur_cron_col=0
+              cur_cron_card_row[0]=0
             fi
           fi
         fi
+        stty -echo 2>/dev/null  # Restore dashboard terminal state after modal
         ;;
       x) # Done/delete selected task OR cron toggle/review
         if [[ "$_view_mode" == "list" ]] && _list_get_selected_cron_id; then

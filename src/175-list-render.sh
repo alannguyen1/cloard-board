@@ -77,7 +77,7 @@ _render_list_cron_header() {
 
   local cron_total=0
   local _ci
-  for _ci in {0..2}; do
+  for _ci in {0..3}; do
     cron_total=$((cron_total + ${_cron_col_cnt[__cron:${_ci}]:-0}))
   done
 

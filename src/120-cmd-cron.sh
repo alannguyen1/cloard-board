@@ -64,9 +64,10 @@ cmd_cron_add() {
   # Schedule
   echo "${C_CYAN}Schedule:${C_RESET}"
   echo "  1) Daily at HH:MM"
-  echo "  2) Hourly (within a time range)"
-  echo "  3) Every N minutes (within a time range)"
-  printf "${C_CYAN}Choice [1-3]: ${C_RESET}"
+  echo "  2) Weekdays at HH:MM"
+  echo "  3) Hourly (within a time range)"
+  echo "  4) Every N minutes (within a time range)"
+  printf "${C_CYAN}Choice [1-4]: ${C_RESET}"
   local stype_choice=""
   read -r stype_choice
   case "$stype_choice" in
@@ -82,6 +83,24 @@ cmd_cron_add() {
       schedule_raw=$(jq -n --argjson h "$hour" --argjson m "$minute" '{Hour: $h, Minute: $m}')
       ;;
     2)
+      schedule_type="weekdays"
+      printf "${C_CYAN}Time (HH:MM, 24h): ${C_RESET}"
+      local time_str=""
+      read -r time_str
+      local hour minute
+      hour=$(echo "$time_str" | cut -d: -f1 | sed 's/^0//')
+      minute=$(echo "$time_str" | cut -d: -f2 | sed 's/^0//')
+      schedule_desc="Weekdays at ${time_str}"
+      schedule_raw="["
+      local wd_sep=""
+      local wd
+      for wd in 1 2 3 4 5; do
+        schedule_raw="${schedule_raw}${wd_sep}{\"Hour\":${hour},\"Minute\":${minute},\"Weekday\":${wd}}"
+        wd_sep=","
+      done
+      schedule_raw="${schedule_raw}]"
+      ;;
+    3)
       schedule_type="hourly"
       printf "${C_CYAN}Start hour (0-23): ${C_RESET}"
       local start_h="" end_h="" at_min=""
@@ -100,7 +119,7 @@ cmd_cron_add() {
       done
       schedule_raw="${schedule_raw}]"
       ;;
-    3)
+    4)
       schedule_type="interval"
       printf "${C_CYAN}Interval in minutes (1-59, e.g. 30): ${C_RESET}"
       local interval="" start_h="" end_h=""

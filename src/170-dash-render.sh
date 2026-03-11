@@ -193,7 +193,7 @@ _render_footer() {
       printf "${C_DIM}  j/k: nav  Tab: filter  Enter: open  </> status  :/\" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: split  F: fullscreen  v: kanban  q: quit${C_RESET}"
     fi
   elif [[ $cron_row_selected -eq 1 ]]; then
-    printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: new cron  D: delete  Esc: back  v: list  q: quit${C_RESET}"
+    printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: create  D: delete  Esc: back  v: list  q: quit${C_RESET}"
   elif [[ "$filter_mode" == "all" ]]; then
     if [[ "$nav_mode" == "repo" ]]; then
       printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  v: list  q: quit${C_RESET}"
