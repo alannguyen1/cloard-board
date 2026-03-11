@@ -4,6 +4,8 @@ A multi-repo tmux kanban dashboard for managing parallel [Claude Code](https://d
 
 Run multiple Claude agents across different repositories in isolated git worktrees, track their progress on an interactive terminal board, and advance tasks through a kanban workflow: pending, active, needs review, done.
 
+![cloard-board sidebar view](assets/sidebar-screenshot.png)
+
 ![cloard-board dashboard](assets/dashboard-screenshot.png)
 
 ## Install
@@ -169,8 +171,6 @@ Press `v` to switch between kanban and list views. The list view shows all tasks
 #### Sidebar mode (split view)
 
 Press `b` in list mode to open a split pane: a narrow task sidebar on the left (40%) and the selected task's Claude session on the right (60%). The split pane also opens automatically when you press `Enter` on a task in list mode.
-
-![cloard-board sidebar view](assets/sidebar-screenshot.png)
 
 | Key | Action |
 |---|---|
