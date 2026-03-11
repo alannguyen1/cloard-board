@@ -170,6 +170,8 @@ Press `v` to switch between kanban and list views. The list view shows all tasks
 
 Press `b` in list mode to open a split pane: a narrow task sidebar on the left (40%) and the selected task's Claude session on the right (60%). The split pane also opens automatically when you press `Enter` on a task in list mode.
 
+![cloard-board sidebar view](assets/sidebar-screenshot.png)
+
 | Key | Action |
 |---|---|
 | `j` / `k` | Navigate items in sidebar |
