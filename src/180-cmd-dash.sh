@@ -124,7 +124,7 @@ cmd__dash_loop() {
     if [[ "$_view_mode" == "list" ]]; then
       # Detect dead split pane (ghost state cleanup)
       if [[ $_split_active -eq 1 ]]; then
-        if ! tmux_cmd display-message -t "board:dashboard.1" -p '' 2>/dev/null; then
+        if ! tmux_cmd display-message -t "board:dashboard.1" -p '' >/dev/null 2>&1; then
           _split_active=0
           _split_task_id=""
           _split_unbind_sidebar_key
@@ -178,6 +178,21 @@ cmd__dash_loop() {
         nav_mode="repo"
       fi
     fi
+
+    # Compute how many terminal lines the footer will occupy after wrapping
+    local _footer_len
+    if [[ "${_view_mode:-kanban}" == "list" ]]; then
+      if [[ ${_split_active:-0} -eq 1 ]]; then _footer_len=172
+      else _footer_len=181; fi
+    elif [[ $cron_row_selected -eq 1 ]]; then _footer_len=112
+    elif [[ "$filter_mode" == "all" ]]; then _footer_len=111
+    else _footer_len=154; fi
+    local _footer_lines=$(( (_footer_len + cols - 1) / cols ))
+    (( _footer_lines < 1 )) && _footer_lines=1
+
+    # Viewport height available for content (below status bar, above footer)
+    local _viewport_height=$((rows - 1 - _footer_lines))
+    [[ $_viewport_height -lt 1 ]] && _viewport_height=1
 
     # Begin frame buffer
     local _frame=""
@@ -591,17 +606,6 @@ cmd__dash_loop() {
     if [[ "$_view_mode" == "kanban" ]] && $_has_cron_data; then
       _render_cron_row
     fi
-
-    # Compute how many terminal lines the footer will occupy after wrapping
-    local _footer_len
-    if [[ "${_view_mode:-kanban}" == "list" ]]; then
-      if [[ ${_split_active:-0} -eq 1 ]]; then _footer_len=172
-      else _footer_len=181; fi
-    elif [[ $cron_row_selected -eq 1 ]]; then _footer_len=112
-    elif [[ "$filter_mode" == "all" ]]; then _footer_len=111
-    else _footer_len=154; fi
-    local _footer_lines=$(( (_footer_len + cols - 1) / cols ))
-    (( _footer_lines < 1 )) && _footer_lines=1
 
     # Clip frame to terminal height (header always visible; reserve footer lines)
     local _max_lines=$((rows - _footer_lines))

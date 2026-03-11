@@ -24,7 +24,7 @@ _list_content_line_of() {
 
 # Ensure the cursor item is within the visible viewport. Adjusts _list_scroll_top.
 _list_adjust_scroll() {
-  local viewport_height=$((rows - 3))
+  local viewport_height=${_viewport_height:-$((rows - 3))}
   [[ $viewport_height -lt 1 ]] && viewport_height=1
 
   _list_content_line_of "$_list_cursor"
@@ -271,7 +271,7 @@ _render_scrollbar_track() {
 
 # Render the full-screen list view (no split pane).
 _render_list_full() {
-  local viewport_height=$((rows - 3))
+  local viewport_height=${_viewport_height:-$((rows - 3))}
   [[ $viewport_height -lt 1 ]] && viewport_height=1
 
   _list_adjust_scroll
@@ -401,7 +401,7 @@ _render_sidebar_task_card() {
 # uses the narrower pane width and omits the scrollbar.
 _render_list_sidebar() {
   local sidebar_w="${1:-$cols}"
-  local viewport_height=$((rows - 3))
+  local viewport_height=${_viewport_height:-$((rows - 3))}
   [[ $viewport_height -lt 1 ]] && viewport_height=1
 
   _list_adjust_scroll
