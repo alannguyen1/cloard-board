@@ -565,6 +565,45 @@ SCRIPT
 assert_eq "resume cmd uses --resume when session exists on disk" \
   "claude --resume uid-real --dangerously-skip-permissions" "$result"
 
+# H13: _claude_session_exists finds sessions at new location (~/.claude/projects/*/UUID.jsonl)
+result=$(run_zsh <<'SCRIPT'
+source "$2"
+GLOBAL_DIR=$(mktemp -d)
+GLOBAL_STATE="$GLOBAL_DIR/state.json"
+# Create a fake session .jsonl in the new location
+FAKE_PROJECT="${HOME}/.claude/projects/test-project-$$"
+mkdir -p "${FAKE_PROJECT}"
+echo '{}' > "${FAKE_PROJECT}/uid-new-loc.jsonl"
+cat > "$GLOBAL_STATE" <<'JSON'
+{"version":5,"next_task_id":2,"repos":[],"tasks":[{"id":"t-001","title":"test","repo":"r","status":"active","session_uid":"uid-new-loc","session_history":["uid-new-loc"]}],"cron_jobs":[],"cron_runs":[]}
+JSON
+result=$(_build_claude_resume_cmd "t-001")
+rm -rf "${FAKE_PROJECT}"
+echo "$result"
+SCRIPT
+)
+assert_eq "resume cmd uses --resume when session exists at new location (.jsonl)" \
+  "claude --resume uid-new-loc --dangerously-skip-permissions" "$result"
+
+# H14: _claude_session_exists finds sessions at new location (UUID/ directory)
+result=$(run_zsh <<'SCRIPT'
+source "$2"
+GLOBAL_DIR=$(mktemp -d)
+GLOBAL_STATE="$GLOBAL_DIR/state.json"
+# Create a fake session directory (no .jsonl) in the new location
+FAKE_PROJECT="${HOME}/.claude/projects/test-project-dir-$$"
+mkdir -p "${FAKE_PROJECT}/uid-dir-loc"
+cat > "$GLOBAL_STATE" <<'JSON'
+{"version":5,"next_task_id":2,"repos":[],"tasks":[{"id":"t-001","title":"test","repo":"r","status":"active","session_uid":"uid-dir-loc","session_history":["uid-dir-loc"]}],"cron_jobs":[],"cron_runs":[]}
+JSON
+result=$(_build_claude_resume_cmd "t-001")
+rm -rf "${FAKE_PROJECT}"
+echo "$result"
+SCRIPT
+)
+assert_eq "resume cmd uses --resume when session exists at new location (dir)" \
+  "claude --resume uid-dir-loc --dangerously-skip-permissions" "$result"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════"

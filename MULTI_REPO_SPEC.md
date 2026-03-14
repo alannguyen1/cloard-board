@@ -630,7 +630,7 @@ Added fields to `~/.cloard-board/state.json`:
     "plist_path": "/path/to/plist",
     "working_dir": "/path/to/dir",
     "claude_command": "claude -p \"...\" --model ...",
-    "schedule_type": "daily|hourly|interval",
+    "schedule_type": "daily|weekdays|hourly|interval",
     "schedule_desc": "Daily at 08:30",
     "schedule_raw": {"Hour": 8, "Minute": 30},
     "enabled": true,

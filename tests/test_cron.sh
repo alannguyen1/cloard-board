@@ -471,6 +471,17 @@ assert_eq "schedule XML generation present" "0" "$?"
 grep -q 'EnvironmentVariables' "$BOARD"
 assert_eq "env vars XML generation present" "0" "$?"
 
+# Regression: _install_cron_binary must redirect info() to stderr
+# Without >&2, info() stdout leaks into $() and corrupts the plist binary path
+install_fn=$(sed -n '/_install_cron_binary()/,/^}/p' "$BOARD")
+echo "$install_fn" | grep -q 'info.*>&2'
+assert_eq "_install_cron_binary redirects info to stderr" "0" "$?"
+
+# Verify info() itself writes to stdout (so >&2 redirect is load-bearing)
+info_fn=$(grep '^info()' "$BOARD")
+echo "$info_fn" | grep -qv '>&2'
+assert_eq "info() writes to stdout (redirect is necessary)" "0" "$?"
+
 # ── Schedule presets ─────────────────────────────────────────────────────────
 
 echo ""

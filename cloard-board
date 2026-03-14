@@ -846,7 +846,7 @@ _install_cron_binary() {
   if [[ ! -f "$installed" ]] || ! diff -q "$SCRIPT_PATH" "$installed" >/dev/null 2>&1; then
     cp "$SCRIPT_PATH" "$installed"
     chmod +x "$installed"
-    info "installed cloard-board to $installed"
+    info "installed cloard-board to $installed" >&2
   fi
   echo "$installed"
 }
@@ -1707,9 +1707,16 @@ cmd_repo_unarchive() {
 # ── Commands ───────────────────────────────────────────────────────────────────
 
 # Check if a Claude session exists on disk.
-# Sessions stored at ~/Library/Application Support/Claude/claude-code-sessions/*/UUID/
+# Checks new location (~/.claude/projects/) first, then old location as fallback.
 _claude_session_exists() {
   local uid="$1"
+  # New location: ~/.claude/projects/*/UUID.jsonl
+  local new_matches=("${HOME}/.claude/projects"/*/"${uid}.jsonl"(N))
+  [[ ${#new_matches[@]} -gt 0 ]] && return 0
+  # New location: ~/.claude/projects/*/UUID/ (directory)
+  local new_dir_matches=("${HOME}/.claude/projects"/*/"${uid}"(N))
+  [[ ${#new_dir_matches[@]} -gt 0 ]] && [[ -d "${new_dir_matches[0]}" ]] && return 0
+  # Fallback: old location
   local sessions_root="${HOME}/Library/Application Support/Claude/claude-code-sessions"
   [[ -d "$sessions_root" ]] || return 1
   local matches=("${sessions_root}"/*/"${uid}"(N))
@@ -7084,7 +7091,7 @@ cmd__dash_loop() {
               update_cron_run_field "$cron_item" "status" "archived"
               ;;
           esac
-        elif [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
+        elif [[ "$_view_mode" == "kanban" && $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
           local cron_item="$_tid"
           case $cur_cron_col in
             0)  # Scheduled: toggle enable/disable
@@ -7348,7 +7355,7 @@ cmd__dash_loop() {
         fi
         ;;
       D) # Delete cron job (from dashboard)
-        if [[ $cron_row_selected -eq 1 && $cur_cron_col -eq 0 ]] && _get_selected_cron_id; then
+        if [[ "$_view_mode" == "kanban" && $cron_row_selected -eq 1 && $cur_cron_col -eq 0 ]] && _get_selected_cron_id; then
           local cron_item="$_tid"
           cursor_show
           stty echo

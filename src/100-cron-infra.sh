@@ -104,7 +104,7 @@ _install_cron_binary() {
   if [[ ! -f "$installed" ]] || ! diff -q "$SCRIPT_PATH" "$installed" >/dev/null 2>&1; then
     cp "$SCRIPT_PATH" "$installed"
     chmod +x "$installed"
-    info "installed cloard-board to $installed"
+    info "installed cloard-board to $installed" >&2
   fi
   echo "$installed"
 }

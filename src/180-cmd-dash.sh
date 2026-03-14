@@ -1396,7 +1396,7 @@ cmd__dash_loop() {
               update_cron_run_field "$cron_item" "status" "archived"
               ;;
           esac
-        elif [[ $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
+        elif [[ "$_view_mode" == "kanban" && $cron_row_selected -eq 1 ]] && _get_selected_cron_id; then
           local cron_item="$_tid"
           case $cur_cron_col in
             0)  # Scheduled: toggle enable/disable
@@ -1660,7 +1660,7 @@ cmd__dash_loop() {
         fi
         ;;
       D) # Delete cron job (from dashboard)
-        if [[ $cron_row_selected -eq 1 && $cur_cron_col -eq 0 ]] && _get_selected_cron_id; then
+        if [[ "$_view_mode" == "kanban" && $cron_row_selected -eq 1 && $cur_cron_col -eq 0 ]] && _get_selected_cron_id; then
           local cron_item="$_tid"
           cursor_show
           stty echo

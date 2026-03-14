@@ -1,9 +1,16 @@
 # ── Commands ───────────────────────────────────────────────────────────────────
 
 # Check if a Claude session exists on disk.
-# Sessions stored at ~/Library/Application Support/Claude/claude-code-sessions/*/UUID/
+# Checks new location (~/.claude/projects/) first, then old location as fallback.
 _claude_session_exists() {
   local uid="$1"
+  # New location: ~/.claude/projects/*/UUID.jsonl
+  local new_matches=("${HOME}/.claude/projects"/*/"${uid}.jsonl"(N))
+  [[ ${#new_matches[@]} -gt 0 ]] && return 0
+  # New location: ~/.claude/projects/*/UUID/ (directory)
+  local new_dir_matches=("${HOME}/.claude/projects"/*/"${uid}"(N))
+  [[ ${#new_dir_matches[@]} -gt 0 ]] && [[ -d "${new_dir_matches[0]}" ]] && return 0
+  # Fallback: old location
   local sessions_root="${HOME}/Library/Application Support/Claude/claude-code-sessions"
   [[ -d "$sessions_root" ]] || return 1
   local matches=("${sessions_root}"/*/"${uid}"(N))
