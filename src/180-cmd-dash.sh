@@ -73,8 +73,10 @@ cmd__dash_loop() {
   local -i _list_cursor=0         # index into _list_items[]
   local -i _list_scroll_top=0     # first visible content-line in viewport
   local -a _list_items=()         # flat ordered array: "group:repo", "task:t-001", etc.
-  local _split_task_id=""          # task ID in right pane
+  local _split_task_id=""          # task ID (or cron ID) in right pane
+  local -i _split_is_cron=0       # 1 when split pane shows a cron session
   local _list_follow_id=""         # task ID to follow after re-sort
+  local _list_follow_type="task"   # "task" or "cron" prefix for follow target
   typeset -A _list_group_collapsed # group_name -> 1 if collapsed
   local -i _list_scrollbar_vh=0    # set by _render_list_full for deferred scrollbar
   local -i _list_scrollbar_total=0
@@ -861,32 +863,13 @@ cmd__dash_loop() {
                 stty -echo
                 cursor_hide
                 ;;
-              1)  # Active: attach to tmux window
-                local rdata="${_cron_run_data[$cron_item]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
-                if [[ -n "$rwin" ]] && tmux_window_exists "$rwin"; then
-                  cursor_show
-                  tmux_select_window "$rwin"
-                  cursor_hide
-                fi
-                ;;
-              2|3)  # Needs Review / Done: resume session
-                local rdata="${_cron_run_data[$cron_item]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
-                if [[ -n "$rsid" ]]; then
-                  local resume_win="resume-${cron_item}"
-                  local cjob_wdir
-                  cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
-                  local safe_wdir=${(q)cjob_wdir}
-                  ensure_tmux_session
-                  tmux_create_window "$resume_win" "zsh" "-c" \
-                    "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-                  cursor_show
-                  tmux_select_window "$resume_win"
-                  cursor_hide
-                fi
+              1|2|3)  # Active / Needs Review / Done: open in split pane via list mode
+                [[ "${_split_active:-0}" == "1" ]] && _split_close
+                _list_follow_id="$cron_item"
+                _list_follow_type="cron"
+                _view_mode="list"
+                _list_transfer_from_kanban
+                _split_open_cron "$cron_item"
                 ;;
             esac
           fi
@@ -1718,9 +1701,16 @@ _get_active_task_id() {
 _list_transfer_from_kanban() {
   _list_group_collapsed=()  # expand all groups by default
 
-  # Try to position cursor on the same task selected in kanban
-  if _get_selected_id 2>/dev/null; then
+  # If caller pre-set _list_follow_id (e.g. kanban cron Enter), preserve it
+  if [[ -n "${_list_follow_id:-}" ]]; then
+    # Ensure __cron group is expanded when following a cron item
+    [[ "${_list_follow_type:-task}" == "cron" ]] && unset '_list_group_collapsed[__cron]'
+  elif _get_selected_id 2>/dev/null; then
     _list_follow_id="$_tid"
+  elif [[ $cron_row_selected -eq 1 ]]; then
+    # Cron row selected but no specific task ID; expand cron group
+    _list_follow_type="cron"
+    unset '_list_group_collapsed[__cron]'
   elif [[ ${#_repo_names[@]} -gt 0 ]]; then
     # Position at current repo's group header
     _list_follow_id=""

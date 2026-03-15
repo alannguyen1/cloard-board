@@ -99,6 +99,7 @@ _split_open() {
 
   _split_active=1
   _split_task_id="$task_id"
+  _split_is_cron=0
   _split_bind_sidebar_key
 
   # Clean up stale windows before checking for a live one
@@ -122,6 +123,50 @@ _split_open() {
     "export CLOARD_TASK_ID=${task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
 
   tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
+}
+
+# Open a split pane with a cron run's Claude session on the right side.
+_split_open_cron() {
+  local cron_id="$1"
+  local rdata="${_cron_run_data[$cron_id]:-}"
+
+  # Only works for cron runs with data (not scheduled jobs)
+  [[ -n "$rdata" ]] || return 1
+
+  local rjob_id rstat recode rstart rsid rwin
+  IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+
+  _split_active=1
+  _split_task_id="$cron_id"
+  _split_is_cron=1
+  _split_bind_sidebar_key
+
+  ensure_tmux_session
+
+  # Active run with live tmux window: join it into dashboard right pane
+  if [[ "$rstat" == "active" && -n "$rwin" ]] && tmux_window_exists "$rwin"; then
+    tmux_cmd join-pane -h -s "board:${rwin}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
+    return 0
+  fi
+
+  # Resume from session ID
+  if [[ -n "$rsid" ]]; then
+    local cjob_wdir
+    cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
+    local safe_wdir=${(q)cjob_wdir}
+    local resume_win="resume-${cron_id}"
+
+    # Check for existing resume window
+    _purge_stale_windows "$resume_win"
+    if tmux_window_exists "$resume_win"; then
+      tmux_cmd join-pane -h -s "board:${resume_win}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    else
+      tmux_cmd split-window -h -t "board:dashboard" -p 60 \
+        "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+    fi
+    tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
+  fi
 }
 
 # Switch the right pane to a different task's session.
@@ -194,14 +239,20 @@ _split_switch_session() {
 # Close the split view, preserving the running session in its own tmux window.
 _split_close() {
   if [[ -n "$_split_task_id" ]]; then
+    # For cron splits, preserve with resume- prefix so _split_open_cron can find it
+    local break_name="$_split_task_id"
+    if [[ "${_split_is_cron:-0}" == "1" ]]; then
+      break_name="resume-${_split_task_id}"
+    fi
     # Kill stale windows first so break-pane creates the only named window
-    _purge_stale_windows "$_split_task_id"
+    _purge_stale_windows "$break_name"
     # Try to preserve as named window; fall back to killing the pane
-    tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null \
+    tmux_cmd break-pane -d -s "board:dashboard.1" -n "$break_name" 2>/dev/null \
       || tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null \
       || true
   fi
   _split_active=0
   _split_task_id=""
+  _split_is_cron=0
   _split_unbind_sidebar_key
 }

@@ -669,6 +669,259 @@ assert_eq "_split_switch_session purges both old and new task" "4" "$result_swit
 result_close=$(sed -n '/_split_close()/,/^}/p' "$BOARD" | grep '_purge_stale_windows')
 assert_match "_split_close purges stale windows" '_purge_stale_windows' "$result_close"
 
+# ── K: Reviewed cron runs hidden with d toggle ─────────────────────────────
+
+echo ""
+echo "K: Reviewed cron runs hidden with d toggle"
+
+# Test: reviewed cron runs hidden when _show_done=0
+result_cron_hidden=$(run_zsh <<'SCRIPT'
+setopt KSH_ARRAYS TYPESET_SILENT
+source "$2"
+
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
+typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+typeset -A _list_group_collapsed
+local -a _repo_names _list_items
+local _show_done=0 _list_cursor=0 _list_follow_id="" _has_cron_data=true
+local _total_task_count=0 _active_count=0 _review_count=0
+
+_repo_names=("test-repo")
+_repo_task_count[test-repo]=0
+for _ci in {0..3}; do _repo_cols[test-repo:${_ci}]=""; _repo_col_cnt[test-repo:${_ci}]=0; done
+
+# Cron: one active, one needs_review, one reviewed, one scheduled
+_cron_col_ids[__cron:0]="cj-001"
+_cron_col_ids[__cron:1]="cr-001"
+_cron_col_ids[__cron:2]="cr-002"
+_cron_col_ids[__cron:3]="cr-003"
+_cron_col_cnt[__cron:0]=1
+_cron_col_cnt[__cron:1]=1
+_cron_col_cnt[__cron:2]=1
+_cron_col_cnt[__cron:3]=1
+
+_list_build_items
+echo "${#_list_items[@]}"
+for item in "${_list_items[@]}"; do echo "$item"; done
+SCRIPT
+)
+# With _show_done=0: reviewed (col 3) should be hidden
+# Expected items: group:test-repo, cron_group:__cron, cron:cr-001 (active), cron:cr-002 (needs_review), cron:cj-001 (scheduled)
+item_count=$(echo "$result_cron_hidden" | head -1)
+assert_eq "reviewed cron runs hidden when _show_done=0 (count=5)" "5" "$item_count"
+echo "$result_cron_hidden" | grep -qv 'cron:cr-003'
+assert_eq "cr-003 (reviewed) not in list" "0" "$?"
+
+# Test: reviewed cron runs visible when _show_done=1
+result_cron_shown=$(run_zsh <<'SCRIPT'
+setopt KSH_ARRAYS TYPESET_SILENT
+source "$2"
+
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
+typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+typeset -A _list_group_collapsed
+local -a _repo_names _list_items
+local _show_done=1 _list_cursor=0 _list_follow_id="" _has_cron_data=true
+local _total_task_count=0 _active_count=0 _review_count=0
+
+_repo_names=("test-repo")
+_repo_task_count[test-repo]=0
+for _ci in {0..3}; do _repo_cols[test-repo:${_ci}]=""; _repo_col_cnt[test-repo:${_ci}]=0; done
+
+_cron_col_ids[__cron:0]="cj-001"
+_cron_col_ids[__cron:1]="cr-001"
+_cron_col_ids[__cron:2]="cr-002"
+_cron_col_ids[__cron:3]="cr-003"
+_cron_col_cnt[__cron:0]=1
+_cron_col_cnt[__cron:1]=1
+_cron_col_cnt[__cron:2]=1
+_cron_col_cnt[__cron:3]=1
+
+_list_build_items
+echo "${#_list_items[@]}"
+for item in "${_list_items[@]}"; do echo "$item"; done
+SCRIPT
+)
+item_count_shown=$(echo "$result_cron_shown" | head -1)
+assert_eq "reviewed cron runs visible when _show_done=1 (count=6)" "6" "$item_count_shown"
+echo "$result_cron_shown" | grep -q 'cron:cr-003'
+assert_eq "cr-003 (reviewed) in list when _show_done=1" "0" "$?"
+
+# ── L: Cron split pane functions ──────────────────────────────────────────
+
+echo ""
+echo "L: Cron split pane functions"
+
+# _split_open_cron function present
+grep -q '_split_open_cron()' "$BOARD"
+assert_eq "_split_open_cron function present" "0" "$?"
+
+# _split_open_cron sets _split_is_cron=1
+result_cron_flag=$(sed -n '/_split_open_cron()/,/^}/p' "$BOARD" | grep -c '_split_is_cron=1')
+assert_eq "_split_open_cron sets _split_is_cron=1" "1" "$result_cron_flag"
+
+# _split_open sets _split_is_cron=0
+result_task_flag=$(sed -n '/_split_open() {/,/^}/p' "$BOARD" | grep -c '_split_is_cron=0')
+assert_eq "_split_open clears _split_is_cron" "1" "$result_task_flag"
+
+# _split_close resets _split_is_cron=0
+result_close_flag=$(sed -n '/_split_close()/,/^}/p' "$BOARD" | grep -c '_split_is_cron=0')
+assert_eq "_split_close resets _split_is_cron" "1" "$result_close_flag"
+
+# _split_close uses resume- prefix for cron windows
+grep -q 'resume-.*_split_task_id' "$BOARD"
+assert_eq "_split_close uses resume- prefix for cron" "0" "$?"
+
+# _split_is_cron state variable in dash loop
+grep -q '_split_is_cron=0' "$BOARD"
+assert_eq "_split_is_cron state variable initialized" "0" "$?"
+
+# Enter handler for cron uses _split_open_cron
+result_enter=$(sed -n '/Cron Enter: open in split/,/;;/p' "$BOARD" | grep -c '_split_open_cron' || true)
+assert_eq "Enter on cron run uses _split_open_cron" "1" "$(( result_enter >= 1 ? 1 : 0 ))"
+
+# Enter handler cross-type switching: cron to task
+grep -q '_split_is_cron:-0.*==.*1' "$BOARD"
+assert_eq "Enter cross-type switch: cron to task" "0" "$?"
+
+# b key handles cron items via _split_open_cron
+result_b=$(grep -c '_split_open_cron' "$BOARD" || true)
+assert_eq "b key opens split for cron items (5 refs)" "1" "$(( result_b >= 5 ? 1 : 0 ))"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo ""
+echo "M: Cron follow type and kanban-to-list cron transfer"
+
+# _list_follow_type defaults to "task"
+grep -q '_list_follow_type="task"' "$BOARD"
+assert_eq "_list_follow_type defaults to task" "0" "$?"
+
+# _list_follow_type used in follow target construction
+grep -q '${_list_follow_type:-task}:${_list_follow_id}' "$BOARD"
+assert_eq "follow target uses _list_follow_type prefix" "0" "$?"
+
+# _list_follow_type reset to task after follow completes
+result_reset=$(sed -n '/Follow cursor to tracked item/,/^  fi/p' "$BOARD" | grep -c '_list_follow_type="task"' || true)
+assert_eq "_list_follow_type reset after follow" "1" "$result_reset"
+
+# _list_follow_id with type cron positions cursor on cron item
+result_cron_follow=$(run_zsh <<'SCRIPT'
+setopt KSH_ARRAYS TYPESET_SILENT
+source "$2"
+
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
+typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+typeset -A _list_group_collapsed
+local -a _repo_names _list_items
+local _show_done=0 _list_cursor=0 _list_follow_id="" _list_follow_type="task"
+local _total_task_count=0 _active_count=0 _review_count=0
+
+_repo_names=(myrepo)
+_task_status[t-001]="active"; _task_repo[t-001]="myrepo"
+_task_status_at[t-001]="2026-01-01T00:00:00Z"
+_repo_cols[myrepo:1]="t-001"
+_repo_col_cnt[myrepo:1]=1
+for _ci in {0..3}; do
+  _cron_col_ids[__cron:${_ci}]=""
+  _cron_col_cnt[__cron:${_ci}]=0
+done
+_cron_col_ids[__cron:1]="cr-001"
+_cron_col_cnt[__cron:1]=1
+
+# Pre-set follow to cron item
+_list_follow_id="cr-001"
+_list_follow_type="cron"
+_list_build_items
+
+echo "${_list_items[$_list_cursor]}"
+SCRIPT
+)
+assert_eq "cron follow positions cursor on cron:cr-001" "cron:cr-001" "$result_cron_follow"
+
+# _list_transfer_from_kanban preserves pre-set _list_follow_id
+result_preserve=$(run_zsh <<'SCRIPT'
+setopt KSH_ARRAYS TYPESET_SILENT
+source "$2"
+
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
+typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+typeset -A _list_group_collapsed _repo_collapsed _repo_paths _repo_types
+typeset -A cur_card_row _scroll_top
+local -a _repo_names _list_items
+local _show_done=0 _list_cursor=0 _list_follow_id="" _list_follow_type="task"
+local _total_task_count=0 _active_count=0 _review_count=0
+local -i cron_row_selected=0 cur_repo_idx=0 cur_col=0
+local nav_mode="card" filter_mode="all" _tid=""
+
+_repo_names=(myrepo)
+_task_status[t-001]="active"; _task_repo[t-001]="myrepo"
+_task_status_at[t-001]="2026-01-01T00:00:00Z"
+_repo_cols[myrepo:1]="t-001"
+_repo_col_cnt[myrepo:1]=1
+for _ci in {0..3}; do
+  _cron_col_ids[__cron:${_ci}]=""
+  _cron_col_cnt[__cron:${_ci}]=0
+done
+_cron_col_ids[__cron:1]="cr-001"
+_cron_col_cnt[__cron:1]=1
+
+# Pre-set follow ID (simulating kanban cron Enter handler)
+_list_follow_id="cr-001"
+_list_follow_type="cron"
+_list_transfer_from_kanban
+
+echo "${_list_items[$_list_cursor]}"
+SCRIPT
+)
+assert_eq "transfer preserves pre-set cron follow" "cron:cr-001" "$result_preserve"
+
+# __cron group auto-expands when navigating to cron item
+result_expand=$(run_zsh <<'SCRIPT'
+setopt KSH_ARRAYS TYPESET_SILENT
+source "$2"
+
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
+typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+typeset -A _list_group_collapsed _repo_collapsed _repo_paths _repo_types
+typeset -A cur_card_row _scroll_top
+local -a _repo_names _list_items
+local _show_done=0 _list_cursor=0 _list_follow_id="" _list_follow_type="task"
+local _total_task_count=0 _active_count=0 _review_count=0
+local -i cron_row_selected=0 cur_repo_idx=0 cur_col=0
+local nav_mode="card" filter_mode="all" _tid=""
+
+_repo_names=()
+for _ci in {0..3}; do
+  _cron_col_ids[__cron:${_ci}]=""
+  _cron_col_cnt[__cron:${_ci}]=0
+done
+_cron_col_ids[__cron:1]="cr-001"
+_cron_col_cnt[__cron:1]=1
+
+# Start with __cron collapsed
+_list_group_collapsed[__cron]=1
+_list_follow_id="cr-001"
+_list_follow_type="cron"
+_list_transfer_from_kanban
+
+echo "${_list_group_collapsed[__cron]:-unset}"
+SCRIPT
+)
+assert_eq "__cron group auto-expands for cron follow" "unset" "$result_expand"
+
+# Kanban cron Enter handler sets _list_follow_type to cron
+grep -q '_list_follow_type="cron"' "$BOARD"
+assert_eq "kanban cron Enter sets _list_follow_type=cron" "0" "$?"
+
+# Kanban cron Enter switches _view_mode to list
+result_viewmode=$(sed -n '/Active .* Needs Review .* Done: open in split/,/;;/p' "$BOARD" | grep -c '_view_mode="list"' || true)
+assert_eq "kanban cron Enter switches to list mode" "1" "$result_viewmode"
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 echo ""

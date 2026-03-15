@@ -559,7 +559,11 @@ _list_handle_key() {
             sleep 2
             stty -echo; cursor_hide
           elif [[ "${_split_active:-0}" == "1" ]]; then
-            if [[ "$sel_id" != "$_split_task_id" ]]; then
+            if [[ "${_split_is_cron:-0}" == "1" ]]; then
+              # Switching from cron to task: close cron split, open task split
+              _split_close
+              _split_open "$sel_id"
+            elif [[ "$sel_id" != "$_split_task_id" ]]; then
               _split_switch_session "$sel_id"
             fi
             # Keep focus on sidebar (pane 0); user presses l to move to Claude pane
@@ -568,27 +572,18 @@ _list_handle_key() {
           fi
           ;;
         cron:*)
-          # Cron Enter: attach to active run window, or show details
+          # Cron Enter: open in split pane, or show scheduled job details
           local cid="${item#cron:}"
           local rdata="${_cron_run_data[$cid]:-}"
           if [[ -n "$rdata" ]]; then
-            local rjob_id rstat recode rstart rsid rwin
-            IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
-            if [[ "$rstat" == "active" && -n "$rwin" ]] && tmux_window_exists "$rwin"; then
-              cursor_show
-              tmux_select_window "$rwin"
-              cursor_hide
-            elif [[ -n "$rsid" ]]; then
-              local resume_win="resume-${cid}"
-              local cjob_wdir
-              cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
-              local safe_wdir=${(q)cjob_wdir}
-              ensure_tmux_session
-              tmux_create_window "$resume_win" "zsh" "-c" \
-                "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-              cursor_show
-              tmux_select_window "$resume_win"
-              cursor_hide
+            if [[ "${_split_active:-0}" == "1" ]]; then
+              if [[ "$_split_task_id" != "$cid" ]]; then
+                _split_close
+                _split_open_cron "$cid"
+              fi
+              # Keep focus on sidebar; user presses l to move to Claude pane
+            else
+              _split_open_cron "$cid"
             fi
           else
             # Scheduled job: show details
@@ -679,6 +674,8 @@ _list_handle_key() {
         _split_close
       elif _list_get_selected_id; then
         _split_open "$_tid"
+      elif _list_get_selected_cron_id; then
+        _split_open_cron "$_tid"
       fi
       ;;
 

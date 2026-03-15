@@ -104,6 +104,8 @@ _list_build_items() {
     # Cron items: active (col 1), then needs_review (col 2), then scheduled (col 0)
     local _lb_cron_col _lb_cron_ids
     for _lb_cron_col in 1 2 3 0; do
+      # Hide reviewed cron runs when done items are hidden (same as tasks)
+      [[ "$_lb_cron_col" == "3" && "$_show_done" == "0" ]] && continue
       _lb_cron_ids="${_cron_col_ids[__cron:${_lb_cron_col}]:-}"
       [[ -z "$_lb_cron_ids" ]] && continue
       local -a _lb_cron_arr=(${(s: :)_lb_cron_ids})
@@ -116,7 +118,7 @@ _list_build_items() {
 
   # ── Follow cursor to tracked item ──────────────────────────────────────────
   if [[ -n "${_list_follow_id:-}" ]]; then
-    local _lb_fi _lb_target="task:${_list_follow_id}"
+    local _lb_fi _lb_target="${_list_follow_type:-task}:${_list_follow_id}"
     for (( _lb_fi=0; _lb_fi<${#_list_items[@]}; _lb_fi++ )); do
       if [[ "${_list_items[$_lb_fi]}" == "$_lb_target" ]]; then
         _list_cursor=$_lb_fi
@@ -124,5 +126,6 @@ _list_build_items() {
       fi
     done
     _list_follow_id=""
+    _list_follow_type="task"
   fi
 }

@@ -4471,6 +4471,8 @@ _list_build_items() {
     # Cron items: active (col 1), then needs_review (col 2), then scheduled (col 0)
     local _lb_cron_col _lb_cron_ids
     for _lb_cron_col in 1 2 3 0; do
+      # Hide reviewed cron runs when done items are hidden (same as tasks)
+      [[ "$_lb_cron_col" == "3" && "$_show_done" == "0" ]] && continue
       _lb_cron_ids="${_cron_col_ids[__cron:${_lb_cron_col}]:-}"
       [[ -z "$_lb_cron_ids" ]] && continue
       local -a _lb_cron_arr=(${(s: :)_lb_cron_ids})
@@ -4483,7 +4485,7 @@ _list_build_items() {
 
   # ── Follow cursor to tracked item ──────────────────────────────────────────
   if [[ -n "${_list_follow_id:-}" ]]; then
-    local _lb_fi _lb_target="task:${_list_follow_id}"
+    local _lb_fi _lb_target="${_list_follow_type:-task}:${_list_follow_id}"
     for (( _lb_fi=0; _lb_fi<${#_list_items[@]}; _lb_fi++ )); do
       if [[ "${_list_items[$_lb_fi]}" == "$_lb_target" ]]; then
         _list_cursor=$_lb_fi
@@ -4491,6 +4493,7 @@ _list_build_items() {
       fi
     done
     _list_follow_id=""
+    _list_follow_type="task"
   fi
 }
 # ── Dashboard render helpers ───────────────────────────────────────────────────
@@ -5261,7 +5264,11 @@ _list_handle_key() {
             sleep 2
             stty -echo; cursor_hide
           elif [[ "${_split_active:-0}" == "1" ]]; then
-            if [[ "$sel_id" != "$_split_task_id" ]]; then
+            if [[ "${_split_is_cron:-0}" == "1" ]]; then
+              # Switching from cron to task: close cron split, open task split
+              _split_close
+              _split_open "$sel_id"
+            elif [[ "$sel_id" != "$_split_task_id" ]]; then
               _split_switch_session "$sel_id"
             fi
             # Keep focus on sidebar (pane 0); user presses l to move to Claude pane
@@ -5270,27 +5277,18 @@ _list_handle_key() {
           fi
           ;;
         cron:*)
-          # Cron Enter: attach to active run window, or show details
+          # Cron Enter: open in split pane, or show scheduled job details
           local cid="${item#cron:}"
           local rdata="${_cron_run_data[$cid]:-}"
           if [[ -n "$rdata" ]]; then
-            local rjob_id rstat recode rstart rsid rwin
-            IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
-            if [[ "$rstat" == "active" && -n "$rwin" ]] && tmux_window_exists "$rwin"; then
-              cursor_show
-              tmux_select_window "$rwin"
-              cursor_hide
-            elif [[ -n "$rsid" ]]; then
-              local resume_win="resume-${cid}"
-              local cjob_wdir
-              cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
-              local safe_wdir=${(q)cjob_wdir}
-              ensure_tmux_session
-              tmux_create_window "$resume_win" "zsh" "-c" \
-                "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-              cursor_show
-              tmux_select_window "$resume_win"
-              cursor_hide
+            if [[ "${_split_active:-0}" == "1" ]]; then
+              if [[ "$_split_task_id" != "$cid" ]]; then
+                _split_close
+                _split_open_cron "$cid"
+              fi
+              # Keep focus on sidebar; user presses l to move to Claude pane
+            else
+              _split_open_cron "$cid"
             fi
           else
             # Scheduled job: show details
@@ -5381,6 +5379,8 @@ _list_handle_key() {
         _split_close
       elif _list_get_selected_id; then
         _split_open "$_tid"
+      elif _list_get_selected_cron_id; then
+        _split_open_cron "$_tid"
       fi
       ;;
 
@@ -5587,6 +5587,7 @@ _split_open() {
 
   _split_active=1
   _split_task_id="$task_id"
+  _split_is_cron=0
   _split_bind_sidebar_key
 
   # Clean up stale windows before checking for a live one
@@ -5610,6 +5611,50 @@ _split_open() {
     "export CLOARD_TASK_ID=${task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
 
   tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
+}
+
+# Open a split pane with a cron run's Claude session on the right side.
+_split_open_cron() {
+  local cron_id="$1"
+  local rdata="${_cron_run_data[$cron_id]:-}"
+
+  # Only works for cron runs with data (not scheduled jobs)
+  [[ -n "$rdata" ]] || return 1
+
+  local rjob_id rstat recode rstart rsid rwin
+  IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+
+  _split_active=1
+  _split_task_id="$cron_id"
+  _split_is_cron=1
+  _split_bind_sidebar_key
+
+  ensure_tmux_session
+
+  # Active run with live tmux window: join it into dashboard right pane
+  if [[ "$rstat" == "active" && -n "$rwin" ]] && tmux_window_exists "$rwin"; then
+    tmux_cmd join-pane -h -s "board:${rwin}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
+    return 0
+  fi
+
+  # Resume from session ID
+  if [[ -n "$rsid" ]]; then
+    local cjob_wdir
+    cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
+    local safe_wdir=${(q)cjob_wdir}
+    local resume_win="resume-${cron_id}"
+
+    # Check for existing resume window
+    _purge_stale_windows "$resume_win"
+    if tmux_window_exists "$resume_win"; then
+      tmux_cmd join-pane -h -s "board:${resume_win}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    else
+      tmux_cmd split-window -h -t "board:dashboard" -p 60 \
+        "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
+    fi
+    tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
+  fi
 }
 
 # Switch the right pane to a different task's session.
@@ -5682,15 +5727,21 @@ _split_switch_session() {
 # Close the split view, preserving the running session in its own tmux window.
 _split_close() {
   if [[ -n "$_split_task_id" ]]; then
+    # For cron splits, preserve with resume- prefix so _split_open_cron can find it
+    local break_name="$_split_task_id"
+    if [[ "${_split_is_cron:-0}" == "1" ]]; then
+      break_name="resume-${_split_task_id}"
+    fi
     # Kill stale windows first so break-pane creates the only named window
-    _purge_stale_windows "$_split_task_id"
+    _purge_stale_windows "$break_name"
     # Try to preserve as named window; fall back to killing the pane
-    tmux_cmd break-pane -d -s "board:dashboard.1" -n "$_split_task_id" 2>/dev/null \
+    tmux_cmd break-pane -d -s "board:dashboard.1" -n "$break_name" 2>/dev/null \
       || tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null \
       || true
   fi
   _split_active=0
   _split_task_id=""
+  _split_is_cron=0
   _split_unbind_sidebar_key
 }
 cmd_dash() {
@@ -5768,8 +5819,10 @@ cmd__dash_loop() {
   local -i _list_cursor=0         # index into _list_items[]
   local -i _list_scroll_top=0     # first visible content-line in viewport
   local -a _list_items=()         # flat ordered array: "group:repo", "task:t-001", etc.
-  local _split_task_id=""          # task ID in right pane
+  local _split_task_id=""          # task ID (or cron ID) in right pane
+  local -i _split_is_cron=0       # 1 when split pane shows a cron session
   local _list_follow_id=""         # task ID to follow after re-sort
+  local _list_follow_type="task"   # "task" or "cron" prefix for follow target
   typeset -A _list_group_collapsed # group_name -> 1 if collapsed
   local -i _list_scrollbar_vh=0    # set by _render_list_full for deferred scrollbar
   local -i _list_scrollbar_total=0
@@ -6556,32 +6609,13 @@ cmd__dash_loop() {
                 stty -echo
                 cursor_hide
                 ;;
-              1)  # Active: attach to tmux window
-                local rdata="${_cron_run_data[$cron_item]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
-                if [[ -n "$rwin" ]] && tmux_window_exists "$rwin"; then
-                  cursor_show
-                  tmux_select_window "$rwin"
-                  cursor_hide
-                fi
-                ;;
-              2|3)  # Needs Review / Done: resume session
-                local rdata="${_cron_run_data[$cron_item]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
-                if [[ -n "$rsid" ]]; then
-                  local resume_win="resume-${cron_item}"
-                  local cjob_wdir
-                  cjob_wdir=$(cron_job_field "$rjob_id" "working_dir")
-                  local safe_wdir=${(q)cjob_wdir}
-                  ensure_tmux_session
-                  tmux_create_window "$resume_win" "zsh" "-c" \
-                    "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
-                  cursor_show
-                  tmux_select_window "$resume_win"
-                  cursor_hide
-                fi
+              1|2|3)  # Active / Needs Review / Done: open in split pane via list mode
+                [[ "${_split_active:-0}" == "1" ]] && _split_close
+                _list_follow_id="$cron_item"
+                _list_follow_type="cron"
+                _view_mode="list"
+                _list_transfer_from_kanban
+                _split_open_cron "$cron_item"
                 ;;
             esac
           fi
@@ -7413,9 +7447,16 @@ _get_active_task_id() {
 _list_transfer_from_kanban() {
   _list_group_collapsed=()  # expand all groups by default
 
-  # Try to position cursor on the same task selected in kanban
-  if _get_selected_id 2>/dev/null; then
+  # If caller pre-set _list_follow_id (e.g. kanban cron Enter), preserve it
+  if [[ -n "${_list_follow_id:-}" ]]; then
+    # Ensure __cron group is expanded when following a cron item
+    [[ "${_list_follow_type:-task}" == "cron" ]] && unset '_list_group_collapsed[__cron]'
+  elif _get_selected_id 2>/dev/null; then
     _list_follow_id="$_tid"
+  elif [[ $cron_row_selected -eq 1 ]]; then
+    # Cron row selected but no specific task ID; expand cron group
+    _list_follow_type="cron"
+    unset '_list_group_collapsed[__cron]'
   elif [[ ${#_repo_names[@]} -gt 0 ]]; then
     # Position at current repo's group header
     _list_follow_id=""
