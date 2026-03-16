@@ -52,6 +52,21 @@ _xml_escape() {
 
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
+# Compute a compact "time ago" string from an ISO timestamp.
+# Sets _tago (avoids subshell). Empty string on invalid/missing input.
+_time_ago() {
+  [[ -z "${1:-}" ]] && { _tago=""; return; }
+  local _ta_epoch
+  TZ=UTC strftime -r -s _ta_epoch "%Y-%m-%dT%H:%M:%SZ" "$1" 2>/dev/null || { _tago=""; return; }
+  local _ta_delta=$(( EPOCHSECONDS - _ta_epoch ))
+  [[ $_ta_delta -lt 0 ]] && { _tago=""; return; }
+  if   (( _ta_delta < 60 ));    then _tago="[<1m ago]"
+  elif (( _ta_delta < 3600 ));  then _tago="[$((_ta_delta / 60))m ago]"
+  elif (( _ta_delta < 86400 )); then _tago="[$((_ta_delta / 3600))h ago]"
+  else                               _tago="[$((_ta_delta / 86400))d ago]"
+  fi
+}
+
 # ── Lock helpers (mkdir-based, portable to macOS) ─────────────────────────────
 _lock_state() {
   local lockdir="${GLOBAL_DIR}/.lock"
@@ -2469,6 +2484,7 @@ cmd_signal() {
       tsk_status=$(task_status "$id")
       if [[ "$tsk_status" == "active" || "$tsk_status" == "needs_review" ]]; then
         update_task_field "$id" "claude_status" "$signal"
+        update_task_field "$id" "last_activity_at" "$(now_iso)"
         # If task was moved to needs_review by a previous "waiting" signal, move it back
         if [[ "$tsk_status" == "needs_review" ]]; then
           set_task_status "$id" "active"
@@ -2480,6 +2496,7 @@ cmd_signal() {
       tsk_status=$(task_status "$id")
       if [[ "$tsk_status" == "active" ]]; then
         update_task_field "$id" "claude_status" "$signal"
+        update_task_field "$id" "last_activity_at" "$(now_iso)"
         # Auto-move to needs_review when Claude is waiting
         set_task_status "$id" "needs_review"
       fi
@@ -4184,6 +4201,7 @@ _snapshot_tasks() {
   _task_wtmode=()
   _task_repo=()
   _task_status_at=()
+  _task_activity_at=()
   _repo_names=()
   _repo_paths=()
   _repo_types=()
@@ -4199,7 +4217,7 @@ _snapshot_tasks() {
   _cron_jobs=()           # id -> name
   _cron_job_enabled=()    # id -> true/false
   _cron_job_schedule=()   # id -> schedule_desc
-  _cron_run_data=()       # run_id -> "cron_job_id\x1estatus\x1eexit_code\x1estarted_at\x1esession_id\x1etmux_window"
+  _cron_run_data=()       # run_id -> "cron_job_id\x1estatus\x1eexit_code\x1estarted_at\x1esession_id\x1etmux_window\x1ecompleted_at"
   _cron_col_ids=()        # __cron:N -> space-separated IDs
   _cron_col_cnt=()        # __cron:N -> count
   _has_cron_data=false
@@ -4212,12 +4230,12 @@ _snapshot_tasks() {
   _snap=$(jq -r '
     ("H\u001e" + (.next_task_id | tostring) + "\u001e" + (.repos | length | tostring) + "\u001e" + (.tasks | length | tostring)),
     (.repos[] | "R\u001e" + .name + "\u001e" + .path + "\u001e" + (.type // "git") + "\u001e" + (if .archived == true then "1" else "0" end)),
-    (.tasks[] | "T\u001e" + .id + "\u001e" + .status + "\u001e" + (.title // "") + "\u001e" + (.pr_url // "") + "\u001e" + (.claude_status // "") + "\u001e" + (.worktree_mode // "worktree") + "\u001e" + (.repo // "") + "\u001e" + (.status_changed_at // "")),
+    (.tasks[] | "T\u001e" + .id + "\u001e" + .status + "\u001e" + (.title // "") + "\u001e" + (.pr_url // "") + "\u001e" + (.claude_status // "") + "\u001e" + (.worktree_mode // "worktree") + "\u001e" + (.repo // "") + "\u001e" + (.status_changed_at // "") + "\u001e" + (.last_activity_at // "")),
     (.cron_jobs[]? | "CJ\u001e" + .id + "\u001e" + .name + "\u001e" + (if .enabled then "true" else "false" end) + "\u001e" + (.schedule_desc // "")),
-    (.cron_runs[]? | select(.status == "active" or .status == "needs_review" or .status == "reviewed") | "CR\u001e" + .run_id + "\u001e" + .cron_job_id + "\u001e" + .status + "\u001e" + (.exit_code | tostring) + "\u001e" + (.started_at // "") + "\u001e" + (.session_id // "") + "\u001e" + (.tmux_window // ""))
+    (.cron_runs[]? | select(.status == "active" or .status == "needs_review" or .status == "reviewed") | "CR\u001e" + .run_id + "\u001e" + .cron_job_id + "\u001e" + .status + "\u001e" + (.exit_code | tostring) + "\u001e" + (.started_at // "") + "\u001e" + (.session_id // "") + "\u001e" + (.tmux_window // "") + "\u001e" + (.completed_at // ""))
   ' "$GLOBAL_STATE" 2>/dev/null) || return 0
 
-  while IFS=$'\x1e' read -r _type _f1 _f2 _f3 _f4 _f5 _f6 _f7 _f8; do
+  while IFS=$'\x1e' read -r _type _f1 _f2 _f3 _f4 _f5 _f6 _f7 _f8 _f9; do
     case "$_type" in
       H)
         _total_task_count="$_f3"
@@ -4239,7 +4257,7 @@ _snapshot_tasks() {
         fi
         ;;
       T)
-        # _f1=id, _f2=status, _f3=title, _f4=pr_url, _f5=claude_status, _f6=worktree_mode, _f7=repo, _f8=status_changed_at
+        # _f1=id, _f2=status, _f3=title, _f4=pr_url, _f5=claude_status, _f6=worktree_mode, _f7=repo, _f8=status_changed_at, _f9=last_activity_at
         _task_status[$_f1]="$_f2"
         _task_title[$_f1]="$_f3"
         _task_pr[$_f1]="$_f4"
@@ -4247,6 +4265,7 @@ _snapshot_tasks() {
         _task_wtmode[$_f1]="$_f6"
         _task_repo[$_f1]="$_f7"
         _task_status_at[$_f1]="$_f8"
+        _task_activity_at[$_f1]="$_f9"
 
         [[ "$_f2" == "active" ]] && _active_count=$((_active_count + 1))
         [[ "$_f2" == "needs_review" ]] && _review_count=$((_review_count + 1))
@@ -4291,8 +4310,8 @@ _snapshot_tasks() {
         _cron_col_cnt[$_ck]=$(( ${_cron_col_cnt[$_ck]:-0} + 1 ))
         ;;
       CR)
-        # _f1=run_id, _f2=cron_job_id, _f3=status, _f4=exit_code, _f5=started_at, _f6=session_id, _f7=tmux_window
-        _cron_run_data[$_f1]="${_f2}\x1e${_f3}\x1e${_f4}\x1e${_f5}\x1e${_f6}\x1e${_f7}"
+        # _f1=run_id, _f2=cron_job_id, _f3=status, _f4=exit_code, _f5=started_at, _f6=session_id, _f7=tmux_window, _f8=completed_at
+        _cron_run_data[$_f1]="${_f2}\x1e${_f3}\x1e${_f4}\x1e${_f5}\x1e${_f6}\x1e${_f7}\x1e${_f8}"
         _has_cron_data=true
         local _cron_col
         if [[ "$_f3" == "active" ]]; then
@@ -4620,8 +4639,8 @@ _render_cron_row() {
                 ;;
               1)  # Active: show run info
                 local rdata="${_cron_run_data[$item_id]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                local rjob_id rstat recode rstart rsid rwin rcompleted
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
                 local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
                 case $line_no in
                   0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
@@ -4633,10 +4652,14 @@ _render_cron_row() {
                 ;;
               2)  # Needs Review: show run info
                 local rdata="${_cron_run_data[$item_id]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                local rjob_id rstat recode rstart rsid rwin rcompleted
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
                 local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
                 local exit_info="exit ${recode}"
+                if [[ -n "${rcompleted:-}" ]]; then
+                  _time_ago "$rcompleted"
+                  [[ -n "$_tago" ]] && exit_info="${exit_info} ${_tago}"
+                fi
                 case $line_no in
                   0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
                   1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
@@ -4647,8 +4670,8 @@ _render_cron_row() {
                 ;;
               3)  # Done: show reviewed run info
                 local rdata="${_cron_run_data[$item_id]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                local rjob_id rstat recode rstart rsid rwin rcompleted
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
                 local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
                 local exit_info="exit ${recode}"
                 case $line_no in
@@ -4835,6 +4858,15 @@ _render_list_task_card() {
     [[ -n "$right_meta" ]] && right_meta+=" "
     right_meta+="$pr_short"
   fi
+  # Append time ago for non-pending tasks
+  if [[ "$tstatus" != "pending" ]]; then
+    local tstatus_at="${_task_activity_at[$task_id]:-${_task_status_at[$task_id]:-}}"
+    if [[ -n "$tstatus_at" ]]; then
+      _time_ago "$tstatus_at"
+      [[ -n "$_tago" ]] && { [[ -n "$right_meta" ]] && right_meta="${right_meta} ${_tago}" || right_meta="$_tago"; }
+    fi
+  fi
+
   # Add spacing if we have right metadata
   [[ -n "$right_meta" ]] && right_meta="  ${right_meta}"
 
@@ -4911,12 +4943,18 @@ _render_list_cron_card() {
     fi
   else
     # Cron run
-    local rjob_id rstat recode rstart rsid rwin
-    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+    local rjob_id rstat recode rstart rsid rwin rcompleted
+    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
     cron_name="${_cron_jobs[$rjob_id]:-$rjob_id}"
     case "$rstat" in
       active)       badge_char="●"; badge_color="$C_GREEN";  right_meta="● running";  right_color="$C_GREEN" ;;
-      needs_review) badge_char="◆"; badge_color="$C_YELLOW"; right_meta="◆ review";   right_color="$C_YELLOW" ;;
+      needs_review)
+        badge_char="◆"; badge_color="$C_YELLOW"; right_meta="◆ review"; right_color="$C_YELLOW"
+        if [[ -n "${rcompleted:-}" ]]; then
+          _time_ago "$rcompleted"
+          [[ -n "$_tago" ]] && right_meta="${right_meta} ${_tago}"
+        fi
+        ;;
       reviewed)     badge_char="✓"; badge_color="$C_CYAN";   right_meta="✓ reviewed";  right_color="$C_CYAN" ;;
       *)            badge_char="○"; badge_color="$C_DIM";     right_meta="$rstat";      right_color="$C_DIM" ;;
     esac
@@ -5074,6 +5112,15 @@ _render_sidebar_task_card() {
   [[ "$claude" == "working" ]] && claude_char=" ⚙"
   [[ "$claude" == "waiting" ]] && claude_char=" ○"
 
+  # Append time ago for non-pending tasks
+  if [[ "$tstatus" != "pending" ]]; then
+    local tstatus_at="${_task_activity_at[$task_id]:-${_task_status_at[$task_id]:-}}"
+    if [[ -n "$tstatus_at" ]]; then
+      _time_ago "$tstatus_at"
+      [[ -n "$_tago" ]] && claude_char="${claude_char} ${_tago}"
+    fi
+  fi
+
   local prefix=" "
   local sel_on="" sel_off=""
   if [[ "$is_selected" == "1" ]]; then
@@ -5200,8 +5247,8 @@ _list_get_cron_col() {
   if [[ -z "$rdata" ]]; then
     _list_cron_col=0  # Scheduled job
   else
-    local rjob_id rstat recode rstart rsid rwin
-    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+    local rjob_id rstat recode rstart rsid rwin rcompleted
+    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
     case "$rstat" in
       active)       _list_cron_col=1 ;;
       needs_review) _list_cron_col=2 ;;
@@ -6154,6 +6201,14 @@ cmd__dash_loop() {
                       [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
                       # waiting status hidden (too noisy)
                       [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
+                      local tstatus="${_task_status[$task_id]}"
+                      if [[ "$tstatus" != "pending" ]]; then
+                        local tstatus_at="${_task_activity_at[$task_id]:-${_task_status_at[$task_id]:-}}"
+                        if [[ -n "$tstatus_at" ]]; then
+                          _time_ago "$tstatus_at"
+                          [[ -n "$_tago" ]] && { [[ -n "$extra" ]] && extra="${extra} ${_tago}" || extra="$_tago"; }
+                        fi
+                      fi
                       if [[ -n "$extra" ]]; then
                         extra=$(trunc "$extra" $((card_inner - 2)))
                         local st_fill_len=$((card_inner - ${#extra} - 2))
@@ -6315,6 +6370,14 @@ cmd__dash_loop() {
                     [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
                     [[ "$cstatus" == "waiting" ]] && { extra="○ waiting"; extra_color="${C_YELLOW}"; }
                     [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
+                    local tstatus="${_task_status[$task_id]}"
+                    if [[ "$tstatus" != "pending" ]]; then
+                      local tstatus_at="${_task_activity_at[$task_id]:-${_task_status_at[$task_id]:-}}"
+                      if [[ -n "$tstatus_at" ]]; then
+                        _time_ago "$tstatus_at"
+                        [[ -n "$_tago" ]] && { [[ -n "$extra" ]] && extra="${extra} ${_tago}" || extra="$_tago"; }
+                      fi
+                    fi
                     extra=$(trunc "$extra" $((card_inner - 1)))
                     if $is_selected; then
                       cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${extra}")

@@ -130,6 +130,15 @@ _render_list_task_card() {
     [[ -n "$right_meta" ]] && right_meta+=" "
     right_meta+="$pr_short"
   fi
+  # Append time ago for non-pending tasks
+  if [[ "$tstatus" != "pending" ]]; then
+    local tstatus_at="${_task_activity_at[$task_id]:-${_task_status_at[$task_id]:-}}"
+    if [[ -n "$tstatus_at" ]]; then
+      _time_ago "$tstatus_at"
+      [[ -n "$_tago" ]] && { [[ -n "$right_meta" ]] && right_meta="${right_meta} ${_tago}" || right_meta="$_tago"; }
+    fi
+  fi
+
   # Add spacing if we have right metadata
   [[ -n "$right_meta" ]] && right_meta="  ${right_meta}"
 
@@ -206,12 +215,18 @@ _render_list_cron_card() {
     fi
   else
     # Cron run
-    local rjob_id rstat recode rstart rsid rwin
-    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+    local rjob_id rstat recode rstart rsid rwin rcompleted
+    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
     cron_name="${_cron_jobs[$rjob_id]:-$rjob_id}"
     case "$rstat" in
       active)       badge_char="●"; badge_color="$C_GREEN";  right_meta="● running";  right_color="$C_GREEN" ;;
-      needs_review) badge_char="◆"; badge_color="$C_YELLOW"; right_meta="◆ review";   right_color="$C_YELLOW" ;;
+      needs_review)
+        badge_char="◆"; badge_color="$C_YELLOW"; right_meta="◆ review"; right_color="$C_YELLOW"
+        if [[ -n "${rcompleted:-}" ]]; then
+          _time_ago "$rcompleted"
+          [[ -n "$_tago" ]] && right_meta="${right_meta} ${_tago}"
+        fi
+        ;;
       reviewed)     badge_char="✓"; badge_color="$C_CYAN";   right_meta="✓ reviewed";  right_color="$C_CYAN" ;;
       *)            badge_char="○"; badge_color="$C_DIM";     right_meta="$rstat";      right_color="$C_DIM" ;;
     esac
@@ -369,6 +384,15 @@ _render_sidebar_task_card() {
   [[ "$claude" == "working" ]] && claude_char=" ⚙"
   [[ "$claude" == "waiting" ]] && claude_char=" ○"
 
+  # Append time ago for non-pending tasks
+  if [[ "$tstatus" != "pending" ]]; then
+    local tstatus_at="${_task_activity_at[$task_id]:-${_task_status_at[$task_id]:-}}"
+    if [[ -n "$tstatus_at" ]]; then
+      _time_ago "$tstatus_at"
+      [[ -n "$_tago" ]] && claude_char="${claude_char} ${_tago}"
+    fi
+  fi
+
   local prefix=" "
   local sel_on="" sel_off=""
   if [[ "$is_selected" == "1" ]]; then
@@ -495,8 +519,8 @@ _list_get_cron_col() {
   if [[ -z "$rdata" ]]; then
     _list_cron_col=0  # Scheduled job
   else
-    local rjob_id rstat recode rstart rsid rwin
-    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+    local rjob_id rstat recode rstart rsid rwin rcompleted
+    IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
     case "$rstat" in
       active)       _list_cron_col=1 ;;
       needs_review) _list_cron_col=2 ;;

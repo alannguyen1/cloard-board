@@ -408,6 +408,14 @@ cmd__dash_loop() {
                       [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
                       # waiting status hidden (too noisy)
                       [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
+                      local tstatus="${_task_status[$task_id]}"
+                      if [[ "$tstatus" != "pending" ]]; then
+                        local tstatus_at="${_task_activity_at[$task_id]:-${_task_status_at[$task_id]:-}}"
+                        if [[ -n "$tstatus_at" ]]; then
+                          _time_ago "$tstatus_at"
+                          [[ -n "$_tago" ]] && { [[ -n "$extra" ]] && extra="${extra} ${_tago}" || extra="$_tago"; }
+                        fi
+                      fi
                       if [[ -n "$extra" ]]; then
                         extra=$(trunc "$extra" $((card_inner - 2)))
                         local st_fill_len=$((card_inner - ${#extra} - 2))
@@ -569,6 +577,14 @@ cmd__dash_loop() {
                     [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
                     [[ "$cstatus" == "waiting" ]] && { extra="○ waiting"; extra_color="${C_YELLOW}"; }
                     [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
+                    local tstatus="${_task_status[$task_id]}"
+                    if [[ "$tstatus" != "pending" ]]; then
+                      local tstatus_at="${_task_activity_at[$task_id]:-${_task_status_at[$task_id]:-}}"
+                      if [[ -n "$tstatus_at" ]]; then
+                        _time_ago "$tstatus_at"
+                        [[ -n "$_tago" ]] && { [[ -n "$extra" ]] && extra="${extra} ${_tago}" || extra="$_tago"; }
+                      fi
+                    fi
                     extra=$(trunc "$extra" $((card_inner - 1)))
                     if $is_selected; then
                       cell=$(printf "${sel_color} │%-*s│${C_RESET}" "$card_inner" " ${extra}")

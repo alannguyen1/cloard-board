@@ -122,8 +122,8 @@ _render_cron_row() {
                 ;;
               1)  # Active: show run info
                 local rdata="${_cron_run_data[$item_id]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                local rjob_id rstat recode rstart rsid rwin rcompleted
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
                 local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
                 case $line_no in
                   0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
@@ -135,10 +135,14 @@ _render_cron_row() {
                 ;;
               2)  # Needs Review: show run info
                 local rdata="${_cron_run_data[$item_id]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                local rjob_id rstat recode rstart rsid rwin rcompleted
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
                 local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
                 local exit_info="exit ${recode}"
+                if [[ -n "${rcompleted:-}" ]]; then
+                  _time_ago "$rcompleted"
+                  [[ -n "$_tago" ]] && exit_info="${exit_info} ${_tago}"
+                fi
                 case $line_no in
                   0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
                   1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
@@ -149,8 +153,8 @@ _render_cron_row() {
                 ;;
               3)  # Done: show reviewed run info
                 local rdata="${_cron_run_data[$item_id]:-}"
-                local rjob_id rstat recode rstart rsid rwin
-                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin <<< "$(echo -e "$rdata")"
+                local rjob_id rstat recode rstart rsid rwin rcompleted
+                IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
                 local rjname="${_cron_jobs[$rjob_id]:-$rjob_id}"
                 local exit_info="exit ${recode}"
                 case $line_no in

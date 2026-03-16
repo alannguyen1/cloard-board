@@ -111,7 +111,7 @@ setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
 # Mock snapshot data
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -176,7 +176,7 @@ result2=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -221,7 +221,7 @@ result3=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -266,7 +266,7 @@ result4=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -306,7 +306,7 @@ result5=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -539,7 +539,7 @@ result_cron=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -679,7 +679,7 @@ result_cron_hidden=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -718,7 +718,7 @@ result_cron_shown=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -811,7 +811,7 @@ result_cron_follow=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -846,7 +846,7 @@ result_preserve=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed _repo_collapsed _repo_paths _repo_types
@@ -884,7 +884,7 @@ result_expand=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed _repo_collapsed _repo_paths _repo_types

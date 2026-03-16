@@ -258,7 +258,7 @@ GLOBAL_STATE="$GLOBAL_DIR/state.json"
 cat > "$GLOBAL_STATE" <<'JSON'
 {"version":5,"next_task_id":2,"repos":[{"name":"r","path":"/tmp/r","type":"dir"}],"tasks":[{"id":"t-001","title":"test","repo":"r","status":"active","status_changed_at":"2026-03-10T12:00:00Z","claude_status":null,"worktree_mode":"none","pr_url":null}],"cron_jobs":[],"cron_runs":[]}
 JSON
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
 typeset -A _repo_cols _repo_col_cnt
 local -a _repo_names
@@ -286,7 +286,7 @@ GLOBAL_STATE="$GLOBAL_DIR/state.json"
 cat > "$GLOBAL_STATE" <<'JSON'
 {"version":5,"next_task_id":2,"repos":[{"name":"r","path":"/tmp/r","type":"dir"}],"tasks":[{"id":"t-001","title":"test","repo":"r","status":"active","claude_status":null,"worktree_mode":"none","pr_url":null}],"cron_jobs":[],"cron_runs":[]}
 JSON
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
 typeset -A _repo_cols _repo_col_cnt
 local -a _repo_names
@@ -316,7 +316,7 @@ result=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -366,7 +366,7 @@ result=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -419,7 +419,7 @@ result=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed
@@ -461,7 +461,7 @@ result=$(run_zsh <<'SCRIPT'
 setopt KSH_ARRAYS TYPESET_SILENT
 source "$2"
 
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_cols _repo_col_cnt _repo_task_count _repo_stale
 typeset -A _cron_col_ids _cron_col_cnt _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
 typeset -A _list_group_collapsed

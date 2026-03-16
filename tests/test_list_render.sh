@@ -101,7 +101,7 @@ local cols=120
 local rows=43
 
 # Snapshot arrays
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
 typeset -A _repo_cols _repo_col_cnt
 local -a _repo_names
@@ -208,7 +208,7 @@ GLOBAL_DIR="$TMPDIR_TEST"
 source "\$2"
 
 local cols=120 rows=43
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
 typeset -A _repo_cols _repo_col_cnt
 local -a _repo_names
@@ -261,7 +261,7 @@ GLOBAL_DIR="$TMPDIR_TEST"
 source "\$2"
 
 local cols=30 rows=43
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
 typeset -A _repo_cols _repo_col_cnt
 local -a _repo_names
@@ -317,7 +317,7 @@ GLOBAL_DIR="$TMPDIR_TEST"
 source "\$2"
 
 local cols=40 rows=43
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
 typeset -A _repo_cols _repo_col_cnt
 local -a _repo_names
@@ -374,7 +374,7 @@ source "\$2"
 
 # Use small terminal so frame exceeds max_lines and triggers clipping
 local cols=120 rows=20
-typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
 typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
 typeset -A _repo_cols _repo_col_cnt
 local -a _repo_names

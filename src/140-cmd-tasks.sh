@@ -763,6 +763,7 @@ cmd_signal() {
       tsk_status=$(task_status "$id")
       if [[ "$tsk_status" == "active" || "$tsk_status" == "needs_review" ]]; then
         update_task_field "$id" "claude_status" "$signal"
+        update_task_field "$id" "last_activity_at" "$(now_iso)"
         # If task was moved to needs_review by a previous "waiting" signal, move it back
         if [[ "$tsk_status" == "needs_review" ]]; then
           set_task_status "$id" "active"
@@ -774,6 +775,7 @@ cmd_signal() {
       tsk_status=$(task_status "$id")
       if [[ "$tsk_status" == "active" ]]; then
         update_task_field "$id" "claude_status" "$signal"
+        update_task_field "$id" "last_activity_at" "$(now_iso)"
         # Auto-move to needs_review when Claude is waiting
         set_task_status "$id" "needs_review"
       fi
