@@ -17,6 +17,7 @@ test: build
 	zsh tests/test_unified_modal.sh
 	zsh tests/test_status_changed_at.sh
 	zsh tests/test_time_ago.sh
+	zsh tests/test_gc.sh
 
 clean:
 	@echo "cloard-board is the built artifact; not cleaning"

@@ -91,6 +91,130 @@ cmd__capture_session_uid() {
   return 0
 }
 
+_task_idle_reference_at() {
+  local id="$1"
+  local idle_ref
+  idle_ref=$(task_field "$id" "last_activity_at")
+  [[ -n "$idle_ref" ]] || idle_ref=$(task_field "$id" "status_changed_at")
+  [[ -n "$idle_ref" ]] || idle_ref=$(task_field "$id" "started_at")
+  [[ -n "$idle_ref" ]] || idle_ref=$(task_field "$id" "created_at")
+  echo "$idle_ref"
+}
+
+_task_idle_seconds() {
+  local id="$1"
+  local idle_ref
+  idle_ref=$(_task_idle_reference_at "$id")
+  [[ -n "$idle_ref" ]] || return 1
+
+  local idle_epoch
+  idle_epoch=$(_iso_to_epoch "$idle_ref" 2>/dev/null) || return 1
+
+  local now_epoch
+  now_epoch=$(date +%s)
+  local delta=$((now_epoch - idle_epoch))
+  (( delta < 0 )) && delta=0
+  echo "$delta"
+}
+
+_reconcile_task_runtime() {
+  local apply="${1:-false}" verbose="${2:-false}"
+  _gc_findings=0
+  _gc_actions=0
+
+  if tmux_session_exists; then
+    local orphan_split_id
+    orphan_split_id=$(_tmux_dashboard_task_id 2>/dev/null || true)
+    if [[ -n "$orphan_split_id" ]] && ! task_exists "$orphan_split_id"; then
+      _gc_findings=$((_gc_findings + 1))
+      if $apply; then
+        tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null || true
+        _gc_actions=$((_gc_actions + 1))
+        $verbose && info "closed orphaned dashboard split runtime '${orphan_split_id}'"
+      else
+        $verbose && warn "dashboard split runtime '${orphan_split_id}' has no matching task"
+      fi
+    fi
+  fi
+
+  local task_data
+  task_data=$(jq -r '
+    .tasks[] |
+    [.id, .status, (.claude_status // ""), (.last_activity_at // ""), (.status_changed_at // ""), (.started_at // "")] |
+    join("\u001e")
+  ' "$GLOBAL_STATE" 2>/dev/null)
+
+  local id task_state claude_status last_activity_at status_changed_at started_at
+  while IFS=$'\x1e' read -r id task_state claude_status last_activity_at status_changed_at started_at; do
+    [[ -n "$id" ]] || continue
+
+    local idle_ref="$last_activity_at"
+    [[ -n "$idle_ref" ]] || idle_ref="$status_changed_at"
+    [[ -n "$idle_ref" ]] || idle_ref="$started_at"
+
+    local idle_secs=""
+    if [[ -n "$idle_ref" ]]; then
+      local idle_epoch
+      idle_epoch=$(_iso_to_epoch "$idle_ref" 2>/dev/null || true)
+      if [[ -n "$idle_epoch" ]]; then
+        local now_epoch
+        now_epoch=$(date +%s)
+        idle_secs=$((now_epoch - idle_epoch))
+        (( idle_secs < 0 )) && idle_secs=0
+      fi
+    fi
+
+    local has_runtime=0
+    local live_runtime=0
+    _tmux_task_runtime_exists "$id" && has_runtime=1
+    _tmux_task_runtime_live "$id" && live_runtime=1
+
+    local finding=""
+    local apply_mode=""
+
+    if [[ "$task_state" == "active" ]] && [[ -n "$idle_secs" ]] && (( idle_secs >= TASK_ACTIVE_IDLE_TIMEOUT_SECS )); then
+      finding="task '${id}' is active but idle for at least 24h"
+      apply_mode="pause_active"
+    elif [[ "$task_state" == "needs_review" ]] && (( has_runtime == 1 )) && [[ -n "$idle_secs" ]] \
+      && (( idle_secs >= TASK_REVIEW_IDLE_TIMEOUT_SECS )); then
+      finding="task '${id}' is needs_review and still owns a runtime after 1h idle"
+      apply_mode="close_runtime"
+    elif [[ "$task_state" == "done" || "$task_state" == "paused" ]] && (( has_runtime == 1 )); then
+      finding="task '${id}' is ${task_state} but still owns a runtime"
+      apply_mode="close_runtime"
+    elif (( has_runtime == 1 && live_runtime == 0 )); then
+      finding="task '${id}' has a stale fallback shell runtime"
+      apply_mode="close_runtime"
+    fi
+
+    if [[ -n "$finding" ]]; then
+      _gc_findings=$((_gc_findings + 1))
+      if $apply; then
+        case "$apply_mode" in
+          pause_active)
+            _tmux_close_task_runtime "$id" || true
+            set_task_status "$id" "paused"
+            update_task_field_raw "$id" "claude_status" "null"
+            ;;
+          close_runtime)
+            _tmux_close_task_runtime "$id" || true
+            update_task_field_raw "$id" "claude_status" "null"
+            ;;
+        esac
+        _gc_actions=$((_gc_actions + 1))
+        $verbose && info "$finding"
+      else
+        $verbose && warn "$finding"
+      fi
+      continue
+    fi
+
+    if $apply && [[ -n "$claude_status" ]] && (( live_runtime == 0 )); then
+      update_task_field_raw "$id" "claude_status" "null"
+    fi
+  done <<< "$task_data"
+}
+
 cmd_init() {
   ensure_global_state
   check_and_migrate
@@ -255,6 +379,8 @@ cmd_session() {
   rpath=$(repo_path "$repo_name")
   [[ -d "$rpath" ]] || die "repo path not found: $rpath"
 
+  _reconcile_task_runtime true false
+
   # Default title: short session UID
   [[ -z "$title" ]] && title="session-${session_uid:0:8}"
 
@@ -367,6 +493,7 @@ cmd_start() {
   local prompt="${*:-}"
 
   task_exists "$id" || die "task '$id' not found; run 'cloard-board add' first"
+  _reconcile_task_runtime true false
 
   local tsk_status
   tsk_status=$(task_status "$id")
@@ -452,14 +579,18 @@ cmd_go() {
 
   ensure_tmux_session
 
-  if ! tmux_window_exists "$id"; then
+  if ! _tmux_task_runtime_exists "$id"; then
     die "no tmux window for task '${id}'; try 'cloard-board start' or 'cloard-board resume'"
   fi
 
   if [[ -z "${TMUX:-}" ]]; then
-    tmux_cmd attach -t "board:${id}"
+    if tmux_window_exists "$id"; then
+      tmux_cmd attach -t "board:${id}"
+    else
+      tmux_cmd attach -t "board:dashboard"
+    fi
   else
-    tmux_select_window "$id"
+    _tmux_focus_task_runtime "$id" || die "could not focus runtime for '${id}'"
   fi
 }
 
@@ -511,8 +642,7 @@ cmd_done() {
   [[ -n "$id" ]] || die "usage: cloard-board done <id>"
   task_exists "$id" || die "task '$id' not found"
 
-  # Kill tmux window
-  tmux_kill_window "$id"
+  _tmux_close_task_runtime "$id" || true
 
   local wt_mode
   wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$GLOBAL_STATE")
@@ -556,6 +686,7 @@ cmd_reopen() {
   local tsk_status
   tsk_status=$(task_status "$id")
   [[ "$tsk_status" == "done" ]] || die "task '$id' is '${tsk_status}'; only 'done' tasks can be reopened"
+  _reconcile_task_runtime true false
 
   # Look up repo
   local repo_name
@@ -570,8 +701,8 @@ cmd_reopen() {
 
   ensure_tmux_session
 
-  if tmux_window_exists "$id"; then
-    info "window '${id}' already exists; switching to it"
+  if _tmux_task_runtime_exists "$id"; then
+    info "runtime for '${id}' already exists; switching to it"
   else
     # Worktree was removed by cmd_done, so always work from repo root
     local reopen_prompt="${2:-}"
@@ -593,9 +724,13 @@ cmd_reopen() {
   update_task_field_raw "$id" "completed_at" "null"
 
   if [[ -z "${TMUX:-}" ]]; then
-    tmux_cmd attach -t "board:${id}"
+    if tmux_window_exists "$id"; then
+      tmux_cmd attach -t "board:${id}"
+    else
+      tmux_cmd attach -t "board:dashboard"
+    fi
   else
-    tmux_select_window "$id"
+    _tmux_focus_task_runtime "$id" || true
   fi
 
   ok "task '${id}' reopened"
@@ -611,7 +746,7 @@ cmd_pause() {
   [[ "$tsk_status" == "active" || "$tsk_status" == "needs_review" ]] || \
     die "task '$id' is '${tsk_status}'; must be 'active' or 'needs_review' to pause"
 
-  tmux_kill_window "$id"
+  _tmux_close_task_runtime "$id" || true
   set_task_status "$id" "paused"
   update_task_field_raw "$id" "claude_status" "null"
 
@@ -628,6 +763,7 @@ cmd_resume() {
   local tsk_status
   tsk_status=$(task_status "$id")
   [[ "$tsk_status" != "done" ]] || die "task '$id' is done; nothing to resume"
+  _reconcile_task_runtime true false
 
   # Look up repo
   local repo_name
@@ -645,12 +781,12 @@ cmd_resume() {
   ensure_tmux_session
 
   # Kill dead windows (Claude exited, bare zsh running)
-  if tmux_window_exists "$id" && ! _tmux_claude_alive "$id"; then
-    tmux_kill_window "$id"
+  if _tmux_task_runtime_exists "$id" && ! _tmux_task_runtime_live "$id"; then
+    _tmux_close_task_runtime "$id" || true
   fi
 
-  if _tmux_claude_alive "$id"; then
-    info "window '${id}' already exists; switching to it"
+  if _tmux_task_runtime_live "$id"; then
+    info "runtime for '${id}' already exists; switching to it"
   else
     local resume_cmd
     resume_cmd=$(_build_claude_resume_cmd "$id")
@@ -674,9 +810,13 @@ cmd_resume() {
   fi
 
   if [[ -z "${TMUX:-}" ]]; then
-    tmux_cmd attach -t "board:${id}"
+    if tmux_window_exists "$id"; then
+      tmux_cmd attach -t "board:${id}"
+    else
+      tmux_cmd attach -t "board:dashboard"
+    fi
   else
-    tmux_select_window "$id"
+    _tmux_focus_task_runtime "$id" || true
   fi
 }
 
@@ -690,7 +830,7 @@ cmd_rm() {
 
   # Clean up resources for any non-done status
   if [[ "$tsk_status" != "done" ]]; then
-    tmux_kill_window "$id"
+    _tmux_close_task_runtime "$id" || true
     local wt_mode
     wt_mode=$(jq -r --arg id "$id" '.tasks[] | select(.id == $id) | .worktree_mode // "worktree"' "$GLOBAL_STATE")
     if [[ "$wt_mode" != "none" ]]; then
@@ -718,6 +858,21 @@ cmd_rm() {
   _unlock_state
 
   ok "removed task '${id}'"
+}
+
+cmd_gc() {
+  info "reconciling task runtime state..."
+  _reconcile_task_runtime true true
+
+  local live_sessions
+  live_sessions=$(_tmux_live_session_count 2>/dev/null || echo "0")
+
+  if [[ "$_gc_actions" -eq 0 ]]; then
+    ok "no task runtime cleanup needed"
+  else
+    ok "applied ${_gc_actions} task runtime cleanup action(s)"
+  fi
+  info "live Claude sessions: ${live_sessions}"
 }
 
 cmd_status() {
@@ -794,6 +949,9 @@ cmd_doctor() {
   local issues=0
 
   info "checking cloard-board health..."
+  local live_sessions
+  live_sessions=$(_tmux_live_session_count 2>/dev/null || echo "0")
+  info "live Claude sessions: ${live_sessions}"
 
   # Check each repo
   local repo_data
@@ -824,11 +982,14 @@ cmd_doctor() {
     fi
   done <<< "$repo_data"
 
+  _reconcile_task_runtime false true
+  issues=$((issues + _gc_findings))
+
   # Check for active tasks with no tmux window
   while read -r tid; do
     [[ -z "$tid" ]] && continue
-    if ! tmux_window_exists "$tid" 2>/dev/null; then
-      warn "task '${tid}' is active but has no tmux window"
+    if ! _tmux_task_runtime_exists "$tid" 2>/dev/null; then
+      warn "task '${tid}' is active but has no runtime"
       issues=$((issues + 1))
     fi
   done < <(jq -r '.tasks[] | select(.status == "active") | .id' "$GLOBAL_STATE")
@@ -893,4 +1054,3 @@ cmd_doctor() {
     warn "${issues} issue(s) found"
   fi
 }
-

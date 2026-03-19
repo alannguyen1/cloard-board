@@ -75,16 +75,9 @@ assert_eq "fallback checks child command names via ps" "0" "$?"
 grep -q "grep -qE 'claude|node'" "$BOARD"
 assert_eq "fallback greps for claude|node" "0" "$?"
 
-# Test: old single-expression pattern is gone (the old code had the [[ ]] as last line with no && return 0)
-# The old pattern was: [[ "$pane_cmd" == *claude* ... ]] as the ONLY check (no pgrep fallback)
-# Verify the function body contains pgrep (i.e., the fallback was actually added, not just the fast path)
-result=$(awk '/_tmux_claude_alive\(\)/,/^}/' "$BOARD" | grep -c 'pgrep')
-assert_eq "pgrep inside _tmux_claude_alive body" "1" "$result"
-
-# Test: function body has both the fast path AND the fallback
-result=$(awk '/_tmux_claude_alive\(\)/,/^}/' "$BOARD" | grep -c 'return')
-# Should have at least 2 returns: return 1 (no window), return 0 (fast path match), return 1 (no pane_pid)
-assert_eq "_tmux_claude_alive has multiple return paths" "1" "$(( result >= 2 ? 1 : 0 ))"
+# Test: _tmux_claude_alive either contains the fallback directly or delegates to the shared pane helper
+result=$(awk '/_tmux_claude_alive\(\)/,/^}/' "$BOARD" | grep -cE 'pgrep|_tmux_pane_claude_alive' || true)
+assert_eq "_tmux_claude_alive keeps fallback logic or delegates to shared helper" "1" "$(( result >= 1 ? 1 : 0 ))"
 
 # ── Fix A: Functional simulation of child-process detection ────────────────
 

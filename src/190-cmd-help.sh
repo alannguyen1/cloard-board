@@ -31,6 +31,7 @@ ${C_BOLD}TASK COMMANDS${C_RESET}
   rm <id>                      Remove a task entirely
   list [--repo name]           Print all tasks as a table
   status <id>                  Show task and Claude status
+  gc                           Reconcile stale task runtimes and idle sessions
   signal <id> <status>         Set Claude status (working|waiting|clear)
 
 ${C_BOLD}CRON JOBS${C_RESET}
@@ -47,7 +48,7 @@ ${C_BOLD}CRON JOBS${C_RESET}
 ${C_BOLD}DASHBOARD${C_RESET}
   dash                         Open the interactive kanban dashboard
   attach                       Attach to the cloard-board tmux session
-  doctor                       Check for orphaned worktrees/windows
+  doctor                       Check for orphaned or stale runtimes/worktrees
 
 ${C_BOLD}SETUP${C_RESET}
   init                         Register current directory as a repo
@@ -119,4 +120,3 @@ EOF
 }
 
 cmd_version() { echo "cloard-board v${VERSION}"; }
-

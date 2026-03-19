@@ -108,6 +108,7 @@ _split_open() {
   if tmux_window_exists "$task_id"; then
     # Live session found: join it into the dashboard as right pane
     tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    _tmux_mark_task_pane "board:dashboard.1" "$task_id"
     tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
@@ -122,6 +123,7 @@ _split_open() {
   tmux_cmd split-window -h -t "board:dashboard" -p 60 \
     "export CLOARD_TASK_ID=${task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
 
+  _tmux_mark_task_pane "board:dashboard.1" "$task_id"
   tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
 }
 
@@ -200,6 +202,7 @@ _split_switch_session() {
         tmux_cmd rename-window -t "board:${new_task_id}" "$old_task_id" 2>/dev/null || true
         _purge_stale_windows "$old_task_id"
       fi
+      _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
@@ -219,6 +222,7 @@ _split_switch_session() {
   if tmux_window_exists "$new_task_id"; then
     # Live session found after fallback: join it
     tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null || true
+    _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
     tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
@@ -233,6 +237,7 @@ _split_switch_session() {
   tmux_cmd split-window -h -t "board:dashboard" -p 60 \
     "export CLOARD_TASK_ID=${new_task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"
 
+  _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
   tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
 }
 

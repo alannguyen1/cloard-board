@@ -19,6 +19,12 @@ _xml_escape() {
 
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
+_iso_to_epoch() {
+  [[ -n "${1:-}" ]] || return 1
+  date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$1" "+%s" 2>/dev/null \
+    || date -u -d "$1" "+%s" 2>/dev/null
+}
+
 # Compute a compact "time ago" string from an ISO timestamp.
 # Sets _tago (avoids subshell). Empty string on invalid/missing input.
 _time_ago() {
@@ -33,4 +39,3 @@ _time_ago() {
   else                               _tago="[$((_ta_delta / 86400))d ago]"
   fi
 }
-

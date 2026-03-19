@@ -7,6 +7,9 @@ readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
 readonly HOOK_VERSION="4"
 readonly MAX_SESSION_HISTORY=10
+readonly TASK_REVIEW_IDLE_TIMEOUT_SECS=3600
+readonly TASK_ACTIVE_IDLE_TIMEOUT_SECS=86400
+readonly TASK_RUNTIME_GC_INTERVAL_SECS=60
 
 # ── Colours (ANSI) ────────────────────────────────────────────────────────────
 readonly C_RESET=$'\e[0m'
@@ -21,4 +24,3 @@ readonly C_CYAN=$'\e[36m'
 readonly C_WHITE=$'\e[37m'
 readonly C_BG_BLUE=$'\e[44m'
 readonly C_BG_DEFAULT=$'\e[49m'
-

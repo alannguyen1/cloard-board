@@ -58,16 +58,16 @@ assert "cmd_reopen uses _build_claude_resume_cmd" \
 section "Dead window detection"
 
 assert "_tmux_claude_alive checks pane_current_command" \
-  'grep -A 8 "_tmux_claude_alive()" "$SCRIPT" | grep -q "pane_current_command"'
+  'grep -A 8 "_tmux_claude_alive()" "$SCRIPT" | grep -Eq "pane_current_command|_tmux_pane_claude_alive"'
 
 assert "cmd_resume kills dead windows" \
-  'sed -n "/^cmd_resume/,/^cmd_/p" "$SCRIPT" | grep -q "_tmux_claude_alive"'
+  'sed -n "/^cmd_resume/,/^cmd_/p" "$SCRIPT" | grep -Eq "_tmux_claude_alive|_tmux_task_runtime_live"'
 
 assert "dashboard paused handler kills dead windows" \
-  'grep -B2 -A5 "paused)" "$SRC_DIR/180-cmd-dash.sh" | grep -q "_tmux_claude_alive"'
+  'grep -B2 -A5 "paused)" "$SRC_DIR/180-cmd-dash.sh" | grep -Eq "_tmux_claude_alive|_tmux_task_runtime_live"'
 
 assert "dashboard active handler kills dead windows" \
-  'grep -B2 -A5 "active|needs_review)" "$SRC_DIR/180-cmd-dash.sh" | grep -q "_tmux_claude_alive"'
+  'grep -B2 -A5 "active|needs_review)" "$SRC_DIR/180-cmd-dash.sh" | grep -Eq "_tmux_claude_alive|_tmux_task_runtime_live"'
 
 # ── Fast dispatch for _capture-session-uid ─────────────────────────
 section "Fast dispatch"

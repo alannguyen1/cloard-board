@@ -41,6 +41,7 @@ main() {
         reopen)     cmd_reopen "$@" ;;
         rm|remove)  cmd_rm "$@" ;;
         status)     cmd_status "$@" ;;
+        gc)         cmd_gc "$@" ;;
         doctor)     cmd_doctor "$@" ;;
         _dash_loop) cmd__dash_loop "$@" ;;
         _dash_switch) cmd__dash_switch "$@" ;;

@@ -5,6 +5,8 @@ cmd_cron_exec() {
   [[ -n "$cron_id" ]] || die "usage: cloard-board cron-exec <cron-id>"
   cron_job_exists "$cron_id" || die "cron job not found: ${cron_id}"
 
+  _reconcile_task_runtime true false
+
   local enabled
   enabled=$(cron_job_field "$cron_id" "enabled")
   [[ "$enabled" == "true" ]] || { echo "cron job ${cron_id} is disabled; skipping"; exit 0; }
@@ -95,4 +97,3 @@ cmd__cron_complete() {
   ' "$GLOBAL_STATE" > "$tmp" && mv "$tmp" "$GLOBAL_STATE"
   _unlock_state
 }
-

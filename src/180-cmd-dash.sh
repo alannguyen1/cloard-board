@@ -1,4 +1,5 @@
 cmd_dash() {
+  _reconcile_task_runtime true false
   ensure_tmux_session
 
   # If we're not in the cloard-board tmux, launch dashboard in it
@@ -26,6 +27,7 @@ cmd_dash() {
 
 # Switch to dashboard window, recreating it if closed
 cmd__dash_switch() {
+  _reconcile_task_runtime true false
   ensure_tmux_session
   if ! tmux_window_exists "dashboard"; then
     tmux_cmd new-window -t "board" -n "dashboard"
@@ -95,6 +97,7 @@ cmd__dash_loop() {
   typeset -A _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
   typeset -A _cron_col_ids _cron_col_cnt
   local _has_cron_data=false
+  local _last_runtime_gc_check=0
 
   # Trap to restore terminal on exit
   cleanup_dash() {
@@ -111,6 +114,8 @@ cmd__dash_loop() {
   # Drain any pending terminal responses
   while read -rsk1 -t 0.05 _discard 2>/dev/null; do :; done
 
+  _reconcile_task_runtime true false
+
   while true; do
     local _t0=""
     [[ "${CLOARD_DEBUG:-}" == "1" ]] && _t0=${EPOCHREALTIME:-}
@@ -120,6 +125,13 @@ cmd__dash_loop() {
     local rows=$(tput lines)
     local col_width=$(( (cols - 2) / 4 ))
     local card_inner=$(( col_width - 4 ))
+
+    local _gc_now_epoch
+    _gc_now_epoch=$(date +%s)
+    if [[ $((_gc_now_epoch - _last_runtime_gc_check)) -ge TASK_RUNTIME_GC_INTERVAL_SECS ]]; then
+      _reconcile_task_runtime true false
+      _last_runtime_gc_check=$_gc_now_epoch
+    fi
 
     # Snapshot all data
     _snapshot_tasks
@@ -976,10 +988,10 @@ cmd__dash_loop() {
                 ;;
               paused)
                 # Kill dead windows (Claude exited, bare zsh running)
-                if tmux_window_exists "$sel_id" && ! _tmux_claude_alive "$sel_id"; then
-                  tmux_kill_window "$sel_id"
+                if _tmux_task_runtime_exists "$sel_id" && ! _tmux_task_runtime_live "$sel_id"; then
+                  _tmux_close_task_runtime "$sel_id" || true
                 fi
-                if ! tmux_window_exists "$sel_id"; then
+                if ! _tmux_task_runtime_exists "$sel_id"; then
                   local wt_mode_paused="${_task_wtmode[$sel_id]}"
                   local resume_cmd
                   resume_cmd=$(_build_claude_resume_cmd "$sel_id")
@@ -991,14 +1003,14 @@ cmd__dash_loop() {
                   fi
                 fi
                 set_task_status "$sel_id" "active"
-                tmux_select_window "$sel_id"
+                _tmux_focus_task_runtime "$sel_id" || true
                 ;;
               active|needs_review)
                 # Kill dead windows (Claude exited, bare zsh running)
-                if tmux_window_exists "$sel_id" && ! _tmux_claude_alive "$sel_id"; then
-                  tmux_kill_window "$sel_id"
+                if _tmux_task_runtime_exists "$sel_id" && ! _tmux_task_runtime_live "$sel_id"; then
+                  _tmux_close_task_runtime "$sel_id" || true
                 fi
-                if ! tmux_window_exists "$sel_id"; then
+                if ! _tmux_task_runtime_exists "$sel_id"; then
                   local wt_mode_act="${_task_wtmode[$sel_id]}"
                   local resume_cmd
                   resume_cmd=$(_build_claude_resume_cmd "$sel_id")
@@ -1010,7 +1022,7 @@ cmd__dash_loop() {
                   fi
                 fi
                 cursor_show
-                tmux_select_window "$sel_id"
+                _tmux_focus_task_runtime "$sel_id" || true
                 cursor_hide
                 ;;
               done)
@@ -1574,7 +1586,7 @@ cmd__dash_loop() {
           local sel_id="$_tid"
           local p_status="${_task_status[$sel_id]}"
           if [[ "$p_status" == "active" || "$p_status" == "needs_review" ]]; then
-            tmux_kill_window "$sel_id"
+            _tmux_close_task_runtime "$sel_id" || true
             set_task_status "$sel_id" "paused"
             update_task_field_raw "$sel_id" "claude_status" "null"
           fi
@@ -1823,4 +1835,3 @@ _list_transfer_to_kanban() {
     _split_close
   fi
 }
-
