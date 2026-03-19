@@ -80,6 +80,8 @@ cmd__dash_loop() {
   typeset -A _list_group_collapsed # group_name -> 1 if collapsed
   local -i _list_scrollbar_vh=0    # set by _render_list_full for deferred scrollbar
   local -i _list_scrollbar_total=0
+  local -i _sidebar_border_vh=0    # set by _render_list_sidebar for deferred border
+  local -i _sidebar_border_w=0
 
   # Declare snapshot arrays (persist across loop, modified by _snapshot_tasks via dynamic scope)
   typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at
@@ -642,6 +644,13 @@ cmd__dash_loop() {
       _render_scrollbar_track "$_list_scrollbar_vh" "$_list_scrollbar_total"
       _list_scrollbar_vh=0
       _list_scrollbar_total=0
+    fi
+
+    # Deferred sidebar border (split mode, painted over the frame like the scrollbar)
+    if [[ $_sidebar_border_vh -gt 0 ]]; then
+      _render_sidebar_border "$_sidebar_border_vh" "$_sidebar_border_w"
+      _sidebar_border_vh=0
+      _sidebar_border_w=0
     fi
 
     # Footer

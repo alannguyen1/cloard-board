@@ -1162,7 +1162,7 @@ _modal_create_cron() {
   esac
 
   # Build claude command (prompt-based, no model flag)
-  local claude_cmd="claude -p $(printf '%q' "$_mf_prompt")"
+  local claude_cmd="claude --dangerously-skip-permissions -p $(printf '%q' "$_mf_prompt")"
 
   # Auto-capture env vars
   local env_vars

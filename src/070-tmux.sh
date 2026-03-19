@@ -10,6 +10,11 @@ ensure_tmux_session() {
     tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50
     pin_dashboard_to_zero
   fi
+  # Active pane gets a bright blue border; inactive pane gets dark gray.
+  # Heavy border lines for better visibility (tmux 3.2+, silently ignored on older).
+  tmux_cmd set-option -t "board" pane-active-border-style "fg=#4488ff"
+  tmux_cmd set-option -t "board" pane-border-style "fg=#333333"
+  tmux_cmd set-option -t "board" pane-border-lines heavy 2>/dev/null || true
   # Always refresh the prefix-b binding (handles upgrades from old static binding).
   # Write a small helper script so run-shell doesn't need full cloard-board init.
   local _helper="${GLOBAL_DIR}/dash-switch.sh"

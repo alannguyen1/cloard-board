@@ -50,8 +50,8 @@ cmd_cron_exec() {
   claude_cmd=$(cron_job_field "$cron_id" "claude_command")
   env_json=$(jq -c --arg id "$cron_id" '.cron_jobs[] | select(.id == $id) | .env_vars // {}' "$GLOBAL_STATE")
 
-  # Inject --session-id into the claude command
-  claude_cmd="${claude_cmd} --session-id ${session_id}"
+  # Inject --session-id and --dangerously-skip-permissions into the claude command
+  claude_cmd="${claude_cmd} --session-id ${session_id} --dangerously-skip-permissions"
 
   # Build env export string
   local env_exports=""

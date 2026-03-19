@@ -74,6 +74,7 @@ _render_list_group_header() {
 # $1 = 1 if selected, 0 otherwise
 _render_list_cron_header() {
   local is_selected="$1"
+  local width="${2:-$cols}"
 
   local cron_total=0
   local _ci
@@ -85,7 +86,7 @@ _render_list_cron_header() {
   [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="▶"
 
   local hdr_text="${arrow} cron jobs (${cron_total} items)"
-  local _hpad="${(r:${cols}:)hdr_text}"
+  local _hpad="${(r:${width}:)hdr_text}"
 
   if [[ "$is_selected" == "1" ]]; then
     _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${_hpad}${C_RESET}"
@@ -423,10 +424,25 @@ _render_sidebar_task_card() {
 
 # Render the list as a narrow sidebar. Same logic as _render_list_full but
 # uses the narrower pane width and omits the scrollbar.
+# Content is inset by 1 col to leave room for the border overlay.
 _render_list_sidebar() {
   local sidebar_w="${1:-$cols}"
   local viewport_height=${_viewport_height:-$((rows - 3))}
   [[ $viewport_height -lt 1 ]] && viewport_height=1
+
+  # Reserve 2 lines for top/bottom border, 1 col left inset for │
+  local content_w=$((sidebar_w - 1))
+  [[ $content_w -lt 4 ]] && content_w=4
+  local content_vh=$((viewport_height - 2))
+  [[ $content_vh -lt 1 ]] && content_vh=1
+
+  # Top border line (blank row that the overlay will paint over)
+  local _e=""
+  _frame+="${(r:${sidebar_w}:)_e}"$'\n'
+
+  # Temporarily adjust viewport for border-reserved height
+  local _save_vh=${_viewport_height:-$viewport_height}
+  _viewport_height=$content_vh
 
   _list_adjust_scroll
 
@@ -441,7 +457,7 @@ _render_list_sidebar() {
       continue
     fi
 
-    [[ $content_line -ge $((_list_scroll_top + viewport_height)) ]] && break
+    [[ $content_line -ge $((_list_scroll_top + content_vh)) ]] && break
 
     local is_sel=0
     [[ $_rs_idx -eq $_list_cursor ]] && is_sel=1
@@ -449,14 +465,14 @@ _render_list_sidebar() {
     local item="${_list_items[$_rs_idx]}"
     case "$item" in
       group:*)
-        # Slim group header for sidebar
+        # Slim group header for sidebar (inset 1 col for left border)
         local rn="${item#group:}"
         local arrow="▼"
         [[ "${_list_group_collapsed[$rn]:-}" == "1" ]] && arrow="▶"
         local total="${_repo_task_count[$rn]:-0}"
-        local hdr="${arrow} ${rn} (${total})"
-        hdr=$(trunc "$hdr" "$sidebar_w")
-        local _shpad="${(r:${sidebar_w}:)hdr}"
+        local hdr=" ${arrow} ${rn} (${total})"
+        hdr=$(trunc "$hdr" "$content_w")
+        local _shpad="${(r:${content_w}:)hdr}"
         if [[ $is_sel -eq 1 ]]; then
           _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${_shpad}${C_RESET}"
         else
@@ -465,13 +481,13 @@ _render_list_sidebar() {
         _frame+=$'\n'
         ;;
       task:*)
-        _render_sidebar_task_card "${item#task:}" "$sidebar_w" "$is_sel"
+        _render_sidebar_task_card "${item#task:}" "$content_w" "$is_sel"
         ;;
       cron_group:*)
-        _render_list_cron_header "$is_sel"
+        _render_list_cron_header "$is_sel" "$content_w"
         ;;
       cron:*)
-        _render_list_cron_card "${item#cron:}" "$sidebar_w" "$is_sel"
+        _render_list_cron_card "${item#cron:}" "$content_w" "$is_sel"
         ;;
     esac
 
@@ -480,12 +496,53 @@ _render_list_sidebar() {
 
   # Pad remaining lines
   local rendered_lines=$((content_line - _list_scroll_top))
-  [[ $rendered_lines -gt $viewport_height ]] && rendered_lines=$viewport_height
+  [[ $rendered_lines -gt $content_vh ]] && rendered_lines=$content_vh
   local _pad_i _e=""
-  for (( _pad_i=rendered_lines; _pad_i<viewport_height; _pad_i++ )); do
-    _frame+="${(r:${sidebar_w}:)_e}"
+  for (( _pad_i=rendered_lines; _pad_i<content_vh; _pad_i++ )); do
+    _frame+="${(r:${content_w}:)_e}"
     _frame+=$'\n'
   done
+
+  # Bottom border line (blank row that the overlay will paint over)
+  _frame+="${(r:${sidebar_w}:)_e}"$'\n'
+
+  # Store border dimensions for deferred overlay (painted after frame output)
+  _sidebar_border_vh=$content_vh
+  _sidebar_border_w=$sidebar_w
+
+  # Restore viewport height
+  _viewport_height=$_save_vh
+}
+
+# Paint a box border around the sidebar using cursor positioning.
+# Called AFTER the frame is printed (same pattern as the scrollbar overlay).
+# $1 = content viewport height, $2 = sidebar pane width
+_render_sidebar_border() {
+  local vh="$1" sw="$2"
+  local _bc=$'\033[38;2;68;136;255m'   # #4488ff blue
+  local _rst="${C_RESET}"
+
+  # Top border: row 2 (row 1 is the status bar)
+  move_to 2 1
+  printf "${_bc}┌"
+  local _bi
+  for ((_bi=0; _bi<sw-2; _bi++)); do printf "─"; done
+  printf "┐${_rst}"
+
+  # Left and right edges on each content row
+  local _ri
+  for ((_ri=0; _ri<vh; _ri++)); do
+    move_to "$((_ri + 3))" 1
+    printf "${_bc}│${_rst}"
+    move_to "$((_ri + 3))" "$sw"
+    printf "${_bc}│${_rst}"
+  done
+
+  # Bottom border
+  move_to "$((vh + 3))" 1
+  printf "${_bc}└"
+  for ((_bi=0; _bi<sw-2; _bi++)); do printf "─"; done
+  printf "┘${_rst}"
 }
 
 # ── Selection helpers ────────────────────────────────────────────────────────
@@ -636,6 +693,8 @@ _list_handle_key() {
         filter_mode="all"
         # Expand all groups
         _list_group_collapsed=()
+        _list_cursor=0
+        _list_scroll_top=0
       else
         filter_mode="${_repo_names[$((filter_idx - 1))]}"
         # Collapse all groups except the selected repo; expand that one
@@ -645,11 +704,10 @@ _list_handle_key() {
         done
         unset "_list_group_collapsed[$filter_mode]"
         _list_group_collapsed[__cron]=1
-        # Move cursor to that repo's group header
-        local _tf_i
-        for (( _tf_i=0; _tf_i<${#_list_items[@]}; _tf_i++ )); do
-          [[ "${_list_items[$_tf_i]}" == "group:${filter_mode}" ]] && { _list_cursor=$_tf_i; break; }
-        done
+        # Follow the group header in the rebuilt array
+        _list_follow_id="${filter_mode}"
+        _list_follow_type="group"
+        _list_scroll_top=0
       fi
       _list_needs_rebuild=1
       ;;
@@ -660,6 +718,8 @@ _list_handle_key() {
       if [[ $filter_idx -eq 0 ]]; then
         filter_mode="all"
         _list_group_collapsed=()
+        _list_cursor=0
+        _list_scroll_top=0
       else
         filter_mode="${_repo_names[$((filter_idx - 1))]}"
         local _tf_rn
@@ -668,10 +728,10 @@ _list_handle_key() {
         done
         unset "_list_group_collapsed[$filter_mode]"
         _list_group_collapsed[__cron]=1
-        local _tf_i
-        for (( _tf_i=0; _tf_i<${#_list_items[@]}; _tf_i++ )); do
-          [[ "${_list_items[$_tf_i]}" == "group:${filter_mode}" ]] && { _list_cursor=$_tf_i; break; }
-        done
+        # Follow the group header in the rebuilt array
+        _list_follow_id="${filter_mode}"
+        _list_follow_type="group"
+        _list_scroll_top=0
       fi
       _list_needs_rebuild=1
       ;;
