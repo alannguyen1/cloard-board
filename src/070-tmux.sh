@@ -93,8 +93,18 @@ _tmux_mark_task_pane() {
   tmux_cmd set-option -pt "$target" @cloard_task_id "$task_id" 2>/dev/null || true
 }
 
+_tmux_dashboard_has_split() {
+  tmux_session_exists || return 1
+  tmux_window_exists "dashboard" || return 1
+
+  local pane_count
+  pane_count=$(tmux_cmd display-message -p -t "board:dashboard" '#{window_panes}' 2>/dev/null || true)
+  [[ "$pane_count" == <-> ]] || return 1
+  (( pane_count > 1 ))
+}
+
 _tmux_dashboard_task_id() {
-  tmux_cmd display-message -t "board:dashboard.1" -p '' >/dev/null 2>&1 || return 1
+  _tmux_dashboard_has_split || return 1
   local task_id
   task_id=$(tmux_cmd display-message -p -t "board:dashboard.1" '#{@cloard_task_id}' 2>/dev/null || true)
   if [[ -n "$task_id" && "$task_id" != "(null)" ]]; then
@@ -138,11 +148,13 @@ _tmux_close_task_runtime() {
   local id="$1"
   tmux_session_exists || return 1
   local closed=1
-  local dash_task
-  dash_task=$(_tmux_dashboard_task_id 2>/dev/null || true)
-  if [[ "$dash_task" == "$id" ]]; then
-    tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null || true
-    closed=0
+  if _tmux_dashboard_has_split; then
+    local dash_task
+    dash_task=$(_tmux_dashboard_task_id 2>/dev/null || true)
+    if [[ "$dash_task" == "$id" ]]; then
+      tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null || true
+      closed=0
+    fi
   fi
   if tmux_window_exists "$id"; then
     tmux_kill_window "$id"
@@ -157,6 +169,7 @@ _tmux_focus_task_runtime() {
     tmux_select_window "$id"
     return 0
   fi
+  _tmux_dashboard_has_split || return 1
   local dash_task
   dash_task=$(_tmux_dashboard_task_id 2>/dev/null || true)
   if [[ "$dash_task" == "$id" ]]; then
@@ -179,8 +192,7 @@ _tmux_live_session_count() {
     fi
   done < <(tmux_cmd list-windows -t "board" -F '#{window_name}' 2>/dev/null)
 
-  if tmux_cmd display-message -t "board:dashboard.1" -p '' >/dev/null 2>&1 \
-    && _tmux_pane_claude_alive "board:dashboard.1"; then
+  if _tmux_dashboard_has_split && _tmux_pane_claude_alive "board:dashboard.1"; then
     count=$((count + 1))
   fi
 

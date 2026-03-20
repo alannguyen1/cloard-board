@@ -140,11 +140,7 @@ cmd__dash_loop() {
     if [[ "$_view_mode" == "list" ]]; then
       # Detect dead split pane (ghost state cleanup)
       if [[ $_split_active -eq 1 ]]; then
-        if ! tmux_cmd display-message -t "board:dashboard.1" -p '' >/dev/null 2>&1; then
-          _split_active=0
-          _split_task_id=""
-          _split_unbind_sidebar_key
-        fi
+        _split_sync_state || true
       fi
       _list_build_items
       # Clamp list cursor

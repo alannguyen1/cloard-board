@@ -597,6 +597,10 @@ _list_handle_key() {
   local max_idx=$((${#_list_items[@]} - 1))
   [[ $max_idx -lt 0 ]] && max_idx=0
 
+  if [[ "${_split_active:-0}" == "1" ]]; then
+    _split_sync_state || true
+  fi
+
   case "$key" in
     j) # Cursor down
       if [[ $_list_cursor -lt $max_idx ]]; then

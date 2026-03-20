@@ -760,15 +760,15 @@ assert_eq "_split_open_cron function present" "0" "$?"
 
 # _split_open_cron sets _split_is_cron=1
 result_cron_flag=$(sed -n '/_split_open_cron()/,/^}/p' "$BOARD" | grep -c '_split_is_cron=1')
-assert_eq "_split_open_cron sets _split_is_cron=1" "1" "$result_cron_flag"
+assert_eq "_split_open_cron sets _split_is_cron=1" "1" "$(( result_cron_flag >= 1 ? 1 : 0 ))"
 
 # _split_open sets _split_is_cron=0
 result_task_flag=$(sed -n '/_split_open() {/,/^}/p' "$BOARD" | grep -c '_split_is_cron=0')
-assert_eq "_split_open clears _split_is_cron" "1" "$result_task_flag"
+assert_eq "_split_open clears _split_is_cron" "1" "$(( result_task_flag >= 1 ? 1 : 0 ))"
 
-# _split_close resets _split_is_cron=0
-result_close_flag=$(sed -n '/_split_close()/,/^}/p' "$BOARD" | grep -c '_split_is_cron=0')
-assert_eq "_split_close resets _split_is_cron" "1" "$result_close_flag"
+# _split_close resets split state via helper
+result_close_flag=$(sed -n '/_split_close()/,/^}/p' "$BOARD" | grep -c '_split_reset_state' || true)
+assert_eq "_split_close delegates reset to _split_reset_state" "1" "$(( result_close_flag >= 1 ? 1 : 0 ))"
 
 # _split_close uses resume- prefix for cron windows
 grep -q 'resume-.*_split_task_id' "$BOARD"
