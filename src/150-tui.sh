@@ -75,6 +75,22 @@ readonly -a COL_NAMES=("Pending" "Active" "Needs Review" "Done")
 readonly -a CRON_COL_NAMES=("Scheduled" "Active" "Needs Review" "Done")
 readonly -a COL_STATUSES=("pending" "active" "needs_review" "done")
 
+# ASCII-safe glyph palette for the dashboard renderer. Ambiguous-width Unicode
+# glyphs cause line wrapping drift in some tmux/terminal combinations.
+readonly TUI_GLYPH_EXPANDED="v"
+readonly TUI_GLYPH_COLLAPSED=">"
+readonly TUI_GLYPH_ACTIVE="*"
+readonly TUI_GLYPH_REVIEW="!"
+readonly TUI_GLYPH_PENDING="o"
+readonly TUI_GLYPH_PAUSED="="
+readonly TUI_GLYPH_DONE="x"
+readonly TUI_GLYPH_DISABLED="x"
+readonly TUI_GLYPH_WORKING="*"
+readonly TUI_GLYPH_WAITING="o"
+readonly TUI_GLYPH_SCROLL_UP="^"
+readonly TUI_GLYPH_SCROLL_DOWN="v"
+readonly TUI_ELLIPSIS="..."
+
 # Column colours
 col_color() {
   case "$1" in
@@ -88,15 +104,28 @@ col_color() {
 # Truncate string to width
 trunc() {
   local str="$1" max="$2"
-  if [[ ${#str} -gt $max ]]; then
-    echo "${str:0:$((max-1))}…"
-  else
+  (( max > 0 )) || { echo ""; return; }
+
+  if [[ ${#str} -le $max ]]; then
     echo "$str"
+    return
+  fi
+
+  local ellipsis="${TUI_ELLIPSIS}"
+  local ellipsis_len=${#ellipsis}
+  if (( max <= ellipsis_len )); then
+    echo "${str:0:$max}"
+  else
+    echo "${str:0:$((max - ellipsis_len))}${ellipsis}"
   fi
 }
 
 # Move cursor
 move_to() { printf '\e[%d;%dH' "$1" "$2"; }
+
+# Reset scroll region/origin mode so absolute cursor moves always target the
+# full pane even if a previous app left constrained terminal state behind.
+tui_reset_viewport() { printf '\e[r\e[?6l'; }
 
 # Clear screen
 cls() { printf '\e[2J\e[H'; }
@@ -104,4 +133,3 @@ cls() { printf '\e[2J\e[H'; }
 # Hide/show cursor
 cursor_hide() { printf '\e[?25l'; }
 cursor_show() { printf '\e[?25h'; }
-

@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # Tests for:
-#   A: _tmux_claude_alive child-process fallback (zsh wrapper case)
+#   A: _tmux_claude_alive descendant-process fallback
 #   B: Hook versioning in bootstrap
 set -euo pipefail
 setopt KSH_ARRAYS
@@ -42,7 +42,7 @@ assert_match() {
   fi
 }
 
-# ── Fix A: _tmux_claude_alive child-process fallback ───────────────────────
+# ── Fix A: _tmux_claude_alive descendant-process fallback ──────────────────
 
 echo ""
 echo "Fix A: _tmux_claude_alive structure"
@@ -51,58 +51,118 @@ echo "Fix A: _tmux_claude_alive structure"
 grep -q '_tmux_claude_alive()' "$BOARD"
 assert_eq "_tmux_claude_alive function exists" "0" "$?"
 
-# Test: fast path still checks pane_current_command (for direct claude/node)
+# Test: fast path still checks pane_current_command (for direct runtimes)
 grep -q 'pane_current_command' "$BOARD"
 assert_eq "fast path checks pane_current_command" "0" "$?"
 
-# Test: fast path returns 0 on match (&&  return 0)
-grep -q '\[\[ "\$pane_cmd" == \*claude\* || "\$pane_cmd" == \*node\* \]\] && return 0' "$BOARD"
-assert_eq "fast path returns 0 on match" "0" "$?"
+# Test: fast path matches claude, node, and bun
+grep -q '\[\[ "\$pane_cmd" == \*claude\* || "\$pane_cmd" == \*node\* || "\$pane_cmd" == \*bun\* \]\] && return 0' "$BOARD"
+assert_eq "fast path matches claude, node, and bun" "0" "$?"
 
 # Test: fallback uses pane_pid
 grep -q '#{pane_pid}' "$BOARD"
 assert_eq "fallback fetches pane_pid" "0" "$?"
 
-# Test: fallback uses pgrep -P to find child processes
-grep -q 'pgrep -P "\$pane_pid"' "$BOARD"
-assert_eq "fallback uses pgrep -P for child processes" "0" "$?"
+# Test: helper for per-process matching exists
+grep -q '_tmux_process_matches_runtime()' "$BOARD"
+assert_eq "runtime matcher helper exists" "0" "$?"
 
-# Test: fallback pipes to ps -o comm=
-grep -q "ps -o comm= -p" "$BOARD"
-assert_eq "fallback checks child command names via ps" "0" "$?"
+# Test: helper for recursive process-tree walk exists
+grep -q '_tmux_process_tree_runtime_alive()' "$BOARD"
+assert_eq "process-tree helper exists" "0" "$?"
 
-# Test: fallback greps for claude or node
-grep -q "grep -qE 'claude|node'" "$BOARD"
-assert_eq "fallback greps for claude|node" "0" "$?"
+# Test: process-tree walk uses pgrep recursion
+grep -q 'pgrep -P "\$pid"' "$BOARD"
+assert_eq "process-tree helper uses pgrep recursion" "0" "$?"
 
-# Test: _tmux_claude_alive either contains the fallback directly or delegates to the shared pane helper
-result=$(awk '/_tmux_claude_alive\(\)/,/^}/' "$BOARD" | grep -cE 'pgrep|_tmux_pane_claude_alive' || true)
-assert_eq "_tmux_claude_alive keeps fallback logic or delegates to shared helper" "1" "$(( result >= 1 ? 1 : 0 ))"
+# Test: matcher inspects full command lines as well as comm names
+grep -q 'ps eww -o command=' "$BOARD"
+assert_eq "runtime matcher checks full command lines" "0" "$?"
 
-# ── Fix A: Functional simulation of child-process detection ────────────────
+# Test: _tmux_pane_claude_alive delegates to the recursive helper
+grep -q '_tmux_process_tree_runtime_alive "\$pane_pid"' "$BOARD"
+assert_eq "_tmux_pane_claude_alive delegates to process-tree helper" "0" "$?"
 
 echo ""
-echo "Fix A: Child-process detection simulation"
+echo "Fix A: Functional descendant-process detection"
 
-# Simulate: pgrep finds a "claude" child, grep should match
-result=$(echo "claude" | grep -qE 'claude|node' && echo "alive" || echo "dead")
-assert_eq "grep matches claude child" "alive" "$result"
+BOARD_SRC="$TMPDIR_TEST/board_src.zsh"
+sed '/^main "\$@"$/d' "$BOARD" > "$BOARD_SRC"
+source "$BOARD_SRC"
 
-# Simulate: pgrep finds a "node" child, grep should match
-result=$(echo "node" | grep -qE 'claude|node' && echo "alive" || echo "dead")
-assert_eq "grep matches node child" "alive" "$result"
+tmux_cmd() {
+  if [[ "$*" == *"#{pane_current_command}"* ]]; then
+    echo "${MOCK_PANE_COMMAND:-zsh}"
+  elif [[ "$*" == *"#{pane_pid}"* ]]; then
+    echo "${MOCK_PANE_PID:-100}"
+  else
+    return 1
+  fi
+}
 
-# Simulate: pgrep finds only "zsh" child, grep should NOT match
-result=$(echo "zsh" | grep -qE 'claude|node' && echo "alive" || echo "dead")
-assert_eq "grep rejects zsh-only children" "dead" "$result"
+MOCK_BIN="$TMPDIR_TEST/bin"
+mkdir -p "$MOCK_BIN"
 
-# Simulate: pgrep finds multiple children, one is claude
-result=$(printf "zsh\nclaude\ncat" | grep -qE 'claude|node' && echo "alive" || echo "dead")
-assert_eq "grep matches claude among multiple children" "alive" "$result"
+cat > "$MOCK_BIN/pgrep" <<'EOF'
+#!/usr/bin/env bash
+parent=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -P) parent="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "${MOCK_SCENARIO:-live}:$parent" in
+  live:100) printf '200\n' ;;
+  live:200) printf '300\n' ;;
+  dead:100) printf '200\n' ;;
+  *) ;;
+esac
+EOF
+chmod +x "$MOCK_BIN/pgrep"
 
-# Simulate: empty pgrep output (no children), grep should NOT match
-result=$(echo "" | grep -qE 'claude|node' && echo "alive" || echo "dead")
-assert_eq "grep rejects empty child list" "dead" "$result"
+cat > "$MOCK_BIN/ps" <<'EOF'
+#!/usr/bin/env bash
+format=""
+pid=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    eww) shift ;;
+    -o) format="$2"; shift 2 ;;
+    -p) pid="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+case "${MOCK_SCENARIO:-live}:$format:$pid" in
+  live:comm=:100) echo "zsh" ;;
+  live:comm=:200) echo "helper" ;;
+  live:comm=:300) echo "helper" ;;
+  live:command=:100) echo "zsh -c wrapped-runtime" ;;
+  live:command=:200) echo "python wrapper.py" ;;
+  live:command=:300) echo "/Users/test/.bun/bin/bun /Users/test/.local/bin/claude --resume abc" ;;
+  dead:comm=:100) echo "zsh" ;;
+  dead:comm=:200) echo "cat" ;;
+  dead:command=:100) echo "zsh -c wrapped-shell" ;;
+  dead:command=:200) echo "cat" ;;
+  *) ;;
+esac
+EOF
+chmod +x "$MOCK_BIN/ps"
+
+PATH="$MOCK_BIN:$PATH"
+export MOCK_PANE_COMMAND="zsh"
+export MOCK_PANE_PID="100"
+
+export MOCK_SCENARIO="live"
+alive_rc=1
+_tmux_pane_claude_alive "board:dashboard.1" && alive_rc=0
+assert_eq "recursive descendant cmdline counts as live" "0" "$alive_rc"
+
+export MOCK_SCENARIO="dead"
+dead_rc=0
+_tmux_pane_claude_alive "board:dashboard.1" || dead_rc=$?
+assert_eq "fallback shell tree stays dead" "1" "$dead_rc"
 
 # ── Fix B: Ctrl-F binding structure ────────────────────────────────────────
 

@@ -361,6 +361,255 @@ sidebar_null=$(echo "$sidebar_result" | grep '^NULL:' | cut -d: -f2)
 assert_ge "sidebar: printf output has content" 200 "$sidebar_bytes"
 assert_eq "sidebar: no null bytes" "0" "$sidebar_null"
 
+# ── Test split sidebar lines fit pane width ─────────────────────────────────
+
+echo ""
+echo "List render: split sidebar width fit"
+
+sidebar_fit_result=$(run_zsh <<SCRIPT
+setopt KSH_ARRAYS TYPESET_SILENT
+GLOBAL_STATE="$STATE_FILE"
+GLOBAL_DIR="$TMPDIR_TEST"
+source "\$2"
+
+_time_ago() { _tago='[1h ago]'; }
+
+local cols=38 rows=18
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
+typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
+typeset -A _repo_cols _repo_col_cnt
+local -a _repo_names
+local _total_task_count=0 _active_count=0 _review_count=0
+local _tid=""
+typeset -A _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+typeset -A _cron_col_ids _cron_col_cnt
+local _has_cron_data=false
+local _ci
+for _ci in {0..3}; do
+  _cron_col_ids["__cron:\${_ci}"]=""
+  _cron_col_cnt["__cron:\${_ci}"]=0
+done
+local _view_mode="list"
+local -i _split_active=1 _show_done=0 _list_cursor=0 _list_scroll_top=0
+local -a _list_items=()
+local _split_task_id="t-001" _list_follow_id=""
+typeset -A _list_group_collapsed
+local -i _list_scrollbar_vh=0 _list_scrollbar_total=0 _list_needs_rebuild=0
+local filter_mode="all"
+local -i filter_idx=0
+local nav_mode="repo"
+local _viewport_height=12
+
+_snapshot_tasks
+_task_title[t-001]="boringstack product strategy startups"
+_task_activity_at[t-001]="2026-03-24T00:00:00Z"
+_list_build_items
+
+local _frame=""
+_render_list_sidebar
+
+printf '%s' "\$_frame" > "$TMPDIR_TEST/frame_sidebar_fit.bin"
+perl -CS -pe 's/\e\[[0-9;]*[[:alpha:]]//g; tr/│┌┐└┘─/||||||/;' "$TMPDIR_TEST/frame_sidebar_fit.bin" > "$TMPDIR_TEST/frame_sidebar_fit_stripped.txt"
+
+local max_len=\$(awk '{ if (length > max) max = length } END { print max + 0 }' "$TMPDIR_TEST/frame_sidebar_fit_stripped.txt")
+local min_len=\$(awk 'NR == 1 || length < min { min = length } END { print min + 0 }' "$TMPDIR_TEST/frame_sidebar_fit_stripped.txt")
+local overflow=\$(awk -v maxw="\$cols" 'length > maxw { print NR ":" length; exit } END { if (NR == 0) print "empty" }' "$TMPDIR_TEST/frame_sidebar_fit_stripped.txt")
+local wrapped_long=\$(grep -c 'startups' "$TMPDIR_TEST/frame_sidebar_fit_stripped.txt" || true)
+local ellipsis_line=\$(grep -c 'boringstack produc\\.\\.\\..*\\[1h ago\\]' "$TMPDIR_TEST/frame_sidebar_fit_stripped.txt" || true)
+
+echo "MAX_LEN:\${max_len}"
+echo "MIN_LEN:\${min_len}"
+echo "OVERFLOW:\${overflow:-none}"
+echo "WRAPPED_LONG:\${wrapped_long}"
+echo "ELLIPSIS_LINE:\${ellipsis_line}"
+SCRIPT
+)
+
+sidebar_fit_max=$(echo "$sidebar_fit_result" | grep '^MAX_LEN:' | cut -d: -f2 | tr -d ' ')
+sidebar_fit_min=$(echo "$sidebar_fit_result" | grep '^MIN_LEN:' | cut -d: -f2 | tr -d ' ')
+sidebar_fit_overflow=$(echo "$sidebar_fit_result" | grep '^OVERFLOW:' | cut -d: -f2- | tr -d ' ')
+sidebar_fit_wrapped=$(echo "$sidebar_fit_result" | grep '^WRAPPED_LONG:' | cut -d: -f2 | tr -d ' ')
+sidebar_fit_ellipsis=$(echo "$sidebar_fit_result" | grep '^ELLIPSIS_LINE:' | cut -d: -f2 | tr -d ' ')
+assert_eq "split sidebar lines stay within pane width" "none" "${sidebar_fit_overflow:-none}"
+assert_ge "split sidebar width-fit produced visible lines" 10 "$sidebar_fit_max"
+assert_eq "split sidebar width-fit fully paints each line width" "38" "${sidebar_fit_min:-0}"
+assert_eq "split sidebar long title does not leak wrapped suffix" "0" "${sidebar_fit_wrapped:-0}"
+assert_eq "split sidebar long title truncates with timeago on one line" "1" "${sidebar_fit_ellipsis:-0}"
+
+# ── Test responsive footer selection ────────────────────────────────────────
+
+echo ""
+echo "List render: responsive footer selection"
+
+footer_modes_result=$(run_zsh <<SCRIPT
+setopt KSH_ARRAYS TYPESET_SILENT
+GLOBAL_STATE="$STATE_FILE"
+GLOBAL_DIR="$TMPDIR_TEST"
+source "\$2"
+
+run_case() {
+  local label="\$1"
+  local width="\$2"
+  local view_mode="\$3"
+  local split_active="\$4"
+  local filter="\$5"
+  local nav="\$6"
+  local cron_selected="\${7:-0}"
+
+  local cols="\$width" rows=20
+  local _view_mode="\$view_mode"
+  local -i _split_active="\$split_active"
+  local filter_mode="\$filter"
+  local nav_mode="\$nav"
+  local -i cron_row_selected="\$cron_selected"
+  local _footer_text=""
+  local -i _footer_lines=0
+
+  _footer_select_layout
+
+  echo "\${label}_TEXT:\${_footer_text}"
+  echo "\${label}_LINES:\${_footer_lines}"
+}
+
+run_case "SPLIT_WIDE" 200 "list" 1 "all" "repo"
+run_case "SPLIT_MEDIUM" 60 "list" 1 "all" "repo"
+run_case "SPLIT_NARROW" 30 "list" 1 "all" "repo"
+run_case "LIST_NARROW" 25 "list" 0 "all" "repo"
+SCRIPT
+)
+
+split_wide_text=$(echo "$footer_modes_result" | grep '^SPLIT_WIDE_TEXT:' | cut -d: -f2-)
+split_wide_lines=$(echo "$footer_modes_result" | grep '^SPLIT_WIDE_LINES:' | cut -d: -f2 | tr -d ' ')
+split_medium_text=$(echo "$footer_modes_result" | grep '^SPLIT_MEDIUM_TEXT:' | cut -d: -f2-)
+split_medium_lines=$(echo "$footer_modes_result" | grep '^SPLIT_MEDIUM_LINES:' | cut -d: -f2 | tr -d ' ')
+split_narrow_text=$(echo "$footer_modes_result" | grep '^SPLIT_NARROW_TEXT:' | cut -d: -f2-)
+split_narrow_lines=$(echo "$footer_modes_result" | grep '^SPLIT_NARROW_LINES:' | cut -d: -f2 | tr -d ' ')
+list_narrow_text=$(echo "$footer_modes_result" | grep '^LIST_NARROW_TEXT:' | cut -d: -f2-)
+list_narrow_lines=$(echo "$footer_modes_result" | grep '^LIST_NARROW_LINES:' | cut -d: -f2 | tr -d ' ')
+
+assert_eq "split footer wide keeps full text" \
+  "  j/k: nav  Enter/l: focus  Ctrl-F: toggle  F: fullscreen  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: undock  q: quit" \
+  "$split_wide_text"
+assert_eq "split footer wide stays on one line" "1" "$split_wide_lines"
+assert_eq "split footer medium uses compact text" \
+  "j/k nav  Enter/l focus  Ctrl-F toggle  F fullscreen  Tab filter  b undock  q quit" \
+  "$split_medium_text"
+assert_eq "split footer medium wraps to two lines" "2" "$split_medium_lines"
+assert_eq "split footer narrow uses minimal text" \
+  "j/k nav  Enter/l focus  b undock  q quit" \
+  "$split_narrow_text"
+assert_eq "split footer narrow fits in two lines" "2" "$split_narrow_lines"
+assert_eq "non-split narrow footer also goes minimal" \
+  "j/k nav  Enter open  b dock  q quit" \
+  "$list_narrow_text"
+assert_eq "non-split narrow footer reserves two lines" "2" "$list_narrow_lines"
+
+footer_paint_result=$(run_zsh <<SCRIPT
+setopt KSH_ARRAYS TYPESET_SILENT
+GLOBAL_STATE="$STATE_FILE"
+GLOBAL_DIR="$TMPDIR_TEST"
+source "\$2"
+
+local cols=30 rows=8
+local _view_mode="list"
+local -i _split_active=1
+local filter_mode="all"
+local nav_mode="repo"
+local _footer_text=""
+local -i _footer_lines=0
+
+_footer_select_layout
+_footer_print_padded_lines "\$_footer_text" "\$cols" > "$TMPDIR_TEST/footer_paint.txt"
+local max_len=\$(awk '{ if (length > max) max = length } END { print max + 0 }' "$TMPDIR_TEST/footer_paint.txt")
+local min_len=\$(awk 'NR == 1 || length < min { min = length } END { print min + 0 }' "$TMPDIR_TEST/footer_paint.txt")
+
+echo "PAINT_MAX:\${max_len}"
+echo "PAINT_MIN:\${min_len}"
+SCRIPT
+)
+
+footer_paint_max=$(echo "$footer_paint_result" | grep '^PAINT_MAX:' | cut -d: -f2 | tr -d ' ')
+footer_paint_min=$(echo "$footer_paint_result" | grep '^PAINT_MIN:' | cut -d: -f2 | tr -d ' ')
+assert_eq "responsive footer paint fills full width" "30" "$footer_paint_max"
+assert_eq "responsive footer paint clears trailing chars on wrapped lines" "30" "$footer_paint_min"
+
+# ── Test split sidebar frame keeps footer reserve ───────────────────────────
+
+echo ""
+echo "List render: split sidebar footer reserve"
+
+split_footer_result=$(run_zsh <<SCRIPT
+setopt KSH_ARRAYS TYPESET_SILENT
+GLOBAL_STATE="$STATE_FILE"
+GLOBAL_DIR="$TMPDIR_TEST"
+source "\$2"
+
+local cols=38 rows=14
+typeset -A _task_status _task_title _task_pr _task_claude _task_wtmode _task_repo _task_status_at _task_activity_at
+typeset -A _repo_paths _repo_types _repo_stale _repo_task_count
+typeset -A _repo_cols _repo_col_cnt
+local -a _repo_names
+local _total_task_count=0 _active_count=0 _review_count=0
+local _tid=""
+typeset -A _cron_jobs _cron_job_enabled _cron_job_schedule _cron_run_data
+typeset -A _cron_col_ids _cron_col_cnt
+local _has_cron_data=false
+local _ci
+for _ci in {0..3}; do
+  _cron_col_ids["__cron:\${_ci}"]=""
+  _cron_col_cnt["__cron:\${_ci}"]=0
+done
+local _view_mode="list"
+local -i _split_active=1 _show_done=0 _list_cursor=0 _list_scroll_top=0
+local -a _list_items=()
+local _split_task_id="t-001" _list_follow_id=""
+typeset -A _list_group_collapsed
+local -i _list_scrollbar_vh=0 _list_scrollbar_total=0 _list_needs_rebuild=0
+local filter_mode="all"
+local -i filter_idx=0
+local nav_mode="repo"
+
+_snapshot_tasks
+_list_build_items
+
+local _footer_text=""
+local -i _footer_lines=1
+_footer_select_layout
+local _viewport_height=\$((rows - 1 - _footer_lines))
+[[ \$_viewport_height -lt 1 ]] && _viewport_height=1
+
+local _frame=""
+_render_status_bar
+_render_list_sidebar
+
+local _max_lines=\$((rows - _footer_lines))
+local -a _flines
+_flines=("\${(@f)_frame}")
+if [[ \${#_flines[@]} -gt \$_max_lines ]]; then
+  _flines=("\${_flines[@]:0:\$_max_lines}")
+fi
+
+perl -pe 's/\e\[[0-9;]*[[:alpha:]]//g' <<< "\${(pj:\n:)_flines[@]}" > "$TMPDIR_TEST/frame_sidebar_footer_stripped.txt"
+local overflow=\$(awk -v maxw="\$cols" 'length > maxw { print NR ":" length; exit } END { if (NR == 0) print "empty" }' "$TMPDIR_TEST/frame_sidebar_footer_stripped.txt")
+
+echo "FOOTER_TEXT:\${_footer_text}"
+echo "FOOTER_LINES:\${_footer_lines}"
+echo "MAX_LINES:\${_max_lines}"
+echo "CLIPPED_LINES:\${#_flines[@]}"
+echo "OVERFLOW:\${overflow:-none}"
+SCRIPT
+)
+
+split_footer_text=$(echo "$split_footer_result" | grep '^FOOTER_TEXT:' | cut -d: -f2-)
+split_footer_reserved=$(echo "$split_footer_result" | grep '^FOOTER_LINES:' | cut -d: -f2 | tr -d ' ')
+split_footer_max=$(echo "$split_footer_result" | grep '^MAX_LINES:' | cut -d: -f2 | tr -d ' ')
+split_footer_lines=$(echo "$split_footer_result" | grep '^CLIPPED_LINES:' | cut -d: -f2 | tr -d ' ')
+split_footer_overflow=$(echo "$split_footer_result" | grep '^OVERFLOW:' | cut -d: -f2- | tr -d ' ')
+assert_eq "split sidebar narrow footer uses minimal variant" "j/k nav  Enter/l focus  b undock  q quit" "$split_footer_text"
+assert_eq "split sidebar narrow footer reserves two lines" "2" "$split_footer_reserved"
+assert_eq "split sidebar clipped frame preserves footer reserve" "$split_footer_max" "$split_footer_lines"
+assert_eq "split sidebar clipped frame stays within pane width" "none" "${split_footer_overflow:-none}"
+
 # ── Test frame clipping preserves content ────────────────────────────────────
 
 echo ""

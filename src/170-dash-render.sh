@@ -129,7 +129,7 @@ _render_cron_row() {
                   0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
                   1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
                   2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$rjname" $((cron_card_inner-1)))") ;;
-                  3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_GREEN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "● running" $((cron_card_inner-1)))") ;;
+                  3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_GREEN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "${TUI_GLYPH_ACTIVE} running" $((cron_card_inner-1)))") ;;
                   4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
                 esac
                 ;;
@@ -161,7 +161,7 @@ _render_cron_row() {
                   0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
                   1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
                   2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$rjname" $((cron_card_inner-1)))") ;;
-                  3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_CYAN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "✓ $exit_info" $((cron_card_inner-1)))") ;;
+                  3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_CYAN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "${TUI_GLYPH_DONE} $exit_info" $((cron_card_inner-1)))") ;;
                   4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
                 esac
                 ;;
@@ -187,25 +187,158 @@ _render_cron_row() {
   fi
 }
 
-# Render the key-hints footer bar at the bottom of the screen
-_render_footer() {
-  move_to "$((rows - ${_footer_lines:-1} + 1))" 1
+# Resolve the current footer mode from dashboard state.
+_footer_mode_key() {
   if [[ "${_view_mode:-kanban}" == "list" ]]; then
     if [[ ${_split_active:-0} -eq 1 ]]; then
-      printf "${C_DIM}  j/k: nav  Enter/l: focus  Ctrl-F: toggle  F: fullscreen  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: full list  q: quit${C_RESET}"
+      printf '%s' 'list_split'
     else
-      printf "${C_DIM}  j/k: nav  Tab: filter  Enter: open  </> status  :/\" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: split  F: fullscreen  v: kanban  q: quit${C_RESET}"
+      printf '%s' 'list_full'
     fi
-  elif [[ $cron_row_selected -eq 1 ]]; then
-    printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: create  D: delete  Esc: back  v: list  q: quit${C_RESET}"
-  elif [[ "$filter_mode" == "all" ]]; then
-    if [[ "$nav_mode" == "repo" ]]; then
-      printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  v: list  q: quit${C_RESET}"
+  elif [[ ${cron_row_selected:-0} -eq 1 ]]; then
+    printf '%s' 'cron'
+  elif [[ "${filter_mode:-all}" == 'all' ]]; then
+    if [[ "${nav_mode:-repo}" == 'repo' ]]; then
+      printf '%s' 'kanban_repo'
     else
-      printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  c: new  S: import  t: rename  H: history  R: add repo  v: list  q: quit${C_RESET}"
+      printf '%s' 'kanban_card'
     fi
   else
-    printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  c: new  t: rename  s: shell  x: done  d: show done  H: history  v: list  q: quit${C_RESET}"
+    printf '%s' 'kanban_filtered'
   fi
 }
 
+# Return the footer text for a given mode/variant combination.
+_footer_variant_text() {
+  local mode="$1" variant="$2"
+  case "${mode}:${variant}" in
+    list_split:full)
+      printf '%s' '  j/k: nav  Enter/l: focus  Ctrl-F: toggle  F: fullscreen  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: undock  q: quit'
+      ;;
+    list_split:compact)
+      printf '%s' 'j/k nav  Enter/l focus  Ctrl-F toggle  F fullscreen  Tab filter  b undock  q quit'
+      ;;
+    list_split:minimal)
+      printf '%s' 'j/k nav  Enter/l focus  b undock  q quit'
+      ;;
+
+    list_full:full)
+      printf '%s' '  j/k: nav  Tab: filter  Enter: open  </> status  :/" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: dock  F: fullscreen  v: kanban  q: quit'
+      ;;
+    list_full:compact)
+      printf '%s' 'j/k nav  Enter open  Tab filter  b dock  F fullscreen  v kanban  q quit'
+      ;;
+    list_full:minimal)
+      printf '%s' 'j/k nav  Enter open  b dock  q quit'
+      ;;
+
+    cron:full)
+      printf '%s' '  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: create  D: delete  Esc: back  v: list  q: quit'
+      ;;
+    cron:compact)
+      printf '%s' 'Enter open  x review/done  c create  q quit'
+      ;;
+    cron:minimal)
+      printf '%s' 'Enter open  q quit'
+      ;;
+
+    kanban_repo:full)
+      printf '%s' '  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  v: list  q: quit'
+      ;;
+    kanban_repo:compact)
+      printf '%s' 'j/k repos  Enter zoom  Tab filter  v list  q quit'
+      ;;
+    kanban_repo:minimal)
+      printf '%s' 'j/k repos  Enter zoom  q quit'
+      ;;
+
+    kanban_card:full)
+      printf '%s' '  j/k: scroll  :/" reorder  Esc: repos  c: new  S: import  t: rename  H: history  R: add repo  v: list  q: quit'
+      ;;
+    kanban_card:compact|kanban_filtered:compact)
+      printf '%s' 'j/k cards  Enter open  c new  v list  q quit'
+      ;;
+    kanban_card:minimal|kanban_filtered:minimal)
+      printf '%s' 'j/k cards  Enter open  q quit'
+      ;;
+
+    kanban_filtered:full)
+      printf '%s' '  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/" reorder  c: new  t: rename  s: shell  x: done  d: show done  H: history  v: list  q: quit'
+      ;;
+    *)
+      printf '%s' ''
+      ;;
+  esac
+}
+
+_footer_text_lines() {
+  local text="$1"
+  local width="${2:-${cols:-1}}"
+  (( width > 0 )) || width=1
+  [[ -n "$text" ]] || {
+    printf '%s' '1'
+    return 0
+  }
+  local lines=$(( (${#text} + width - 1) / width ))
+  (( lines < 1 )) && lines=1
+  printf '%s' "$lines"
+}
+
+_footer_print_padded_lines() {
+  local text="$1"
+  local width="${2:-${cols:-1}}"
+  (( width > 0 )) || width=1
+
+  local remaining="$text"
+  local line=""
+  while true; do
+    if [[ ${#remaining} -gt $width ]]; then
+      line="${remaining[1,$width]}"
+      remaining="${remaining[$((width + 1)),-1]}"
+    else
+      line="$remaining"
+      remaining=""
+    fi
+
+    printf "${C_DIM}%-${width}s${C_RESET}" "$line"
+    [[ -n "$remaining" ]] || break
+    printf '\n'
+  done
+}
+
+# Choose the responsive footer text and matching line count for the current
+# dashboard mode and pane width.
+_footer_select_layout() {
+  local mode full compact minimal
+  local -i full_lines compact_lines minimal_lines
+
+  mode=$(_footer_mode_key)
+  full=$(_footer_variant_text "$mode" full)
+  compact=$(_footer_variant_text "$mode" compact)
+  minimal=$(_footer_variant_text "$mode" minimal)
+
+  full_lines=$(_footer_text_lines "$full")
+  if (( full_lines <= 1 )); then
+    _footer_text="$full"
+    _footer_lines=$full_lines
+    return 0
+  fi
+
+  compact_lines=$(_footer_text_lines "$compact")
+  if (( compact_lines <= 2 )); then
+    _footer_text="$compact"
+    _footer_lines=$compact_lines
+    return 0
+  fi
+
+  minimal_lines=$(_footer_text_lines "$minimal")
+  _footer_text="$minimal"
+  _footer_lines=$minimal_lines
+}
+
+# Render the key-hints footer bar at the bottom of the screen
+_render_footer() {
+  [[ -n "${_footer_text:-}" ]] || _footer_select_layout
+  move_to "$((rows - ${_footer_lines:-1} + 1))" 1
+  _footer_print_padded_lines "${_footer_text:-}" "${cols:-1}"
+}

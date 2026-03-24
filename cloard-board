@@ -5,8 +5,7 @@ set -euo pipefail
 setopt KSH_ARRAYS  # Use 0-based array indexing (C-style, consistent with loop conventions)
 setopt TYPESET_SILENT  # Prevent typeset/local from printing values on re-declaration
 # Capture stable script path at startup (realpath "$0" inside functions resolves incorrectly in zsh)
-SCRIPT_PATH=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
-
+SCRIPT_PATH=$(realpath "${(%):-%x}" 2>/dev/null || readlink -f "${(%):-%x}" 2>/dev/null || echo "${(%):-%x}")
 # ── Constants ──────────────────────────────────────────────────────────────────
 readonly VERSION="0.3.0"
 readonly TMUX_SOCKET="cloard-board"
@@ -14,6 +13,7 @@ readonly GLOBAL_DIR="$HOME/.cloard-board"
 readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
 readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
+readonly DASH_ESC_READ_TIMEOUT="0.02"
 readonly HOOK_VERSION="4"
 readonly MAX_SESSION_HISTORY=10
 readonly TASK_REVIEW_IDLE_TIMEOUT_SECS=3600
@@ -412,7 +412,8 @@ tmux_session_exists() {
 
 ensure_tmux_session() {
   if ! tmux_session_exists; then
-    tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50
+    local safe_script=${(q)SCRIPT_PATH}
+    tmux_cmd new-session -d -s "board" -n "dashboard" -x 200 -y 50 "exec zsh ${safe_script} _dash_loop"
     pin_dashboard_to_zero
   fi
   # Active pane gets a bright blue border; inactive pane gets dark gray.
@@ -425,10 +426,10 @@ ensure_tmux_session() {
   local _helper="${GLOBAL_DIR}/dash-switch.sh"
   cat > "$_helper" <<DASHEOF
 #!/bin/sh
-S=cloard-board
+S='${TMUX_SOCKET}'
 tmux -L \$S select-window -t board:dashboard 2>/dev/null && exit 0
 tmux -L \$S new-window -t board -n dashboard
-tmux -L \$S respawn-window -k -t board:dashboard "exec '${SCRIPT_PATH}' _dash_loop"
+tmux -L \$S respawn-window -k -t board:dashboard "exec zsh '${SCRIPT_PATH}' _dash_loop"
 tmux -L \$S select-window -t board:dashboard 2>/dev/null
 DASHEOF
   chmod +x "$_helper"
@@ -459,9 +460,15 @@ tmux_select_window() {
   tmux_cmd select-window -t "board:$name" 2>/dev/null
 }
 
+_tmux_dashboard_start_loop() {
+  local safe_script=${(q)SCRIPT_PATH}
+  tmux_cmd respawn-window -k -t "board:dashboard" "exec zsh ${safe_script} _dash_loop"
+  pin_dashboard_to_zero
+}
+
 _tmux_pane_pid() {
   local target="$1"
-  tmux_cmd list-panes -t "$target" -F '#{pane_pid}' 2>/dev/null | head -1
+  tmux_cmd display-message -p -t "$target" '#{pane_pid}' 2>/dev/null
 }
 
 _tmux_pane_command_line() {
@@ -472,18 +479,125 @@ _tmux_pane_command_line() {
   ps eww -o command= -p "$pane_pid" 2>/dev/null | head -1
 }
 
+_tmux_pane_size() {
+  local target="$1"
+  local pane_size pane_w pane_h
+  pane_size=$(tmux_cmd display-message -p -t "$target" '#{pane_width} #{pane_height}' 2>/dev/null || true)
+  read -r pane_w pane_h <<< "$pane_size"
+  [[ "$pane_w" == <-> && "$pane_h" == <-> ]] || return 1
+  printf '%s %s\n' "$pane_w" "$pane_h"
+}
+
+_tmux_dashboard_primary_pane_size() {
+  _tmux_pane_size "board:dashboard.0"
+}
+
+_tmux_dashboard_rehome_extra_panes() {
+  tmux_session_exists || return 1
+  tmux_window_exists "dashboard" || return 1
+
+  local dock_data dock_kind="" dock_id="" keep_idx="" moved=1
+  dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  if [[ -n "$dock_data" ]]; then
+    IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+  fi
+
+  local pane_idx pane_task
+  while IFS= read -r pane_idx; do
+    [[ "$pane_idx" == <-> ]] || continue
+    (( pane_idx > 0 )) || continue
+    pane_task=$(tmux_cmd display-message -p -t "board:dashboard.${pane_idx}" '#{@cloard_task_id}' 2>/dev/null || true)
+    [[ "$pane_task" == "(null)" ]] && pane_task=""
+    if [[ -n "$dock_id" && -z "$keep_idx" && "$pane_task" == "$dock_id" ]]; then
+      keep_idx="$pane_idx"
+      break
+    fi
+  done < <(tmux_cmd list-panes -t "board:dashboard" -F '#{pane_index}' 2>/dev/null)
+
+  if [[ -n "$keep_idx" && "$keep_idx" != "1" ]]; then
+    tmux_cmd swap-pane -d -s "board:dashboard.${keep_idx}" -t "board:dashboard.1" 2>/dev/null || true
+    keep_idx="1"
+    moved=0
+  fi
+
+  while IFS= read -r pane_idx; do
+    [[ "$pane_idx" == <-> ]] || continue
+    (( pane_idx > 0 )) || continue
+    [[ -n "$keep_idx" && "$pane_idx" == "$keep_idx" ]] && continue
+
+    local pane_name
+    pane_task=$(tmux_cmd display-message -p -t "board:dashboard.${pane_idx}" '#{@cloard_task_id}' 2>/dev/null || true)
+    [[ "$pane_task" == "(null)" ]] && pane_task=""
+    if [[ -n "$pane_task" && "$pane_task" != "(null)" ]] && ! tmux_window_exists "$pane_task"; then
+      pane_name="$pane_task"
+    else
+      pane_name="dashboard-extra-${pane_idx}-$(date +%s)"
+    fi
+
+    tmux_cmd break-pane -d -s "board:dashboard.${pane_idx}" -n "$pane_name" 2>/dev/null || continue
+    moved=0
+  done < <(tmux_cmd list-panes -t "board:dashboard" -F '#{pane_index}' 2>/dev/null)
+
+  return "$moved"
+}
+
+_tmux_process_matches_runtime() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 1
+
+  local comm
+  comm=$(ps -o comm= -p "$pid" 2>/dev/null | head -1)
+  case "${comm##*/}" in
+    claude|node|bun) return 0 ;;
+  esac
+
+  local cmdline
+  cmdline=$(ps eww -o command= -p "$pid" 2>/dev/null | head -1)
+  [[ -n "$cmdline" ]] || return 1
+  echo "$cmdline" | grep -qiE '(^|[[:space:]/])(claude|node|bun)([[:space:]]|$)'
+}
+
+_tmux_process_tree_runtime_alive() {
+  local root_pid="$1"
+  [[ -n "$root_pid" ]] || return 1
+
+  local frontier="${root_pid}"
+  local -A seen=()
+
+  while [[ -n "$frontier" ]]; do
+    local next_frontier=""
+    local pid
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      [[ -n "${seen[$pid]:-}" ]] && continue
+      seen[$pid]=1
+
+      _tmux_process_matches_runtime "$pid" && return 0
+
+      local children
+      children=$(pgrep -P "$pid" 2>/dev/null || true)
+      if [[ -n "$children" ]]; then
+        next_frontier+="${children}"$'\n'
+      fi
+    done <<< "$frontier"
+    frontier="$next_frontier"
+  done
+
+  return 1
+}
+
 _tmux_pane_claude_alive() {
   local target="$1"
   # Fast path: check pane_current_command directly
   local pane_cmd
-  pane_cmd=$(tmux_cmd list-panes -t "$target" -F '#{pane_current_command}' 2>/dev/null | head -1)
-  [[ "$pane_cmd" == *claude* || "$pane_cmd" == *node* ]] && return 0
-  # Fallback: pane_current_command reports "zsh" when launched via zsh -c wrapper;
-  # check child processes of the pane's PID for claude or node
+  pane_cmd=$(tmux_cmd display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || true)
+  [[ "$pane_cmd" == *claude* || "$pane_cmd" == *node* || "$pane_cmd" == *bun* ]] && return 0
+  # Fallback: pane_current_command reports "zsh" for wrapped launches. Inspect
+  # the full descendant process tree so nested wrappers still count as live.
   local pane_pid
   pane_pid=$(_tmux_pane_pid "$target")
   [[ -n "$pane_pid" ]] || return 1
-  pgrep -P "$pane_pid" 2>/dev/null | xargs -I{} ps -o comm= -p {} 2>/dev/null | grep -qE 'claude|node'
+  _tmux_process_tree_runtime_alive "$pane_pid"
 }
 
 _tmux_pane_task_id() {
@@ -498,14 +612,147 @@ _tmux_mark_task_pane() {
   tmux_cmd set-option -pt "$target" @cloard_task_id "$task_id" 2>/dev/null || true
 }
 
-_tmux_dashboard_has_split() {
+_tmux_dashboard_window_option() {
+  local option="$1"
+  tmux_window_exists "dashboard" || return 1
+  tmux_cmd display-message -p -t "board:dashboard" "#{@${option}}" 2>/dev/null
+}
+
+_tmux_dashboard_session_option() {
+  local option="$1"
+  tmux_session_exists || return 1
+  tmux_cmd show-options -v -t "board" "$option" 2>/dev/null
+}
+
+_tmux_dashboard_window_active() {
+  tmux_window_exists "dashboard" || return 1
+  [[ "$(tmux_cmd display-message -p -t "board:dashboard" '#{window_active}' 2>/dev/null || true)" == "1" ]]
+}
+
+_tmux_dashboard_sync_dock_to_window() {
+  tmux_window_exists "dashboard" || return 0
+  local persist kind dock_id
+  persist=$(_tmux_dashboard_session_option "@cloard_dash_dock_persist" 2>/dev/null || true)
+  kind=$(_tmux_dashboard_session_option "@cloard_dash_dock_kind" 2>/dev/null || true)
+  dock_id=$(_tmux_dashboard_session_option "@cloard_dash_dock_id" 2>/dev/null || true)
+  if [[ "$persist" == "1" && ( "$kind" == "task" || "$kind" == "cron" ) && -n "$dock_id" ]]; then
+    tmux_cmd set-option -w -t "board:dashboard" @cloard_dock_persist "1" 2>/dev/null || true
+    tmux_cmd set-option -w -t "board:dashboard" @cloard_dock_kind "$kind" 2>/dev/null || true
+    tmux_cmd set-option -w -t "board:dashboard" @cloard_dock_id "$dock_id" 2>/dev/null || true
+  fi
+}
+
+_tmux_dashboard_set_dock() {
+  local kind="$1" dock_id="$2"
+  [[ "$kind" == "task" || "$kind" == "cron" ]] || return 1
+  [[ -n "$dock_id" ]] || return 1
+  tmux_session_exists || return 1
+  tmux_cmd set-option -t "board" @cloard_dash_dock_persist "1" 2>/dev/null || true
+  tmux_cmd set-option -t "board" @cloard_dash_dock_kind "$kind" 2>/dev/null || true
+  tmux_cmd set-option -t "board" @cloard_dash_dock_id "$dock_id" 2>/dev/null || true
+  if tmux_window_exists "dashboard"; then
+    tmux_cmd set-option -w -t "board:dashboard" @cloard_dock_persist "1" 2>/dev/null || true
+    tmux_cmd set-option -w -t "board:dashboard" @cloard_dock_kind "$kind" 2>/dev/null || true
+    tmux_cmd set-option -w -t "board:dashboard" @cloard_dock_id "$dock_id" 2>/dev/null || true
+  fi
+}
+
+_tmux_dashboard_clear_dock() {
+  tmux_session_exists || return 0
+  tmux_cmd set-option -u -t "board" @cloard_dash_dock_persist 2>/dev/null || true
+  tmux_cmd set-option -u -t "board" @cloard_dash_dock_kind 2>/dev/null || true
+  tmux_cmd set-option -u -t "board" @cloard_dash_dock_id 2>/dev/null || true
+  if tmux_window_exists "dashboard"; then
+    tmux_cmd set-option -w -u -t "board:dashboard" @cloard_dock_persist 2>/dev/null || true
+    tmux_cmd set-option -w -u -t "board:dashboard" @cloard_dock_kind 2>/dev/null || true
+    tmux_cmd set-option -w -u -t "board:dashboard" @cloard_dock_id 2>/dev/null || true
+  fi
+}
+
+_tmux_dashboard_read_dock() {
+  tmux_session_exists || return 1
+
+  local persist="" kind="" dock_id=""
+  if tmux_window_exists "dashboard"; then
+    persist=$(_tmux_dashboard_window_option "cloard_dock_persist" 2>/dev/null || true)
+    kind=$(_tmux_dashboard_window_option "cloard_dock_kind" 2>/dev/null || true)
+    dock_id=$(_tmux_dashboard_window_option "cloard_dock_id" 2>/dev/null || true)
+  fi
+
+  if [[ "$persist" != "1" ]]; then
+    persist=$(_tmux_dashboard_session_option "@cloard_dash_dock_persist" 2>/dev/null || true)
+    kind=$(_tmux_dashboard_session_option "@cloard_dash_dock_kind" 2>/dev/null || true)
+    dock_id=$(_tmux_dashboard_session_option "@cloard_dash_dock_id" 2>/dev/null || true)
+    if [[ "$persist" == "1" ]]; then
+      _tmux_dashboard_sync_dock_to_window
+    fi
+  fi
+
+  if [[ "$persist" != "1" ]]; then
+    return 1
+  fi
+
+  if [[ "$kind" != "task" && "$kind" != "cron" ]]; then
+    _tmux_dashboard_clear_dock
+    return 1
+  fi
+
+  if [[ -z "$dock_id" || "$dock_id" == "(null)" ]]; then
+    _tmux_dashboard_clear_dock
+    return 1
+  fi
+
+  printf '%s\x1e%s\n' "$kind" "$dock_id"
+}
+
+_tmux_dashboard_has_dock() {
+  _tmux_dashboard_read_dock >/dev/null 2>&1
+}
+
+_tmux_dashboard_dock_matches() {
+  local want_kind="$1" want_id="$2"
+  local dock_data
+  dock_data=$(_tmux_dashboard_read_dock 2>/dev/null) || return 1
+  local dock_kind dock_id
+  IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+  [[ "$dock_kind" == "$want_kind" && "$dock_id" == "$want_id" ]]
+}
+
+_tmux_dashboard_dock_task_id() {
+  local dock_data
+  dock_data=$(_tmux_dashboard_read_dock 2>/dev/null) || return 1
+
+  local dock_kind dock_id
+  IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+  [[ "$dock_kind" == "task" && -n "$dock_id" ]] || return 1
+  echo "$dock_id"
+}
+
+_tmux_dashboard_pane_count() {
   tmux_session_exists || return 1
   tmux_window_exists "dashboard" || return 1
 
   local pane_count
   pane_count=$(tmux_cmd display-message -p -t "board:dashboard" '#{window_panes}' 2>/dev/null || true)
   [[ "$pane_count" == <-> ]] || return 1
+  echo "$pane_count"
+}
+
+_tmux_dashboard_has_split() {
+  local pane_count
+  pane_count=$(_tmux_dashboard_pane_count 2>/dev/null) || return 1
   (( pane_count > 1 ))
+}
+
+_tmux_dashboard_active_pane_index() {
+  tmux_session_exists || return 1
+  tmux_window_exists "dashboard" || return 1
+
+  local pane_idx
+  pane_idx=$(tmux_cmd list-panes -t "board:dashboard" -F '#{pane_index} #{pane_active}' 2>/dev/null \
+    | awk '$2 == "1" { print $1; exit }')
+  [[ "$pane_idx" == <-> ]] || return 1
+  echo "$pane_idx"
 }
 
 _tmux_dashboard_task_id() {
@@ -526,6 +773,21 @@ _tmux_claude_alive() {
   local name="$1"
   tmux_window_exists "$name" || return 1
   _tmux_pane_claude_alive "board:${name}"
+}
+
+_tmux_runtime_window_names() {
+  tmux_session_exists || return 1
+  tmux_cmd list-windows -t "board" -F '#{window_name}' 2>/dev/null | grep -vx 'dashboard'
+}
+
+_tmux_live_runtime_window_names() {
+  tmux_session_exists || return 1
+
+  local wname
+  while IFS= read -r wname; do
+    [[ -n "$wname" ]] || continue
+    _tmux_claude_alive "$wname" && echo "$wname"
+  done < <(_tmux_runtime_window_names 2>/dev/null || true)
 }
 
 _tmux_task_runtime_exists() {
@@ -553,6 +815,9 @@ _tmux_close_task_runtime() {
   local id="$1"
   tmux_session_exists || return 1
   local closed=1
+  if _tmux_dashboard_dock_matches "task" "$id"; then
+    _tmux_dashboard_clear_dock
+  fi
   if _tmux_dashboard_has_split; then
     local dash_task
     dash_task=$(_tmux_dashboard_task_id 2>/dev/null || true)
@@ -590,12 +855,9 @@ _tmux_live_session_count() {
   tmux_session_exists || { echo "0"; return 0; }
 
   local wname
-  while read -r wname; do
-    [[ -z "$wname" || "$wname" == "dashboard" ]] && continue
-    if _tmux_claude_alive "$wname"; then
-      count=$((count + 1))
-    fi
-  done < <(tmux_cmd list-windows -t "board" -F '#{window_name}' 2>/dev/null)
+  while IFS= read -r wname; do
+    [[ -n "$wname" ]] && count=$((count + 1))
+  done < <(_tmux_live_runtime_window_names 2>/dev/null || true)
 
   if _tmux_dashboard_has_split && _tmux_pane_claude_alive "board:dashboard.1"; then
     count=$((count + 1))
@@ -1980,15 +2242,168 @@ _task_idle_seconds() {
   echo "$delta"
 }
 
-_reconcile_task_runtime() {
+_task_idle_seconds_from_refs() {
+  local last_activity_at="$1" status_changed_at="$2" started_at="$3"
+  local idle_ref="$last_activity_at"
+  [[ -n "$idle_ref" ]] || idle_ref="$status_changed_at"
+  [[ -n "$idle_ref" ]] || idle_ref="$started_at"
+  [[ -n "$idle_ref" ]] || return 1
+
+  local idle_epoch
+  idle_epoch=$(_iso_to_epoch "$idle_ref" 2>/dev/null) || return 1
+
+  local now_epoch
+  now_epoch=$(date +%s)
+  local delta=$((now_epoch - idle_epoch))
+  (( delta < 0 )) && delta=0
+  echo "$delta"
+}
+
+_reconcile_task_runtime_candidate() {
+  local id="$1" task_state="$2" claude_status="$3" idle_secs="$4"
+  local -i has_runtime="${5:-0}" live_runtime="${6:-0}" docked_task="${7:-0}"
+  local apply="${8:-false}" verbose="${9:-false}"
+
+  local finding=""
+  local apply_mode=""
+
+  if [[ "$task_state" == "active" ]] && [[ -n "$idle_secs" ]] && (( idle_secs >= TASK_ACTIVE_IDLE_TIMEOUT_SECS )); then
+    finding="task '${id}' is active but idle for at least 24h"
+    apply_mode="pause_active"
+  elif [[ "$task_state" == "needs_review" ]] && (( has_runtime == 1 )) && [[ -n "$idle_secs" ]] \
+    && (( idle_secs >= TASK_REVIEW_IDLE_TIMEOUT_SECS )) && (( docked_task == 0 )); then
+    finding="task '${id}' is needs_review and still owns a runtime after 1h idle"
+    apply_mode="close_runtime"
+  elif [[ "$task_state" == "done" || "$task_state" == "paused" ]] && (( has_runtime == 1 )); then
+    finding="task '${id}' is ${task_state} but still owns a runtime"
+    apply_mode="close_runtime"
+  elif (( has_runtime == 1 && live_runtime == 0 && docked_task == 0 )); then
+    finding="task '${id}' has a stale fallback shell runtime"
+    apply_mode="close_runtime"
+  fi
+
+  if [[ -n "$finding" ]]; then
+    _gc_findings=$((_gc_findings + 1))
+    if $apply; then
+      case "$apply_mode" in
+        pause_active)
+          _tmux_close_task_runtime "$id" || true
+          set_task_status "$id" "paused"
+          update_task_field_raw "$id" "claude_status" "null"
+          ;;
+        close_runtime)
+          _tmux_close_task_runtime "$id" || true
+          update_task_field_raw "$id" "claude_status" "null"
+          ;;
+      esac
+      _gc_actions=$((_gc_actions + 1))
+      $verbose && info "$finding"
+    else
+      $verbose && warn "$finding"
+    fi
+    return 0
+  fi
+
+  if $apply && [[ -n "$claude_status" ]] && (( live_runtime == 0 && docked_task == 0 )); then
+    update_task_field_raw "$id" "claude_status" "null"
+  fi
+}
+
+_reconcile_task_runtime_dashboard() {
   local apply="${1:-false}" verbose="${2:-false}"
+  tmux_session_exists || return 0
+
+  local dock_data="" dock_kind="" dock_id="" docked_task_id=""
+  dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  if [[ -n "$dock_data" ]]; then
+    IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+    [[ "$dock_kind" == "task" ]] && docked_task_id="$dock_id"
+  fi
+
+  local split_task_id=""
+  if _tmux_dashboard_has_split; then
+    split_task_id=$(_tmux_dashboard_task_id 2>/dev/null || true)
+    if [[ -n "$split_task_id" && "$dock_kind" != "cron" ]] && ! task_exists "$split_task_id"; then
+      _gc_findings=$((_gc_findings + 1))
+      if $apply; then
+        tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null || true
+        _gc_actions=$((_gc_actions + 1))
+        $verbose && info "closed orphaned dashboard split runtime '${split_task_id}'"
+      else
+        $verbose && warn "dashboard split runtime '${split_task_id}' has no matching task"
+      fi
+      split_task_id=""
+    fi
+  fi
+
+  typeset -A _gc_seen_ids=()
+  local id task_state claude_status last_activity_at status_changed_at started_at idle_secs
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    _gc_seen_ids[$id]=1
+
+    if ! task_exists "$id"; then
+      _gc_findings=$((_gc_findings + 1))
+      if $apply; then
+        _tmux_close_task_runtime "$id" || true
+        _gc_actions=$((_gc_actions + 1))
+        $verbose && info "closed orphaned runtime window '${id}'"
+      else
+        $verbose && warn "runtime window '${id}' has no matching task"
+      fi
+      continue
+    fi
+
+    task_state=$(task_status "$id")
+    claude_status=$(task_field "$id" "claude_status")
+    last_activity_at=$(task_field "$id" "last_activity_at")
+    status_changed_at=$(task_field "$id" "status_changed_at")
+    started_at=$(task_field "$id" "started_at")
+    idle_secs=$(_task_idle_seconds_from_refs "$last_activity_at" "$status_changed_at" "$started_at" 2>/dev/null || true)
+
+    local -i live_runtime=0 docked_task=0
+    _tmux_claude_alive "$id" && live_runtime=1
+    [[ "$id" == "$docked_task_id" ]] && docked_task=1
+    _reconcile_task_runtime_candidate "$id" "$task_state" "$claude_status" "$idle_secs" 1 "$live_runtime" "$docked_task" "$apply" "$verbose"
+  done < <(_tmux_runtime_window_names 2>/dev/null || true)
+
+  if [[ -n "$split_task_id" && -z "${_gc_seen_ids[$split_task_id]:-}" ]]; then
+    task_state=$(task_status "$split_task_id")
+    claude_status=$(task_field "$split_task_id" "claude_status")
+    last_activity_at=$(task_field "$split_task_id" "last_activity_at")
+    status_changed_at=$(task_field "$split_task_id" "status_changed_at")
+    started_at=$(task_field "$split_task_id" "started_at")
+    idle_secs=$(_task_idle_seconds_from_refs "$last_activity_at" "$status_changed_at" "$started_at" 2>/dev/null || true)
+
+    local -i split_live_runtime=0 split_docked_task=0
+    _tmux_pane_claude_alive "board:dashboard.1" && split_live_runtime=1
+    [[ "$split_task_id" == "$docked_task_id" ]] && split_docked_task=1
+    _reconcile_task_runtime_candidate "$split_task_id" "$task_state" "$claude_status" "$idle_secs" 1 "$split_live_runtime" "$split_docked_task" "$apply" "$verbose"
+  fi
+}
+
+_reconcile_task_runtime() {
+  local apply="${1:-false}" verbose="${2:-false}" mode="${3:-full}"
   _gc_findings=0
   _gc_actions=0
+  [[ "$mode" == "dashboard" ]] && {
+    _reconcile_task_runtime_dashboard "$apply" "$verbose"
+    return
+  }
+
+  local docked_task_id="" dock_kind="" dock_id=""
 
   if tmux_session_exists; then
+    local dock_data
+    dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+    if [[ -n "$dock_data" ]]; then
+      IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+      [[ "$dock_kind" == "task" ]] && docked_task_id="$dock_id"
+    fi
+
     local orphan_split_id
     orphan_split_id=$(_tmux_dashboard_task_id 2>/dev/null || true)
-    if [[ -n "$orphan_split_id" ]] && ! task_exists "$orphan_split_id"; then
+    if [[ -n "$orphan_split_id" && "$dock_kind" != "cron" ]] && ! task_exists "$orphan_split_id"; then
       _gc_findings=$((_gc_findings + 1))
       if $apply; then
         tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null || true
@@ -2011,70 +2426,17 @@ _reconcile_task_runtime() {
   while IFS=$'\x1e' read -r id task_state claude_status last_activity_at status_changed_at started_at; do
     [[ -n "$id" ]] || continue
 
-    local idle_ref="$last_activity_at"
-    [[ -n "$idle_ref" ]] || idle_ref="$status_changed_at"
-    [[ -n "$idle_ref" ]] || idle_ref="$started_at"
+    local -i docked_task=0
+    [[ "$id" == "$docked_task_id" ]] && docked_task=1
 
     local idle_secs=""
-    if [[ -n "$idle_ref" ]]; then
-      local idle_epoch
-      idle_epoch=$(_iso_to_epoch "$idle_ref" 2>/dev/null || true)
-      if [[ -n "$idle_epoch" ]]; then
-        local now_epoch
-        now_epoch=$(date +%s)
-        idle_secs=$((now_epoch - idle_epoch))
-        (( idle_secs < 0 )) && idle_secs=0
-      fi
-    fi
+    idle_secs=$(_task_idle_seconds_from_refs "$last_activity_at" "$status_changed_at" "$started_at" 2>/dev/null || true)
 
     local has_runtime=0
     local live_runtime=0
     _tmux_task_runtime_exists "$id" && has_runtime=1
     _tmux_task_runtime_live "$id" && live_runtime=1
-
-    local finding=""
-    local apply_mode=""
-
-    if [[ "$task_state" == "active" ]] && [[ -n "$idle_secs" ]] && (( idle_secs >= TASK_ACTIVE_IDLE_TIMEOUT_SECS )); then
-      finding="task '${id}' is active but idle for at least 24h"
-      apply_mode="pause_active"
-    elif [[ "$task_state" == "needs_review" ]] && (( has_runtime == 1 )) && [[ -n "$idle_secs" ]] \
-      && (( idle_secs >= TASK_REVIEW_IDLE_TIMEOUT_SECS )); then
-      finding="task '${id}' is needs_review and still owns a runtime after 1h idle"
-      apply_mode="close_runtime"
-    elif [[ "$task_state" == "done" || "$task_state" == "paused" ]] && (( has_runtime == 1 )); then
-      finding="task '${id}' is ${task_state} but still owns a runtime"
-      apply_mode="close_runtime"
-    elif (( has_runtime == 1 && live_runtime == 0 )); then
-      finding="task '${id}' has a stale fallback shell runtime"
-      apply_mode="close_runtime"
-    fi
-
-    if [[ -n "$finding" ]]; then
-      _gc_findings=$((_gc_findings + 1))
-      if $apply; then
-        case "$apply_mode" in
-          pause_active)
-            _tmux_close_task_runtime "$id" || true
-            set_task_status "$id" "paused"
-            update_task_field_raw "$id" "claude_status" "null"
-            ;;
-          close_runtime)
-            _tmux_close_task_runtime "$id" || true
-            update_task_field_raw "$id" "claude_status" "null"
-            ;;
-        esac
-        _gc_actions=$((_gc_actions + 1))
-        $verbose && info "$finding"
-      else
-        $verbose && warn "$finding"
-      fi
-      continue
-    fi
-
-    if $apply && [[ -n "$claude_status" ]] && (( live_runtime == 0 )); then
-      update_task_field_raw "$id" "claude_status" "null"
-    fi
+    _reconcile_task_runtime_candidate "$id" "$task_state" "$claude_status" "$idle_secs" "$has_runtime" "$live_runtime" "$docked_task" "$apply" "$verbose"
   done <<< "$task_data"
 }
 
@@ -2994,6 +3356,22 @@ readonly -a COL_NAMES=("Pending" "Active" "Needs Review" "Done")
 readonly -a CRON_COL_NAMES=("Scheduled" "Active" "Needs Review" "Done")
 readonly -a COL_STATUSES=("pending" "active" "needs_review" "done")
 
+# ASCII-safe glyph palette for the dashboard renderer. Ambiguous-width Unicode
+# glyphs cause line wrapping drift in some tmux/terminal combinations.
+readonly TUI_GLYPH_EXPANDED="v"
+readonly TUI_GLYPH_COLLAPSED=">"
+readonly TUI_GLYPH_ACTIVE="*"
+readonly TUI_GLYPH_REVIEW="!"
+readonly TUI_GLYPH_PENDING="o"
+readonly TUI_GLYPH_PAUSED="="
+readonly TUI_GLYPH_DONE="x"
+readonly TUI_GLYPH_DISABLED="x"
+readonly TUI_GLYPH_WORKING="*"
+readonly TUI_GLYPH_WAITING="o"
+readonly TUI_GLYPH_SCROLL_UP="^"
+readonly TUI_GLYPH_SCROLL_DOWN="v"
+readonly TUI_ELLIPSIS="..."
+
 # Column colours
 col_color() {
   case "$1" in
@@ -3007,15 +3385,28 @@ col_color() {
 # Truncate string to width
 trunc() {
   local str="$1" max="$2"
-  if [[ ${#str} -gt $max ]]; then
-    echo "${str:0:$((max-1))}…"
-  else
+  (( max > 0 )) || { echo ""; return; }
+
+  if [[ ${#str} -le $max ]]; then
     echo "$str"
+    return
+  fi
+
+  local ellipsis="${TUI_ELLIPSIS}"
+  local ellipsis_len=${#ellipsis}
+  if (( max <= ellipsis_len )); then
+    echo "${str:0:$max}"
+  else
+    echo "${str:0:$((max - ellipsis_len))}${ellipsis}"
   fi
 }
 
 # Move cursor
 move_to() { printf '\e[%d;%dH' "$1" "$2"; }
+
+# Reset scroll region/origin mode so absolute cursor moves always target the
+# full pane even if a previous app left constrained terminal state behind.
+tui_reset_viewport() { printf '\e[r\e[?6l'; }
 
 # Clear screen
 cls() { printf '\e[2J\e[H'; }
@@ -3023,7 +3414,6 @@ cls() { printf '\e[2J\e[H'; }
 # Hide/show cursor
 cursor_hide() { printf '\e[?25l'; }
 cursor_show() { printf '\e[?25h'; }
-
 # ── Unified Create Modal ──────────────────────────────────────────────────────
 # Centered overlay modal for creating tasks or cron jobs from the dashboard.
 # All _modal_* functions access _mf_* state via zsh dynamic scoping;
@@ -4948,7 +5338,7 @@ _render_cron_row() {
                   0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
                   1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
                   2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$rjname" $((cron_card_inner-1)))") ;;
-                  3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_GREEN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "● running" $((cron_card_inner-1)))") ;;
+                  3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_GREEN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "${TUI_GLYPH_ACTIVE} running" $((cron_card_inner-1)))") ;;
                   4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
                 esac
                 ;;
@@ -4980,7 +5370,7 @@ _render_cron_row() {
                   0) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc}${sel_prefix}┌%s┐${C_RESET}" "$_cron_border") ;;
                   1) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │${C_BOLD}%-*s${C_RESET}${ccc}│${C_RESET}" "$cron_card_inner" " $(trunc "$item_id" $((cron_card_inner-1)))") ;;
                   2) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "$rjname" $((cron_card_inner-1)))") ;;
-                  3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_CYAN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "✓ $exit_info" $((cron_card_inner-1)))") ;;
+                  3) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${C_CYAN} │%-*s│${C_RESET}" "$cron_card_inner" " $(trunc "${TUI_GLYPH_DONE} $exit_info" $((cron_card_inner-1)))") ;;
                   4) cell=$(printf "${sel_color:+$sel_color}${sel_color:- }${ccc} └%s┘${C_RESET}" "$_cron_border") ;;
                 esac
                 ;;
@@ -5006,28 +5396,161 @@ _render_cron_row() {
   fi
 }
 
-# Render the key-hints footer bar at the bottom of the screen
-_render_footer() {
-  move_to "$((rows - ${_footer_lines:-1} + 1))" 1
+# Resolve the current footer mode from dashboard state.
+_footer_mode_key() {
   if [[ "${_view_mode:-kanban}" == "list" ]]; then
     if [[ ${_split_active:-0} -eq 1 ]]; then
-      printf "${C_DIM}  j/k: nav  Enter/l: focus  Ctrl-F: toggle  F: fullscreen  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: full list  q: quit${C_RESET}"
+      printf '%s' 'list_split'
     else
-      printf "${C_DIM}  j/k: nav  Tab: filter  Enter: open  </> status  :/\" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: split  F: fullscreen  v: kanban  q: quit${C_RESET}"
+      printf '%s' 'list_full'
     fi
-  elif [[ $cron_row_selected -eq 1 ]]; then
-    printf "${C_DIM}  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: create  D: delete  Esc: back  v: list  q: quit${C_RESET}"
-  elif [[ "$filter_mode" == "all" ]]; then
-    if [[ "$nav_mode" == "repo" ]]; then
-      printf "${C_DIM}  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  v: list  q: quit${C_RESET}"
+  elif [[ ${cron_row_selected:-0} -eq 1 ]]; then
+    printf '%s' 'cron'
+  elif [[ "${filter_mode:-all}" == 'all' ]]; then
+    if [[ "${nav_mode:-repo}" == 'repo' ]]; then
+      printf '%s' 'kanban_repo'
     else
-      printf "${C_DIM}  j/k: scroll  :/\" reorder  Esc: repos  c: new  S: import  t: rename  H: history  R: add repo  v: list  q: quit${C_RESET}"
+      printf '%s' 'kanban_card'
     fi
   else
-    printf "${C_DIM}  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/\" reorder  c: new  t: rename  s: shell  x: done  d: show done  H: history  v: list  q: quit${C_RESET}"
+    printf '%s' 'kanban_filtered'
   fi
 }
 
+# Return the footer text for a given mode/variant combination.
+_footer_variant_text() {
+  local mode="$1" variant="$2"
+  case "${mode}:${variant}" in
+    list_split:full)
+      printf '%s' '  j/k: nav  Enter/l: focus  Ctrl-F: toggle  F: fullscreen  </> status  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  Tab: filter  b: undock  q: quit'
+      ;;
+    list_split:compact)
+      printf '%s' 'j/k nav  Enter/l focus  Ctrl-F toggle  F fullscreen  Tab filter  b undock  q quit'
+      ;;
+    list_split:minimal)
+      printf '%s' 'j/k nav  Enter/l focus  b undock  q quit'
+      ;;
+
+    list_full:full)
+      printf '%s' '  j/k: nav  Tab: filter  Enter: open  </> status  :/" reorder  r: reopen  t: rename  s: shell  x: done  d: show done  H: history  c: new  b: dock  F: fullscreen  v: kanban  q: quit'
+      ;;
+    list_full:compact)
+      printf '%s' 'j/k nav  Enter open  Tab filter  b dock  F fullscreen  v kanban  q quit'
+      ;;
+    list_full:minimal)
+      printf '%s' 'j/k nav  Enter open  b dock  q quit'
+      ;;
+
+    cron:full)
+      printf '%s' '  j/k: cards  h/l: cols  Enter: open/resume  x: review/done  c: create  D: delete  Esc: back  v: list  q: quit'
+      ;;
+    cron:compact)
+      printf '%s' 'Enter open  x review/done  c create  q quit'
+      ;;
+    cron:minimal)
+      printf '%s' 'Enter open  q quit'
+      ;;
+
+    kanban_repo:full)
+      printf '%s' '  Tab: filter  j/k: repos  Enter: expand/zoom  Esc: collapse  c: new  S: import  R: add repo  v: list  q: quit'
+      ;;
+    kanban_repo:compact)
+      printf '%s' 'j/k repos  Enter zoom  Tab filter  v list  q quit'
+      ;;
+    kanban_repo:minimal)
+      printf '%s' 'j/k repos  Enter zoom  q quit'
+      ;;
+
+    kanban_card:full)
+      printf '%s' '  j/k: scroll  :/" reorder  Esc: repos  c: new  S: import  t: rename  H: history  R: add repo  v: list  q: quit'
+      ;;
+    kanban_card:compact|kanban_filtered:compact)
+      printf '%s' 'j/k cards  Enter open  c new  v list  q quit'
+      ;;
+    kanban_card:minimal|kanban_filtered:minimal)
+      printf '%s' 'j/k cards  Enter open  q quit'
+      ;;
+
+    kanban_filtered:full)
+      printf '%s' '  Tab: filter  j/k: cards  Enter: open  r: reopen  </> move  :/" reorder  c: new  t: rename  s: shell  x: done  d: show done  H: history  v: list  q: quit'
+      ;;
+    *)
+      printf '%s' ''
+      ;;
+  esac
+}
+
+_footer_text_lines() {
+  local text="$1"
+  local width="${2:-${cols:-1}}"
+  (( width > 0 )) || width=1
+  [[ -n "$text" ]] || {
+    printf '%s' '1'
+    return 0
+  }
+  local lines=$(( (${#text} + width - 1) / width ))
+  (( lines < 1 )) && lines=1
+  printf '%s' "$lines"
+}
+
+_footer_print_padded_lines() {
+  local text="$1"
+  local width="${2:-${cols:-1}}"
+  (( width > 0 )) || width=1
+
+  local remaining="$text"
+  local line=""
+  while true; do
+    if [[ ${#remaining} -gt $width ]]; then
+      line="${remaining[1,$width]}"
+      remaining="${remaining[$((width + 1)),-1]}"
+    else
+      line="$remaining"
+      remaining=""
+    fi
+
+    printf "${C_DIM}%-${width}s${C_RESET}" "$line"
+    [[ -n "$remaining" ]] || break
+    printf '\n'
+  done
+}
+
+# Choose the responsive footer text and matching line count for the current
+# dashboard mode and pane width.
+_footer_select_layout() {
+  local mode full compact minimal
+  local -i full_lines compact_lines minimal_lines
+
+  mode=$(_footer_mode_key)
+  full=$(_footer_variant_text "$mode" full)
+  compact=$(_footer_variant_text "$mode" compact)
+  minimal=$(_footer_variant_text "$mode" minimal)
+
+  full_lines=$(_footer_text_lines "$full")
+  if (( full_lines <= 1 )); then
+    _footer_text="$full"
+    _footer_lines=$full_lines
+    return 0
+  fi
+
+  compact_lines=$(_footer_text_lines "$compact")
+  if (( compact_lines <= 2 )); then
+    _footer_text="$compact"
+    _footer_lines=$compact_lines
+    return 0
+  fi
+
+  minimal_lines=$(_footer_text_lines "$minimal")
+  _footer_text="$minimal"
+  _footer_lines=$minimal_lines
+}
+
+# Render the key-hints footer bar at the bottom of the screen
+_render_footer() {
+  [[ -n "${_footer_text:-}" ]] || _footer_select_layout
+  move_to "$((rows - ${_footer_lines:-1} + 1))" 1
+  _footer_print_padded_lines "${_footer_text:-}" "${cols:-1}"
+}
 # ── List mode render + key handler ────────────────────────────────────────────
 # Pure render functions that append to _frame. They rely on zsh dynamic scoping
 # to access variables declared local in cmd__dash_loop.
@@ -5086,8 +5609,8 @@ _render_list_group_header() {
   local active_cnt="${_repo_col_cnt[${repo_name}:1]:-0}"
   local review_cnt="${_repo_col_cnt[${repo_name}:2]:-0}"
 
-  local arrow="▼"
-  [[ "${_list_group_collapsed[$repo_name]:-}" == "1" ]] && arrow="▶"
+  local arrow="$TUI_GLYPH_EXPANDED"
+  [[ "${_list_group_collapsed[$repo_name]:-}" == "1" ]] && arrow="$TUI_GLYPH_COLLAPSED"
 
   local hdr_text="${arrow} ${repo_name} (${total} tasks: ${active_cnt} active, ${review_cnt} review)"
   local _hpad="${(r:${cols}:)hdr_text}"
@@ -5112,8 +5635,8 @@ _render_list_cron_header() {
     cron_total=$((cron_total + ${_cron_col_cnt[__cron:${_ci}]:-0}))
   done
 
-  local arrow="▼"
-  [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="▶"
+  local arrow="$TUI_GLYPH_EXPANDED"
+  [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="$TUI_GLYPH_COLLAPSED"
 
   local hdr_text="${arrow} cron jobs (${cron_total} items)"
   local _hpad="${(r:${width}:)hdr_text}"
@@ -5129,7 +5652,7 @@ _render_list_cron_header() {
 # ── Task card (1 line) ──────────────────────────────────────────────────────
 
 # Render a single-line task card. Appends to _frame.
-# Format: > ● Fix authentication bug          ⚙ #42
+# Format: > * Fix authentication bug          * #42
 # $1 = task_id, $2 = available width, $3 = 1 if selected
 _render_list_task_card() {
   local task_id="$1"
@@ -5144,17 +5667,17 @@ _render_list_task_card() {
   # Single-char status badge
   local badge_char="" badge_color=""
   case "$tstatus" in
-    active)       badge_char="●"; badge_color="$C_GREEN" ;;
-    needs_review) badge_char="◆"; badge_color="$C_YELLOW" ;;
-    pending)      badge_char="○"; badge_color="$C_DIM" ;;
-    paused)       badge_char="◫"; badge_color="$C_CYAN" ;;
-    done)         badge_char="✓"; badge_color="$C_DIM" ;;
+    active)       badge_char="$TUI_GLYPH_ACTIVE"; badge_color="$C_GREEN" ;;
+    needs_review) badge_char="$TUI_GLYPH_REVIEW"; badge_color="$C_YELLOW" ;;
+    pending)      badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM" ;;
+    paused)       badge_char="$TUI_GLYPH_PAUSED"; badge_color="$C_CYAN" ;;
+    done)         badge_char="$TUI_GLYPH_DONE"; badge_color="$C_DIM" ;;
   esac
 
   # Right-side metadata: claude indicator + PR short
   local right_meta=""
-  [[ "$claude" == "working" ]] && right_meta="⚙"
-  [[ "$claude" == "waiting" ]] && right_meta="○"
+  [[ "$claude" == "working" ]] && right_meta="$TUI_GLYPH_WORKING"
+  [[ "$claude" == "waiting" ]] && right_meta="$TUI_GLYPH_WAITING"
   if [[ -n "$pr" ]]; then
     local pr_short
     pr_short=$(echo "$pr" | command grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
@@ -5203,9 +5726,9 @@ _render_list_task_card() {
 # ── Cron card (1 line) ──────────────────────────────────────────────────────
 
 # Render a single-line cron card. Appends to _frame.
-# Scheduled: "  ○ morning-routine              every 30m"
-# Active:    "  ● morning-routine              ● running"
-# Review:    "  ◆ morning-routine              ◆ review"
+# Scheduled: "  o morning-routine              every 30m"
+# Active:    "  * morning-routine              * running"
+# Review:    "  ! morning-routine              ! review"
 # $1 = cron_id, $2 = available width, $3 = 1 if selected
 _render_list_cron_card() {
   local cron_id="$1"
@@ -5232,15 +5755,15 @@ _render_list_cron_card() {
     local jsched="${_cron_job_schedule[$cron_id]:-}"
     local jenabled="${_cron_job_enabled[$cron_id]:-true}"
     if [[ "$jenabled" != "true" ]]; then
-      badge_char="⊘"; badge_color="$C_RED"
+      badge_char="$TUI_GLYPH_DISABLED"; badge_color="$C_RED"
       right_meta="disabled"
       right_color="$C_RED"
     elif [[ -n "$jsched" ]]; then
-      badge_char="○"; badge_color="$C_DIM"
+      badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
       right_meta="$jsched"
       right_color="$C_DIM"
     else
-      badge_char="○"; badge_color="$C_DIM"
+      badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
       right_meta="scheduled"
       right_color="$C_DIM"
     fi
@@ -5250,16 +5773,16 @@ _render_list_cron_card() {
     IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
     cron_name="${_cron_jobs[$rjob_id]:-$rjob_id}"
     case "$rstat" in
-      active)       badge_char="●"; badge_color="$C_GREEN";  right_meta="● running";  right_color="$C_GREEN" ;;
+      active)       badge_char="$TUI_GLYPH_ACTIVE"; badge_color="$C_GREEN";  right_meta="${TUI_GLYPH_ACTIVE} running";  right_color="$C_GREEN" ;;
       needs_review)
-        badge_char="◆"; badge_color="$C_YELLOW"; right_meta="◆ review"; right_color="$C_YELLOW"
+        badge_char="$TUI_GLYPH_REVIEW"; badge_color="$C_YELLOW"; right_meta="${TUI_GLYPH_REVIEW} review"; right_color="$C_YELLOW"
         if [[ -n "${rcompleted:-}" ]]; then
           _time_ago "$rcompleted"
           [[ -n "$_tago" ]] && right_meta="${right_meta} ${_tago}"
         fi
         ;;
-      reviewed)     badge_char="✓"; badge_color="$C_CYAN";   right_meta="✓ reviewed";  right_color="$C_CYAN" ;;
-      *)            badge_char="○"; badge_color="$C_DIM";     right_meta="$rstat";      right_color="$C_DIM" ;;
+      reviewed)     badge_char="$TUI_GLYPH_DONE"; badge_color="$C_CYAN";   right_meta="${TUI_GLYPH_DONE} reviewed";  right_color="$C_CYAN" ;;
+      *)            badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"; right_meta="$rstat"; right_color="$C_DIM" ;;
     esac
   fi
 
@@ -5389,9 +5912,9 @@ _render_list_full() {
 
 # ── Sidebar task card (compact, single-line) ─────────────────────────────────
 
-# Render a single-line sidebar task card. No task ID or PR; sidebar is narrow.
-# Format: > ● Fix auth bug     ⚙
-# $1 = task_id, $2 = available width, $3 = 1 if selected
+# Render a single-line sidebar task card wrapped inside inline box borders.
+# No task ID or PR; sidebar is narrow.
+# $1 = task_id, $2 = available inner width, $3 = 1 if selected
 _render_sidebar_task_card() {
   local task_id="$1"
   local width="$2"
@@ -5404,16 +5927,16 @@ _render_sidebar_task_card() {
   # Single-char status badge
   local badge_char="" badge_color=""
   case "$tstatus" in
-    active)       badge_char="●"; badge_color="$C_GREEN" ;;
-    needs_review) badge_char="◆"; badge_color="$C_YELLOW" ;;
-    pending)      badge_char="○"; badge_color="$C_DIM" ;;
-    paused)       badge_char="◫"; badge_color="$C_CYAN" ;;
-    done)         badge_char="✓"; badge_color="$C_DIM" ;;
+    active)       badge_char="$TUI_GLYPH_ACTIVE"; badge_color="$C_GREEN" ;;
+    needs_review) badge_char="$TUI_GLYPH_REVIEW"; badge_color="$C_YELLOW" ;;
+    pending)      badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM" ;;
+    paused)       badge_char="$TUI_GLYPH_PAUSED"; badge_color="$C_CYAN" ;;
+    done)         badge_char="$TUI_GLYPH_DONE"; badge_color="$C_DIM" ;;
   esac
 
   local claude_char=""
-  [[ "$claude" == "working" ]] && claude_char=" ⚙"
-  [[ "$claude" == "waiting" ]] && claude_char=" ○"
+  [[ "$claude" == "working" ]] && claude_char=" ${TUI_GLYPH_WORKING}"
+  [[ "$claude" == "waiting" ]] && claude_char=" ${TUI_GLYPH_WAITING}"
 
   # Append time ago for non-pending tasks
   if [[ "$tstatus" != "pending" ]]; then
@@ -5443,9 +5966,9 @@ _render_sidebar_task_card() {
   [[ $title_w -lt 0 ]] && title_w=0
 
   if [[ "$is_selected" == "1" ]]; then
-    _frame+="${sel_on}${prefix} ${badge_char} ${(r:$title_w:)title_str}${claude_char}${sel_off}"
+    _frame+="│${sel_on}${prefix} ${badge_char} ${(r:$title_w:)title_str}${claude_char}${sel_off}│"
   else
-    _frame+="${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$title_w:)title_str}${C_DIM}${claude_char}${C_RESET}"
+    _frame+="│${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$title_w:)title_str}${C_DIM}${claude_char}${C_RESET}│"
   fi
   _frame+=$'\n'
 }
@@ -5454,21 +5977,24 @@ _render_sidebar_task_card() {
 
 # Render the list as a narrow sidebar. Same logic as _render_list_full but
 # uses the narrower pane width and omits the scrollbar.
-# Content is inset by 1 col to leave room for the border overlay.
+# The sidebar border is rendered inline so every repaint fully overwrites the
+# previous frame at narrow widths.
 _render_list_sidebar() {
   local sidebar_w="${1:-$cols}"
   local viewport_height=${_viewport_height:-$((rows - 3))}
   [[ $viewport_height -lt 1 ]] && viewport_height=1
 
-  # Reserve 2 lines for top/bottom border, 1 col left inset for │
-  local content_w=$((sidebar_w - 1))
+  # Reserve 2 lines for top/bottom border and 2 cols for left/right borders.
+  local content_w=$((sidebar_w - 2))
   [[ $content_w -lt 4 ]] && content_w=4
   local content_vh=$((viewport_height - 2))
   [[ $content_vh -lt 1 ]] && content_vh=1
 
-  # Top border line (blank row that the overlay will paint over)
-  local _e=""
-  _frame+="${(r:${sidebar_w}:)_e}"$'\n'
+  # Top border line
+  local _e="" _border_line=""
+  local _bi
+  for ((_bi=0; _bi<content_w; _bi++)); do _border_line+="─"; done
+  _frame+="┌${_border_line}┐"$'\n'
 
   # Temporarily adjust viewport for border-reserved height
   local _save_vh=${_viewport_height:-$viewport_height}
@@ -5495,18 +6021,18 @@ _render_list_sidebar() {
     local item="${_list_items[$_rs_idx]}"
     case "$item" in
       group:*)
-        # Slim group header for sidebar (inset 1 col for left border)
+        # Slim group header for sidebar
         local rn="${item#group:}"
-        local arrow="▼"
-        [[ "${_list_group_collapsed[$rn]:-}" == "1" ]] && arrow="▶"
+        local arrow="$TUI_GLYPH_EXPANDED"
+        [[ "${_list_group_collapsed[$rn]:-}" == "1" ]] && arrow="$TUI_GLYPH_COLLAPSED"
         local total="${_repo_task_count[$rn]:-0}"
         local hdr=" ${arrow} ${rn} (${total})"
         hdr=$(trunc "$hdr" "$content_w")
         local _shpad="${(r:${content_w}:)hdr}"
         if [[ $is_sel -eq 1 ]]; then
-          _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${_shpad}${C_RESET}"
+          _frame+="│${C_BOLD}${C_BG_BLUE}${C_WHITE}${_shpad}${C_RESET}│"
         else
-          _frame+="${C_BOLD}${_shpad}${C_RESET}"
+          _frame+="│${C_BOLD}${_shpad}${C_RESET}│"
         fi
         _frame+=$'\n'
         ;;
@@ -5514,10 +6040,96 @@ _render_list_sidebar() {
         _render_sidebar_task_card "${item#task:}" "$content_w" "$is_sel"
         ;;
       cron_group:*)
-        _render_list_cron_header "$is_sel" "$content_w"
+        local arrow="$TUI_GLYPH_EXPANDED"
+        [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="$TUI_GLYPH_COLLAPSED"
+        local cron_total=0
+        local _ci
+        for _ci in {0..3}; do
+          cron_total=$((cron_total + ${_cron_col_cnt[__cron:${_ci}]:-0}))
+        done
+        local hdr=" ${arrow} cron jobs (${cron_total} items)"
+        hdr=$(trunc "$hdr" "$content_w")
+        local _shpad="${(r:${content_w}:)hdr}"
+        if [[ $is_sel -eq 1 ]]; then
+          _frame+="│${C_BOLD}${C_BG_BLUE}${C_WHITE}${_shpad}${C_RESET}│"
+        else
+          _frame+="│${C_BOLD}${_shpad}${C_RESET}│"
+        fi
+        _frame+=$'\n'
         ;;
       cron:*)
-        _render_list_cron_card "${item#cron:}" "$content_w" "$is_sel"
+        local cid="${item#cron:}"
+        local rdata="${_cron_run_data[$cid]:-}"
+        local prefix=" "
+        local sel_on="" sel_off=""
+        if [[ $is_sel -eq 1 ]]; then
+          prefix=">"
+          sel_on="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+          sel_off="${C_RESET}"
+        fi
+
+        local cron_name="" right_meta="" right_color=""
+        local badge_char="" badge_color=""
+        if [[ -z "$rdata" ]]; then
+          cron_name="${_cron_jobs[$cid]:-$cid}"
+          local jsched="${_cron_job_schedule[$cid]:-}"
+          local jenabled="${_cron_job_enabled[$cid]:-true}"
+          if [[ "$jenabled" != "true" ]]; then
+            badge_char="$TUI_GLYPH_DISABLED"; badge_color="$C_RED"
+            right_meta="disabled"
+            right_color="$C_RED"
+          elif [[ -n "$jsched" ]]; then
+            badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
+            right_meta="$jsched"
+            right_color="$C_DIM"
+          else
+            badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
+            right_meta="scheduled"
+            right_color="$C_DIM"
+          fi
+        else
+          local rjob_id rstat recode rstart rsid rwin rcompleted
+          IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
+          cron_name="${_cron_jobs[$rjob_id]:-$rjob_id}"
+          case "$rstat" in
+            active)
+              badge_char="$TUI_GLYPH_ACTIVE"; badge_color="$C_GREEN"
+              right_meta="${TUI_GLYPH_ACTIVE} running"; right_color="$C_GREEN"
+              ;;
+            needs_review)
+              badge_char="$TUI_GLYPH_REVIEW"; badge_color="$C_YELLOW"
+              right_meta="${TUI_GLYPH_REVIEW} review"; right_color="$C_YELLOW"
+              if [[ -n "${rcompleted:-}" ]]; then
+                _time_ago "$rcompleted"
+                [[ -n "$_tago" ]] && right_meta="${right_meta} ${_tago}"
+              fi
+              ;;
+            reviewed)
+              badge_char="$TUI_GLYPH_DONE"; badge_color="$C_CYAN"
+              right_meta="${TUI_GLYPH_DONE} reviewed"; right_color="$C_CYAN"
+              ;;
+            *)
+              badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
+              right_meta="$rstat"; right_color="$C_DIM"
+              ;;
+          esac
+        fi
+
+        local right_str=""
+        [[ -n "$right_meta" ]] && right_str="  ${right_meta}"
+        local fixed_left=4
+        local right_len=${#right_str}
+        local name_w=$((content_w - fixed_left - right_len))
+        [[ $name_w -lt 1 ]] && name_w=1
+        local name_str
+        name_str=$(trunc "$cron_name" "$name_w")
+
+        if [[ $is_sel -eq 1 ]]; then
+          _frame+="│${sel_on}${prefix} ${badge_char} ${(r:$name_w:)name_str}${right_str}${sel_off}│"
+        else
+          _frame+="│${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$name_w:)name_str}${right_color}${right_str}${C_RESET}│"
+        fi
+        _frame+=$'\n'
         ;;
     esac
 
@@ -5529,16 +6141,12 @@ _render_list_sidebar() {
   [[ $rendered_lines -gt $content_vh ]] && rendered_lines=$content_vh
   local _pad_i _e=""
   for (( _pad_i=rendered_lines; _pad_i<content_vh; _pad_i++ )); do
-    _frame+="${(r:${content_w}:)_e}"
+    _frame+="│${(r:${content_w}:)_e}│"
     _frame+=$'\n'
   done
 
-  # Bottom border line (blank row that the overlay will paint over)
-  _frame+="${(r:${sidebar_w}:)_e}"$'\n'
-
-  # Store border dimensions for deferred overlay (painted after frame output)
-  _sidebar_border_vh=$content_vh
-  _sidebar_border_w=$sidebar_w
+  # Bottom border line
+  _frame+="└${_border_line}┘"$'\n'
 
   # Restore viewport height
   _viewport_height=$_save_vh
@@ -5627,10 +6235,6 @@ _list_handle_key() {
   local max_idx=$((${#_list_items[@]} - 1))
   [[ $max_idx -lt 0 ]] && max_idx=0
 
-  if [[ "${_split_active:-0}" == "1" ]]; then
-    _split_sync_state || true
-  fi
-
   case "$key" in
     j) # Cursor down
       if [[ $_list_cursor -lt $max_idx ]]; then
@@ -5673,10 +6277,17 @@ _list_handle_key() {
             echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${repo_name} <new-path>${C_RESET}"
             sleep 2
             stty -echo; cursor_hide
+          else
+            if [[ "${_split_active:-0}" == "1" ]] && ! _tmux_dashboard_has_split; then
+              _split_reset_state
+            fi
+          fi
+          if [[ -n "${_repo_stale[$repo_name]:-}" ]]; then
+            :
           elif [[ "${_split_active:-0}" == "1" ]]; then
             if [[ "${_split_is_cron:-0}" == "1" ]]; then
               # Switching from cron to task: close cron split, open task split
-              _split_close
+              _split_close keep
               _split_open "$sel_id"
             elif [[ "$sel_id" != "$_split_task_id" ]]; then
               _split_switch_session "$sel_id"
@@ -5691,9 +6302,12 @@ _list_handle_key() {
           local cid="${item#cron:}"
           local rdata="${_cron_run_data[$cid]:-}"
           if [[ -n "$rdata" ]]; then
+            if [[ "${_split_active:-0}" == "1" ]] && ! _tmux_dashboard_has_split; then
+              _split_reset_state
+            fi
             if [[ "${_split_active:-0}" == "1" ]]; then
               if [[ "$_split_task_id" != "$cid" ]]; then
-                _split_close
+                _split_close keep
                 _split_open_cron "$cid"
               fi
               # Keep focus on sidebar; user presses l to move to Claude pane
@@ -5789,7 +6403,11 @@ _list_handle_key() {
 
     b) # Toggle split view
       if [[ "${_split_active:-0}" == "1" ]]; then
-        _split_close
+        if _tmux_dashboard_has_split; then
+          _split_close clear
+        else
+          _split_clear_state
+        fi
       elif _list_get_selected_id; then
         _split_open "$_tid"
       elif _list_get_selected_cron_id; then
@@ -5798,22 +6416,34 @@ _list_handle_key() {
       ;;
 
     l) # Focus right pane (Claude session) when split is active
-      if [[ "${_split_active:-0}" == "1" ]]; then
+      if [[ "${_split_active:-0}" == "1" ]] && _tmux_dashboard_has_split; then
         tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       fi
       ;;
 
     F) # Full-screen the Claude session (exits split view)
       if [[ "${_split_active:-0}" == "1" && -n "${_split_task_id:-}" ]]; then
+        if ! _tmux_dashboard_has_split; then
+          _split_reset_state
+          return 0
+        fi
         local fs_task_id="$_split_task_id"
-        _split_close
-        tmux_select_window "$fs_task_id"
+        local fs_target="$fs_task_id"
+        if [[ "${_split_is_cron:-0}" == "1" ]]; then
+          fs_target=$(_split_break_name "$fs_task_id" "1")
+        fi
+        _split_close keep
+        tmux_select_window "$fs_target"
       fi
       ;;
 
     ESC) # Escape
       if [[ "${_split_active:-0}" == "1" ]]; then
-        _split_close
+        if _tmux_dashboard_has_split; then
+          _split_close clear
+        else
+          _split_clear_state
+        fi
       else
         # Collapse current group if cursor is on a task within it
         local item="${_list_items[$_list_cursor]:-}"
@@ -5992,12 +6622,162 @@ _split_reset_state() {
   _split_unbind_sidebar_key
 }
 
-_split_sync_state() {
-  if [[ "${_split_active:-0}" == "1" ]] && ! _tmux_dashboard_has_split; then
-    _split_reset_state
-    return 1
+_split_clear_state() {
+  _tmux_dashboard_clear_dock
+  _split_reset_state
+}
+
+_split_activate_state() {
+  local kind="$1" dock_id="$2"
+  _split_active=1
+  _split_task_id="$dock_id"
+  if [[ "$kind" == "cron" ]]; then
+    _split_is_cron=1
+  else
+    _split_is_cron=0
   fi
-  return 0
+  _split_bind_sidebar_key
+  _tmux_dashboard_set_dock "$kind" "$dock_id"
+  _tmux_mark_task_pane "board:dashboard.1" "$dock_id"
+}
+
+_split_break_name() {
+  local dock_id="$1" is_cron="${2:-0}"
+  if [[ "$is_cron" == "1" ]]; then
+    echo "resume-${dock_id}"
+  else
+    echo "$dock_id"
+  fi
+}
+
+_split_sync_state() {
+  local dock_data=""
+  if [[ $# -gt 0 ]]; then
+    dock_data="$1"
+  else
+    dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  fi
+
+  local dock_kind="" dock_id=""
+  if [[ -n "$dock_data" ]]; then
+    IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+  fi
+
+  if _tmux_dashboard_has_split; then
+    local dash_id dash_kind="task"
+    dash_id=$(_tmux_dashboard_task_id 2>/dev/null || true)
+    if [[ -n "$dock_data" ]]; then
+      if [[ -z "$dash_id" || "$dock_id" == "$dash_id" ]]; then
+        dash_kind="$dock_kind"
+        [[ -z "$dash_id" ]] && dash_id="$dock_id"
+      fi
+    elif [[ "$dash_id" == cr-* ]]; then
+      dash_kind="cron"
+    fi
+
+    if [[ -z "$dash_id" ]]; then
+      _split_clear_state
+      return 1
+    fi
+
+    local -i want_is_cron=0
+    [[ "$dash_kind" == "cron" ]] && want_is_cron=1
+    local -i state_changed=0
+    if [[ "${_split_active:-0}" != "1" || "$_split_task_id" != "$dash_id" || "${_split_is_cron:-0}" != "$want_is_cron" ]]; then
+      state_changed=1
+    fi
+
+    _split_active=1
+    _split_task_id="$dash_id"
+    _split_is_cron=$want_is_cron
+    if [[ $state_changed -eq 1 ]]; then
+      _split_bind_sidebar_key
+    fi
+    if [[ -z "$dock_data" || "$dock_kind" != "$dash_kind" || "$dock_id" != "$dash_id" ]]; then
+      _tmux_dashboard_set_dock "$dash_kind" "$dash_id"
+    fi
+    return 0
+  fi
+
+  if [[ "${_split_active:-0}" == "1" ]]; then
+    _split_unbind_sidebar_key
+  fi
+  _split_active=0
+
+  if [[ -n "$dock_data" ]]; then
+    _split_task_id="$dock_id"
+    if [[ "$dock_kind" == "cron" ]]; then
+      _split_is_cron=1
+    else
+      _split_is_cron=0
+    fi
+  else
+    _split_task_id=""
+    _split_is_cron=0
+  fi
+  return 1
+}
+
+_split_restore_persisted_if_needed() {
+  local dock_data=""
+  if [[ $# -gt 0 ]]; then
+    dock_data="$1"
+  else
+    dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  fi
+
+  _split_sync_state "$dock_data" || true
+  [[ "${_split_active:-0}" == "1" ]] && return 0
+
+  [[ -n "$dock_data" ]] || return 1
+
+  local dock_kind dock_id
+  IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+
+  _view_mode="list"
+  _list_follow_id="$dock_id"
+  if [[ "$dock_kind" == "cron" ]]; then
+    _list_follow_type="cron"
+    [[ -n "${_cron_run_data[$dock_id]:-}" ]] || {
+      _split_clear_state
+      return 1
+    }
+    _split_open_cron "$dock_id" || {
+      _split_clear_state
+      return 1
+    }
+    return 0
+  fi
+
+  _list_follow_type="task"
+  task_exists "$dock_id" || {
+    _split_clear_state
+    return 1
+  }
+  _split_open "$dock_id" || {
+    _split_clear_state
+    return 1
+  }
+}
+
+# Reapply the persisted dock when the dashboard is still the active window but
+# the right-hand pane has disappeared.
+_dash_restore_dock_if_needed() {
+  local dock_data=""
+  if [[ $# -gt 0 ]]; then
+    dock_data="$1"
+  else
+    dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  fi
+
+  [[ -n "$dock_data" ]] || return 1
+  _tmux_dashboard_window_active || return 1
+
+  _split_sync_state "$dock_data" || true
+  [[ "${_split_active:-0}" == "1" ]] && return 1
+
+  _view_mode="list"
+  _split_restore_persisted_if_needed "$dock_data"
 }
 
 # Open a split pane with the task's Claude session on the right side.
@@ -6019,15 +6799,11 @@ _split_open() {
   if tmux_window_exists "$task_id"; then
     # Live session found: join it into the dashboard as right pane
     if tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null; then
-      _split_active=1
-      _split_task_id="$task_id"
-      _split_is_cron=0
-      _split_bind_sidebar_key
-      _tmux_mark_task_pane "board:dashboard.1" "$task_id"
+      _split_activate_state "task" "$task_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
-    _split_reset_state
+    _split_clear_state
     return 1
   fi
 
@@ -6040,16 +6816,12 @@ _split_open() {
 
   if tmux_cmd split-window -h -t "board:dashboard" -p 60 \
     "export CLOARD_TASK_ID=${task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"; then
-    _split_active=1
-    _split_task_id="$task_id"
-    _split_is_cron=0
-    _split_bind_sidebar_key
-    _tmux_mark_task_pane "board:dashboard.1" "$task_id"
+    _split_activate_state "task" "$task_id"
     tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
 
-  _split_reset_state
+  _split_clear_state
   return 1
 }
 
@@ -6069,14 +6841,11 @@ _split_open_cron() {
   # Active run with live tmux window: join it into dashboard right pane
   if [[ "$rstat" == "active" && -n "$rwin" ]] && tmux_window_exists "$rwin"; then
     if tmux_cmd join-pane -h -s "board:${rwin}.0" -t "board:dashboard" -l '60%' 2>/dev/null; then
-      _split_active=1
-      _split_task_id="$cron_id"
-      _split_is_cron=1
-      _split_bind_sidebar_key
+      _split_activate_state "cron" "$cron_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
-    _split_reset_state
+    _split_clear_state
     return 1
   fi
 
@@ -6091,25 +6860,22 @@ _split_open_cron() {
     _purge_stale_windows "$resume_win"
     if tmux_window_exists "$resume_win"; then
       if ! tmux_cmd join-pane -h -s "board:${resume_win}.0" -t "board:dashboard" -l '60%' 2>/dev/null; then
-        _split_reset_state
+        _split_clear_state
         return 1
       fi
     else
       if ! tmux_cmd split-window -h -t "board:dashboard" -p 60 \
         "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"; then
-        _split_reset_state
+        _split_clear_state
         return 1
       fi
     fi
-    _split_active=1
-    _split_task_id="$cron_id"
-    _split_is_cron=1
-    _split_bind_sidebar_key
+    _split_activate_state "cron" "$cron_id"
     tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
 
-  _split_reset_state
+  _split_clear_state
   return 1
 }
 
@@ -6147,11 +6913,7 @@ _split_switch_session() {
         tmux_cmd rename-window -t "board:${new_task_id}" "$old_task_id" 2>/dev/null || true
         _purge_stale_windows "$old_task_id"
       fi
-      _split_active=1
-      _split_task_id="$new_task_id"
-      _split_is_cron=0
-      _split_bind_sidebar_key
-      _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
+      _split_activate_state "task" "$new_task_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
@@ -6171,15 +6933,11 @@ _split_switch_session() {
   if tmux_window_exists "$new_task_id"; then
     # Live session found after fallback: join it
     if tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null; then
-      _split_active=1
-      _split_task_id="$new_task_id"
-      _split_is_cron=0
-      _split_bind_sidebar_key
-      _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
+      _split_activate_state "task" "$new_task_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
-    _split_reset_state
+    _split_clear_state
     return 1
   fi
 
@@ -6192,27 +6950,21 @@ _split_switch_session() {
 
   if tmux_cmd split-window -h -t "board:dashboard" -p 60 \
     "export CLOARD_TASK_ID=${new_task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"; then
-    _split_active=1
-    _split_task_id="$new_task_id"
-    _split_is_cron=0
-    _split_bind_sidebar_key
-    _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
+    _split_activate_state "task" "$new_task_id"
     tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
 
-  _split_reset_state
+  _split_clear_state
   return 1
 }
 
 # Close the split view, preserving the running session in its own tmux window.
 _split_close() {
+  local mode="${1:-keep}"
   if [[ -n "$_split_task_id" ]] && _tmux_dashboard_has_split; then
-    # For cron splits, preserve with resume- prefix so _split_open_cron can find it
-    local break_name="$_split_task_id"
-    if [[ "${_split_is_cron:-0}" == "1" ]]; then
-      break_name="resume-${_split_task_id}"
-    fi
+    local break_name
+    break_name=$(_split_break_name "$_split_task_id" "${_split_is_cron:-0}")
     # Kill stale windows first so break-pane creates the only named window
     _purge_stale_windows "$break_name"
     # Try to preserve as named window; fall back to killing the pane
@@ -6220,21 +6972,17 @@ _split_close() {
       || tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null \
       || true
   fi
+  if [[ "$mode" == "clear" ]]; then
+    _tmux_dashboard_clear_dock
+  fi
   _split_reset_state
 }
 cmd_dash() {
-  _reconcile_task_runtime true false
   ensure_tmux_session
 
   # If we're not in the cloard-board tmux, launch dashboard in it
   if [[ -z "${TMUX:-}" ]]; then
-    if ! tmux_window_exists "dashboard"; then
-      tmux_cmd new-window -t "board" -n "dashboard"
-    fi
-    local safe_script
-    safe_script=${(q)${SCRIPT_PATH}}
-    tmux_cmd respawn-window -k -t "board:dashboard" "exec ${safe_script} _dash_loop"
-    pin_dashboard_to_zero
+    cmd__dash_switch
     tmux_cmd attach -t "board:dashboard"
     return
   fi
@@ -6251,15 +6999,84 @@ cmd_dash() {
 
 # Switch to dashboard window, recreating it if closed
 cmd__dash_switch() {
-  _reconcile_task_runtime true false
   ensure_tmux_session
   if ! tmux_window_exists "dashboard"; then
     tmux_cmd new-window -t "board" -n "dashboard"
-    local safe_script=${(q)SCRIPT_PATH}
-    tmux_cmd respawn-window -k -t "board:dashboard" "exec ${safe_script} _dash_loop"
-    pin_dashboard_to_zero
+    _tmux_dashboard_start_loop
   fi
   tmux_cmd select-window -t "board:dashboard"
+}
+
+_dash_toggle_view_mode() {
+  if _tmux_dashboard_has_dock; then
+    _view_mode="list"
+    return 0
+  fi
+
+  if [[ "$_view_mode" == "kanban" ]]; then
+    _list_transfer_from_kanban
+    _view_mode="list"
+  else
+    _list_transfer_to_kanban
+    _view_mode="kanban"
+  fi
+}
+
+_state_file_mtime() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  stat -f '%m' "$path" 2>/dev/null || stat -c '%Y' "$path" 2>/dev/null
+}
+
+_dash_poll_external_state() {
+  local state_mtime=""
+  state_mtime=$(_state_file_mtime "$GLOBAL_STATE" 2>/dev/null || true)
+  if [[ -n "$state_mtime" ]]; then
+    if [[ "$state_mtime" != "${_state_mtime:-}" ]]; then
+      _state_mtime="$state_mtime"
+      _dash_mark_snapshot_dirty
+    fi
+  else
+    _state_mtime=""
+  fi
+
+  local pane_count="1"
+  pane_count=$(_tmux_dashboard_pane_count 2>/dev/null || echo "1")
+  if [[ "$pane_count" == <-> ]] && (( pane_count > 1 )); then
+    if _tmux_dashboard_rehome_extra_panes; then
+      pane_count=$(_tmux_dashboard_pane_count 2>/dev/null || echo "1")
+      _dash_mark_dock_dirty
+      _dash_mark_layout_dirty
+      _dash_mark_list_dirty
+    fi
+  fi
+  if [[ "$pane_count" != "${_dash_last_pane_count:--1}" ]]; then
+    if [[ "${_dash_last_pane_count:--1}" != "-1" ]]; then
+      _dash_mark_dock_dirty
+      _dash_mark_layout_dirty
+      _dash_mark_list_dirty
+    fi
+    _dash_last_pane_count="$pane_count"
+  fi
+
+  local active_pane=""
+  active_pane=$(_tmux_dashboard_active_pane_index 2>/dev/null || true)
+  if [[ -n "$active_pane" && "$active_pane" != "${_dash_last_active_pane:-}" ]]; then
+    if [[ "$active_pane" == "0" ]]; then
+      _full_redraw=1
+    fi
+    _dash_last_active_pane="$active_pane"
+  fi
+
+  local -i window_active=0
+  _tmux_dashboard_window_active && window_active=1
+  _dash_last_window_active=$window_active
+
+  if [[ "$pane_count" == "1" && $window_active -eq 1 ]]; then
+    if [[ -n "${_dock_data:-}" ]] || _tmux_dashboard_has_dock; then
+      _dash_mark_dock_dirty
+    fi
+  fi
 }
 
 # The actual dashboard rendering loop (run inside tmux window)
@@ -6299,6 +7116,7 @@ cmd__dash_loop() {
   local -i _list_cursor=0         # index into _list_items[]
   local -i _list_scroll_top=0     # first visible content-line in viewport
   local -a _list_items=()         # flat ordered array: "group:repo", "task:t-001", etc.
+  local -i _list_needs_rebuild=1  # 1 when flat list ordering must be rebuilt
   local _split_task_id=""          # task ID (or cron ID) in right pane
   local -i _split_is_cron=0       # 1 when split pane shows a cron session
   local _list_follow_id=""         # task ID to follow after re-sort
@@ -6322,9 +7140,40 @@ cmd__dash_loop() {
   typeset -A _cron_col_ids _cron_col_cnt
   local _has_cron_data=false
   local _last_runtime_gc_check=0
+  local -i _snapshot_dirty=1 _dock_dirty=1 _layout_dirty=1 _full_redraw=1
+  local _state_mtime=""
+  local -i _dash_last_pane_count=-1
+  local _dash_last_active_pane=""
+  local -i _dash_last_window_active=-1
+  local -i cols=0 rows=0 col_width=0 card_inner=0
+  local _border_card="" _border_full="" _dock_data=""
+
+  _dash_mark_snapshot_dirty() {
+    _snapshot_dirty=1
+    _list_needs_rebuild=1
+    _full_redraw=1
+  }
+
+  _dash_mark_list_dirty() {
+    _list_needs_rebuild=1
+    _full_redraw=1
+  }
+
+  _dash_mark_dock_dirty() {
+    _dock_dirty=1
+    _full_redraw=1
+  }
+
+  _dash_mark_layout_dirty() {
+    _layout_dirty=1
+    _full_redraw=1
+  }
 
   # Trap to restore terminal on exit
   cleanup_dash() {
+    if [[ ${_split_active:-0} -eq 1 ]]; then
+      _split_close keep
+    fi
     cursor_show
     stty echo 2>/dev/null
     printf '\033[?1049l'
@@ -6332,6 +7181,7 @@ cmd__dash_loop() {
   trap cleanup_dash EXIT INT TERM
 
   printf '\033[?1049h'  # Enter alternate screen
+  tui_reset_viewport
   cursor_hide
   stty -echo 2>/dev/null
 
@@ -6339,35 +7189,122 @@ cmd__dash_loop() {
   while read -rsk1 -t 0.05 _discard 2>/dev/null; do :; done
 
   _reconcile_task_runtime true false
+  _last_runtime_gc_check=$(date +%s)
+  _dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  _split_sync_state "$_dock_data" || true
+  if [[ -n "$_dock_data" ]]; then
+    _view_mode="list"
+  fi
+  _state_mtime=$(_state_file_mtime "$GLOBAL_STATE" 2>/dev/null || true)
+  _dash_last_pane_count=$(_tmux_dashboard_pane_count 2>/dev/null || echo "1")
+  _dash_last_active_pane=$(_tmux_dashboard_active_pane_index 2>/dev/null || true)
+  if _tmux_dashboard_window_active; then
+    _dash_last_window_active=1
+  else
+    _dash_last_window_active=0
+  fi
 
   while true; do
     local _t0=""
     [[ "${CLOARD_DEBUG:-}" == "1" ]] && _t0=${EPOCHREALTIME:-}
+    local _perf_snapshot_ms=0.0 _perf_dock_ms=0.0 _perf_list_ms=0.0 _perf_render_ms=0.0 _perf_input_ms=0.0
+    local _perf_phase_t0=""
+    local _i
 
-    # Terminal dimensions
-    local cols=$(tput cols)
-    local rows=$(tput lines)
-    local col_width=$(( (cols - 2) / 4 ))
-    local card_inner=$(( col_width - 4 ))
+    _dash_poll_external_state
+
+    local _term_cols _term_rows _pane_size
+    _pane_size=$(_tmux_dashboard_primary_pane_size 2>/dev/null || true)
+    if [[ -n "$_pane_size" ]]; then
+      IFS=' ' read -r _term_cols _term_rows <<< "$_pane_size"
+    else
+      _term_cols=$(tput cols 2>/dev/null || echo "${cols:-0}")
+      _term_rows=$(tput lines 2>/dev/null || echo "${rows:-0}")
+    fi
+    if [[ "$_term_cols" != "$cols" || "$_term_rows" != "$rows" ]]; then
+      _layout_dirty=1
+    fi
+
+    if [[ $_layout_dirty -eq 1 ]]; then
+      cols=$_term_cols
+      rows=$_term_rows
+      col_width=$(( (cols - 2) / 4 ))
+      card_inner=$(( col_width - 4 ))
+      _border_card=""
+      _border_full=""
+      for (( _i=0; _i<card_inner; _i++ )); do _border_card+="─"; done
+      for (( _i=0; _i<cols; _i++ )); do _border_full+="─"; done
+      _layout_dirty=0
+    fi
 
     local _gc_now_epoch
     _gc_now_epoch=$(date +%s)
     if [[ $((_gc_now_epoch - _last_runtime_gc_check)) -ge TASK_RUNTIME_GC_INTERVAL_SECS ]]; then
-      _reconcile_task_runtime true false
+      _reconcile_task_runtime true false dashboard
       _last_runtime_gc_check=$_gc_now_epoch
+      if [[ "$_gc_actions" -gt 0 ]]; then
+        _dash_mark_snapshot_dirty
+        _dash_mark_dock_dirty
+        _dash_mark_layout_dirty
+        _dash_mark_list_dirty
+      fi
     fi
 
-    # Snapshot all data
-    _snapshot_tasks
+    local -i _has_dock=0
 
-    # Build list items (needed for list mode; cheap no-op data if in kanban)
-    if [[ "$_view_mode" == "list" ]]; then
-      # Detect dead split pane (ghost state cleanup)
-      if [[ $_split_active -eq 1 ]]; then
-        _split_sync_state || true
+    if [[ $_snapshot_dirty -eq 1 ]]; then
+      [[ -n "$_t0" ]] && _perf_phase_t0=${EPOCHREALTIME:-}
+      _snapshot_tasks
+      if [[ -n "$_perf_phase_t0" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
+        _perf_snapshot_ms=$((_perf_snapshot_ms + (EPOCHREALTIME - _perf_phase_t0) * 1000))
       fi
+      _snapshot_dirty=0
+      _list_needs_rebuild=1
+    fi
+
+    if [[ $_dock_dirty -eq 1 ]]; then
+      [[ -n "$_t0" ]] && _perf_phase_t0=${EPOCHREALTIME:-}
+      _dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+      [[ -n "$_dock_data" ]] && _has_dock=1
+      _split_sync_state "$_dock_data" || true
+      if [[ $_has_dock -eq 1 ]]; then
+        _view_mode="list"
+        if _dash_restore_dock_if_needed "$_dock_data"; then
+            _snapshot_dirty=1
+            _list_needs_rebuild=1
+            _dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+            [[ -n "$_dock_data" ]] && _has_dock=1 || _has_dock=0
+        fi
+      fi
+      if [[ -n "$_perf_phase_t0" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
+        _perf_dock_ms=$((_perf_dock_ms + (EPOCHREALTIME - _perf_phase_t0) * 1000))
+      fi
+      _dock_dirty=0
+    else
+      [[ -n "$_dock_data" ]] && _has_dock=1
+    fi
+
+    if [[ $_snapshot_dirty -eq 1 ]]; then
+      [[ -n "$_t0" ]] && _perf_phase_t0=${EPOCHREALTIME:-}
+      _snapshot_tasks
+      if [[ -n "$_perf_phase_t0" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
+        _perf_snapshot_ms=$((_perf_snapshot_ms + (EPOCHREALTIME - _perf_phase_t0) * 1000))
+      fi
+      _snapshot_dirty=0
+      _list_needs_rebuild=1
+    fi
+
+    if [[ "$_view_mode" == "list" && $_list_needs_rebuild -eq 1 ]]; then
+      [[ -n "$_t0" ]] && _perf_phase_t0=${EPOCHREALTIME:-}
       _list_build_items
-      # Clamp list cursor
+      if [[ -n "$_perf_phase_t0" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
+        _perf_list_ms=$((_perf_list_ms + (EPOCHREALTIME - _perf_phase_t0) * 1000))
+      fi
+      _list_needs_rebuild=0
+    fi
+
+    # Clamp list cursor when list mode is active
+    if [[ "$_view_mode" == "list" ]]; then
       if [[ ${#_list_items[@]} -gt 0 ]]; then
         [[ $_list_cursor -ge ${#_list_items[@]} ]] && _list_cursor=$((${#_list_items[@]} - 1))
         [[ $_list_cursor -lt 0 ]] && _list_cursor=0
@@ -6375,11 +7312,6 @@ cmd__dash_loop() {
         _list_cursor=0
       fi
     fi
-
-    # Pre-compute border strings
-    local _border_card="" _border_full="" _i
-    for (( _i=0; _i<card_inner; _i++ )); do _border_card+="─"; done
-    for (( _i=0; _i<cols; _i++ )); do _border_full+="─"; done
 
     # Clamp navigation indices
     if [[ ${#_repo_names[@]} -gt 0 ]]; then
@@ -6415,20 +7347,16 @@ cmd__dash_loop() {
       fi
     fi
 
-    # Compute how many terminal lines the footer will occupy after wrapping
-    local _footer_len
-    if [[ "${_view_mode:-kanban}" == "list" ]]; then
-      if [[ ${_split_active:-0} -eq 1 ]]; then _footer_len=172
-      else _footer_len=181; fi
-    elif [[ $cron_row_selected -eq 1 ]]; then _footer_len=112
-    elif [[ "$filter_mode" == "all" ]]; then _footer_len=111
-    else _footer_len=154; fi
-    local _footer_lines=$(( (_footer_len + cols - 1) / cols ))
-    (( _footer_lines < 1 )) && _footer_lines=1
+    # Compute the exact footer string and reserve the matching wrapped height.
+    local _footer_text=""
+    local -i _footer_lines=1
+    _footer_select_layout
 
     # Viewport height available for content (below status bar, above footer)
     local _viewport_height=$((rows - 1 - _footer_lines))
     [[ $_viewport_height -lt 1 ]] && _viewport_height=1
+
+    [[ -n "$_t0" ]] && _perf_phase_t0=${EPOCHREALTIME:-}
 
     # Begin frame buffer
     local _frame=""
@@ -6574,7 +7502,7 @@ cmd__dash_loop() {
         if [[ $visible_cards -gt 0 ]]; then
           # Scroll-up indicator
           if [[ $scroll_off -gt 0 ]]; then
-            _frame+="  ${C_DIM}▲ ${scroll_off} more above${C_RESET}"$'\n'
+            _frame+="  ${C_DIM}${TUI_GLYPH_SCROLL_UP} ${scroll_off} more above${C_RESET}"$'\n'
           fi
 
           # Render compact 3-line bordered cards
@@ -6636,10 +7564,10 @@ cmd__dash_loop() {
                       fi
                       ;;
                     2)
-                      # Bottom border with status: └ ● working ──┘
+                      # Bottom border with status: └ * working ──┘
                       local cstatus="${_task_claude[$task_id]}"
                       local extra="" extra_color=""
-                      [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
+                      [[ "$cstatus" == "working" ]] && { extra="${TUI_GLYPH_WORKING} working"; extra_color="${C_GREEN}"; }
                       # waiting status hidden (too noisy)
                       [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
                       local tstatus="${_task_status[$task_id]}"
@@ -6684,7 +7612,7 @@ cmd__dash_loop() {
           # Scroll-down indicator
           local below=$((actual_max - scroll_off - visible_cards))
           if [[ $below -gt 0 ]]; then
-            _frame+="  ${C_DIM}▼ ${below} more below${C_RESET}"$'\n'
+            _frame+="  ${C_DIM}${TUI_GLYPH_SCROLL_DOWN} ${below} more below${C_RESET}"$'\n'
           fi
         fi
 
@@ -6746,7 +7674,7 @@ cmd__dash_loop() {
       if [[ $visible_cards -gt 0 ]]; then
         # Scroll-up indicator
         if [[ $scroll_off -gt 0 ]]; then
-          _frame+="  ${C_DIM}▲ ${scroll_off} more above${C_RESET}"$'\n'
+          _frame+="  ${C_DIM}${TUI_GLYPH_SCROLL_UP} ${scroll_off} more above${C_RESET}"$'\n'
         fi
 
         local _rseq=()
@@ -6808,8 +7736,8 @@ cmd__dash_loop() {
                   3)
                     local cstatus="${_task_claude[$task_id]}"
                     local extra="" extra_color=""
-                    [[ "$cstatus" == "working" ]] && { extra="● working"; extra_color="${C_GREEN}"; }
-                    [[ "$cstatus" == "waiting" ]] && { extra="○ waiting"; extra_color="${C_YELLOW}"; }
+                    [[ "$cstatus" == "working" ]] && { extra="${TUI_GLYPH_WORKING} working"; extra_color="${C_GREEN}"; }
+                    [[ "$cstatus" == "waiting" ]] && { extra="${TUI_GLYPH_WAITING} waiting"; extra_color="${C_YELLOW}"; }
                     [[ -n "$pr_short" ]] && { [[ -n "$extra" ]] && extra="${extra} ${pr_short}" || extra="$pr_short"; }
                     local tstatus="${_task_status[$task_id]}"
                     if [[ "$tstatus" != "pending" ]]; then
@@ -6849,7 +7777,7 @@ cmd__dash_loop() {
         # Scroll-down indicator
         local below=$((actual_max - scroll_off - visible_cards))
         if [[ $below -gt 0 ]]; then
-          _frame+="  ${C_DIM}▼ ${below} more below${C_RESET}"$'\n'
+          _frame+="  ${C_DIM}${TUI_GLYPH_SCROLL_DOWN} ${below} more below${C_RESET}"$'\n'
         fi
       fi
     fi
@@ -6869,7 +7797,7 @@ cmd__dash_loop() {
     fi
 
     # Output frame (CSI 3 J clears tmux pane scrollback inline to prevent stale frames on scroll-up)
-    printf '\033[3J\033[H%s\033[J' "$_frame"
+    printf '\033[r\033[?6l\033[3J\033[H%s\033[J' "$_frame"
 
     # Deferred scrollbar (list mode, rendered after frame to use move_to positioning)
     if [[ "$_view_mode" == "list" && $_list_scrollbar_vh -gt 0 ]]; then
@@ -6888,10 +7816,8 @@ cmd__dash_loop() {
     # Footer
     _render_footer
 
-    # Debug timing
-    if [[ -n "${_t0:-}" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
-      local _elapsed=$(( (EPOCHREALTIME - _t0) * 1000 ))
-      printf '%s frame: %.1fms\n' "$(date +%T)" "$_elapsed" >> /tmp/cloard-perf.log
+    if [[ -n "$_perf_phase_t0" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
+      _perf_render_ms=$((_perf_render_ms + (EPOCHREALTIME - _perf_phase_t0) * 1000))
     fi
 
     # Read key with timeout
@@ -6899,9 +7825,10 @@ cmd__dash_loop() {
     read -rsk1 -t "$DASH_REFRESH" key 2>/dev/null || true
 
     # Handle escape sequences
+    [[ -n "$_t0" ]] && _perf_phase_t0=${EPOCHREALTIME:-}
     if [[ "$key" == $'\e' ]]; then
       local seq=""
-      read -rsk2 -t 0.1 seq 2>/dev/null || true
+      read -rsk2 -t "$DASH_ESC_READ_TIMEOUT" seq 2>/dev/null || true
       case "$seq" in
         '[A') key='k' ;;     # up
         '[B') key='j' ;;     # down
@@ -6911,6 +7838,23 @@ cmd__dash_loop() {
         *)    key='ESC' ;;   # plain Esc
       esac
     fi
+    if [[ -n "$_perf_phase_t0" ]] && [[ -n "${EPOCHREALTIME:-}" ]]; then
+      _perf_input_ms=$((_perf_input_ms + (EPOCHREALTIME - _perf_phase_t0) * 1000))
+    fi
+
+    # Debug timing
+    if [[ -n "${_t0:-}" ]]; then
+      local _phase_total=$((_perf_snapshot_ms + _perf_dock_ms + _perf_list_ms + _perf_render_ms + _perf_input_ms))
+      printf '%s frame: %.1fms snapshot=%.1fms dock_sync=%.1fms list_build=%.1fms render=%.1fms input_parse=%.1fms\n' \
+        "$(date +%T)" "$_phase_total" "$_perf_snapshot_ms" "$_perf_dock_ms" "$_perf_list_ms" "$_perf_render_ms" "$_perf_input_ms" >> /tmp/cloard-perf.log
+    fi
+
+    local _prev_split_active="$_split_active"
+    local _prev_split_task_id="$_split_task_id"
+    local _prev_split_is_cron="$_split_is_cron"
+    local _prev_view_mode="$_view_mode"
+    local _prev_show_done="$_show_done"
+    local _prev_filter_mode="$filter_mode"
 
     case "$key" in
       h) # Left column
@@ -7121,7 +8065,7 @@ cmd__dash_loop() {
                 cursor_hide
                 ;;
               1|2|3)  # Active / Needs Review / Done: open in split pane via list mode
-                [[ "${_split_active:-0}" == "1" ]] && _split_close
+                [[ "${_split_active:-0}" == "1" ]] && _split_close keep
                 _list_follow_id="$cron_item"
                 _list_follow_type="cron"
                 _view_mode="list"
@@ -7543,6 +8487,9 @@ cmd__dash_loop() {
           fi
           stty -echo
           cursor_hide
+          _dash_mark_snapshot_dirty
+          _dash_mark_dock_dirty
+          _dash_mark_layout_dirty
           continue
         fi
 
@@ -7871,7 +8818,7 @@ cmd__dash_loop() {
             # Close split pane if showing this task
             local was_split=0
             if [[ "${_split_active:-0}" == "1" && "$_split_task_id" == "$sel_id" ]]; then
-              _split_close
+              _split_close keep
               was_split=1
             fi
 
@@ -7911,17 +8858,11 @@ cmd__dash_loop() {
         fi
         ;;
       v) # Toggle kanban/list view
-        if [[ "$_view_mode" == "kanban" ]]; then
-          _list_transfer_from_kanban
-          _view_mode="list"
-        else
-          _list_transfer_to_kanban
-          _view_mode="kanban"
-        fi
+        _dash_toggle_view_mode
         ;;
       q) # Quit / detach
         if [[ $_split_active -eq 1 ]]; then
-          _split_close
+          _split_close keep
         fi
         cursor_show
         tmux_cmd detach-client 2>/dev/null || exit 0
@@ -7940,6 +8881,33 @@ cmd__dash_loop() {
           ;;
       esac
     fi
+
+    if [[ "$_view_mode" != "$_prev_view_mode" ]]; then
+      _dash_mark_layout_dirty
+      _dash_mark_list_dirty
+    fi
+
+    if [[ "${_split_active:-0}" != "$_prev_split_active" || "$_split_task_id" != "$_prev_split_task_id" || "${_split_is_cron:-0}" != "$_prev_split_is_cron" ]]; then
+      _dash_mark_dock_dirty
+      _dash_mark_layout_dirty
+      _dash_mark_list_dirty
+    fi
+
+    if [[ "$_show_done" != "$_prev_show_done" || "$filter_mode" != "$_prev_filter_mode" ]]; then
+      _dash_mark_list_dirty
+    fi
+
+    case "$key" in
+      '') ;;
+      $'\n'|$'\r'|'>'|'<'|':'|'"'|c|x|R|S|t|p|r|H|D)
+        _dash_mark_snapshot_dirty
+        ;;
+      d)
+        _dash_mark_list_dirty
+        ;;
+    esac
+
+    _full_redraw=0
 
   done
 }
@@ -8052,7 +9020,7 @@ _list_transfer_to_kanban() {
 
   # Close split if active
   if [[ $_split_active -eq 1 ]]; then
-    _split_close
+    _split_close keep
   fi
 }
 # ── Help ───────────────────────────────────────────────────────────────────────
@@ -8161,18 +9129,18 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
 
   List view:
     j/k         Move cursor up/down through items
-    Enter       Expand/collapse group, or open task (split mode)
+    Enter       Expand/collapse group, or open task in the dock
     Tab         Jump to next group header
     Shift-Tab   Jump to previous group header
     </>         Cycle task status left/right
     H           Browse session history for selected task
     D           Toggle show/hide done tasks
-    b           Toggle split view (sidebar + Claude session)
+    b           Toggle the sidebar dock on/off
     l           Focus Claude pane (split mode)
     Ctrl-F      Toggle focus between sidebar and Claude pane
-    F           Full-screen the Claude session (exits split)
-    v           Switch back to kanban view
-    ESC         Close split view or collapse current group
+    F           Full-screen the Claude session (dock stays sticky)
+    v           Switch back to kanban view when no dock is active
+    ESC         Close the dock or collapse current group
 EOF
 }
 

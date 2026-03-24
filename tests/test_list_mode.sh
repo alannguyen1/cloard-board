@@ -355,28 +355,30 @@ assert_eq "group items have height 1" "0" "$?"
 grep -q "task:\*|cron:\*.*_lih=1" "$BOARD"
 assert_eq "task items have height 1" "0" "$?"
 
-# Group header uses expand/collapse arrows
-grep -q '▼' "$BOARD"
-assert_eq "expanded arrow ▼ present" "0" "$?"
+# Group header and status badges use centralized ASCII-safe glyphs
+grep -Fq 'readonly TUI_GLYPH_EXPANDED="v"' "$BOARD"
+assert_eq "expanded group glyph uses ASCII-safe palette" "0" "$?"
 
-grep -q '▶' "$BOARD"
-assert_eq "collapsed arrow ▶ present" "0" "$?"
+grep -Fq 'readonly TUI_GLYPH_COLLAPSED=">"' "$BOARD"
+assert_eq "collapsed group glyph uses ASCII-safe palette" "0" "$?"
 
-# Task card single-char status badges
-grep -q 'badge_char="●"' "$BOARD"
-assert_eq "active badge_char present" "0" "$?"
+grep -Fq 'readonly TUI_GLYPH_ACTIVE="*"' "$BOARD"
+assert_eq "active badge glyph uses ASCII-safe palette" "0" "$?"
 
-grep -q 'badge_char="◆"' "$BOARD"
-assert_eq "review badge_char present" "0" "$?"
+grep -Fq 'readonly TUI_GLYPH_REVIEW="!"' "$BOARD"
+assert_eq "review badge glyph uses ASCII-safe palette" "0" "$?"
 
-grep -q 'badge_char="○"' "$BOARD"
-assert_eq "pending badge_char present" "0" "$?"
+grep -Fq 'readonly TUI_GLYPH_PENDING="o"' "$BOARD"
+assert_eq "pending badge glyph uses ASCII-safe palette" "0" "$?"
 
-grep -q 'badge_char="◫"' "$BOARD"
-assert_eq "paused badge_char present" "0" "$?"
+grep -Fq 'readonly TUI_GLYPH_PAUSED="="' "$BOARD"
+assert_eq "paused badge glyph uses ASCII-safe palette" "0" "$?"
 
-grep -q 'badge_char="✓"' "$BOARD"
-assert_eq "done badge_char present" "0" "$?"
+grep -Fq 'readonly TUI_GLYPH_DONE="x"' "$BOARD"
+assert_eq "done badge glyph uses ASCII-safe palette" "0" "$?"
+
+grep -Fq 'readonly TUI_ELLIPSIS="..."' "$BOARD"
+assert_eq "ellipsis uses ASCII-safe palette" "0" "$?"
 
 # ── D: Split-pane lifecycle ─────────────────────────────────────────────────
 
@@ -505,21 +507,21 @@ assert_eq "footer shows v: kanban hint" "0" "$?"
 grep -q 'v: list' "$BOARD"
 assert_eq "footer shows v: list hint (kanban mode)" "0" "$?"
 
-grep -q 'b: split' "$BOARD"
-assert_eq "footer shows b: split hint" "0" "$?"
+grep -q 'b: dock' "$BOARD"
+assert_eq "footer shows b: dock hint" "0" "$?"
 
-grep -q 'b: full list' "$BOARD"
-assert_eq "footer shows b: full list hint (split mode)" "0" "$?"
+grep -q 'b: undock' "$BOARD"
+assert_eq "footer shows b: undock hint (split mode)" "0" "$?"
 
 # Help text has list view section
 grep -q 'List view:' "$BOARD"
 assert_eq "help has List view section" "0" "$?"
 
-grep -q 'Toggle between kanban and list view' "$BOARD"
-assert_eq "help describes v key for view toggle" "0" "$?"
+grep -q 'Switch back to kanban view when no dock is active' "$BOARD"
+assert_eq "help describes v key dock guard" "0" "$?"
 
-grep -q 'Toggle split view' "$BOARD"
-assert_eq "help describes split view toggle" "0" "$?"
+grep -q 'Toggle the sidebar dock on/off' "$BOARD"
+assert_eq "help describes sidebar dock toggle" "0" "$?"
 
 # Main dispatcher has _split_session
 grep -q '_split_session' "$BOARD"
@@ -758,21 +760,23 @@ echo "L: Cron split pane functions"
 grep -q '_split_open_cron()' "$BOARD"
 assert_eq "_split_open_cron function present" "0" "$?"
 
-# _split_open_cron sets _split_is_cron=1
-result_cron_flag=$(sed -n '/_split_open_cron()/,/^}/p' "$BOARD" | grep -c '_split_is_cron=1')
-assert_eq "_split_open_cron sets _split_is_cron=1" "1" "$(( result_cron_flag >= 1 ? 1 : 0 ))"
+# _split_open_cron activates cron dock state
+result_cron_flag=$(sed -n '/_split_open_cron()/,/^}/p' "$BOARD" | grep -c '_split_activate_state "cron"')
+assert_eq "_split_open_cron activates cron dock state" "1" "$(( result_cron_flag >= 1 ? 1 : 0 ))"
 
-# _split_open sets _split_is_cron=0
-result_task_flag=$(sed -n '/_split_open() {/,/^}/p' "$BOARD" | grep -c '_split_is_cron=0')
-assert_eq "_split_open clears _split_is_cron" "1" "$(( result_task_flag >= 1 ? 1 : 0 ))"
+# _split_open activates task dock state
+result_task_flag=$(sed -n '/_split_open() {/,/^}/p' "$BOARD" | grep -c '_split_activate_state "task"')
+assert_eq "_split_open activates task dock state" "1" "$(( result_task_flag >= 1 ? 1 : 0 ))"
 
 # _split_close resets split state via helper
 result_close_flag=$(sed -n '/_split_close()/,/^}/p' "$BOARD" | grep -c '_split_reset_state' || true)
 assert_eq "_split_close delegates reset to _split_reset_state" "1" "$(( result_close_flag >= 1 ? 1 : 0 ))"
 
-# _split_close uses resume- prefix for cron windows
-grep -q 'resume-.*_split_task_id' "$BOARD"
-assert_eq "_split_close uses resume- prefix for cron" "0" "$?"
+# _split_break_name uses resume- prefix for cron windows
+grep -q '_split_break_name' "$BOARD"
+assert_eq "_split_break_name helper present" "0" "$?"
+grep -q 'resume-\${dock_id}' "$BOARD"
+assert_eq "_split_break_name uses resume- prefix for cron" "0" "$?"
 
 # _split_is_cron state variable in dash loop
 grep -q '_split_is_cron=0' "$BOARD"
@@ -921,6 +925,77 @@ assert_eq "kanban cron Enter sets _list_follow_type=cron" "0" "$?"
 # Kanban cron Enter switches _view_mode to list
 result_viewmode=$(sed -n '/Active .* Needs Review .* Done: open in split/,/;;/p' "$BOARD" | grep -c '_view_mode="list"' || true)
 assert_eq "kanban cron Enter switches to list mode" "1" "$result_viewmode"
+
+# ── M: Navigation hot path ─────────────────────────────────────────────────
+
+echo ""
+echo "M: Navigation hot path"
+
+result_nav_down=$(run_zsh <<'SCRIPT'
+setopt KSH_ARRAYS TYPESET_SILENT
+source "$2"
+
+typeset -A _list_group_collapsed _task_repo _repo_stale _cron_run_data _cron_jobs _cron_job_enabled _cron_job_schedule
+local -a _list_items
+local _list_cursor=0 _list_scroll_top=0 _show_done=0 _list_follow_id="" _list_follow_type="task"
+local _split_task_id="t-001"
+local -i _split_active=1 _split_is_cron=0 _list_needs_rebuild=0
+local sync_calls=0
+
+_split_sync_state() { sync_calls=$((sync_calls + 1)); }
+
+_list_items=("task:t-001" "task:t-002")
+_list_handle_key "j"
+
+echo "${_list_cursor}:${sync_calls}:${_list_needs_rebuild}"
+SCRIPT
+)
+assert_eq "j moves cursor without split sync or rebuild" "1:0:0" "$result_nav_down"
+
+result_nav_up=$(run_zsh <<'SCRIPT'
+setopt KSH_ARRAYS TYPESET_SILENT
+source "$2"
+
+typeset -A _list_group_collapsed _task_repo _repo_stale _cron_run_data _cron_jobs _cron_job_enabled _cron_job_schedule
+local -a _list_items
+local _list_cursor=1 _list_scroll_top=0 _show_done=0 _list_follow_id="" _list_follow_type="task"
+local _split_task_id="t-001"
+local -i _split_active=1 _split_is_cron=0 _list_needs_rebuild=0
+local sync_calls=0
+
+_split_sync_state() { sync_calls=$((sync_calls + 1)); }
+
+_list_items=("task:t-001" "task:t-002")
+_list_handle_key "k"
+
+echo "${_list_cursor}:${sync_calls}:${_list_needs_rebuild}"
+SCRIPT
+)
+assert_eq "k moves cursor without split sync or rebuild" "0:0:0" "$result_nav_up"
+
+result_no_sync=$(sed -n '/_list_handle_key()/,/^}/p' "$BOARD" | grep -c '_split_sync_state' || true)
+assert_eq "_list_handle_key no longer calls _split_sync_state" "0" "$result_no_sync"
+
+grep -q 'DASH_ESC_READ_TIMEOUT' "$BOARD"
+assert_eq "arrow-key timeout constant present" "0" "$?"
+
+grep -q 'read -rsk2 -t "\$DASH_ESC_READ_TIMEOUT"' "$BOARD"
+assert_eq "arrow-key parser uses reduced timeout constant" "0" "$?"
+
+grep -q '_snapshot_dirty -eq 1' "$BOARD"
+assert_eq "dashboard loop gates snapshot rebuilds" "0" "$?"
+
+grep -q '_list_needs_rebuild -eq 1' "$BOARD"
+assert_eq "dashboard loop gates list rebuilds" "0" "$?"
+
+grep -q 'snapshot=' "$BOARD"
+assert_eq "debug log includes snapshot timing" "0" "$?"
+
+grep -q 'dock_sync=' "$BOARD"
+assert_eq "debug log includes dock timing" "0" "$?"
+
+grep -q 'input_parse=' "$BOARD"
+assert_eq "debug log includes input parse timing" "0" "$?"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

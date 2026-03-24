@@ -163,14 +163,14 @@ Press `v` to switch between kanban and list views. The list view shows all tasks
 | `d` | Toggle show/hide done tasks |
 | `H` | Open session history modal |
 | `c` | Open new task modal |
-| `b` | Toggle split view (sidebar + Claude session pane) |
+| `b` | Toggle the sidebar dock (sidebar + Claude session pane) |
 | `v` | Switch back to kanban view |
 | `Esc` | Collapse current group |
 | `q` | Quit |
 
 #### Sidebar mode (split view)
 
-Press `b` in list mode to open a split pane: a narrow task sidebar on the left (40%) and the selected task's Claude session on the right (60%). The split pane also opens automatically when you press `Enter` on a task in list mode.
+Press `b` in list mode to open a split pane: a narrow task sidebar on the left (40%) and the selected task's Claude session on the right (60%). The split pane also opens automatically when you press `Enter` on a task in list mode. Once opened, the dock stays sticky across fullscreening, detach/reattach, and reopening the dashboard. Press `b` or `Esc` to turn it off.
 
 | Key | Action |
 |---|---|
@@ -184,8 +184,8 @@ Press `b` in list mode to open a split pane: a narrow task sidebar on the left (
 | `d` | Toggle show/hide done tasks |
 | `H` | Open session history modal |
 | `Tab` | Cycle repo filter |
-| `b` | Close split, return to full list |
-| `Esc` | Close split |
+| `b` | Close the dock, return to the full list |
+| `Esc` | Close the dock |
 | `q` | Quit |
 
 ### Cron row

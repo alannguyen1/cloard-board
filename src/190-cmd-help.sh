@@ -104,18 +104,18 @@ ${C_BOLD}DASHBOARD KEYS${C_RESET}
 
   List view:
     j/k         Move cursor up/down through items
-    Enter       Expand/collapse group, or open task (split mode)
+    Enter       Expand/collapse group, or open task in the dock
     Tab         Jump to next group header
     Shift-Tab   Jump to previous group header
     </>         Cycle task status left/right
     H           Browse session history for selected task
     D           Toggle show/hide done tasks
-    b           Toggle split view (sidebar + Claude session)
+    b           Toggle the sidebar dock on/off
     l           Focus Claude pane (split mode)
     Ctrl-F      Toggle focus between sidebar and Claude pane
-    F           Full-screen the Claude session (exits split)
-    v           Switch back to kanban view
-    ESC         Close split view or collapse current group
+    F           Full-screen the Claude session (dock stays sticky)
+    v           Switch back to kanban view when no dock is active
+    ESC         Close the dock or collapse current group
 EOF
 }
 

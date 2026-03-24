@@ -117,15 +117,168 @@ _task_idle_seconds() {
   echo "$delta"
 }
 
-_reconcile_task_runtime() {
+_task_idle_seconds_from_refs() {
+  local last_activity_at="$1" status_changed_at="$2" started_at="$3"
+  local idle_ref="$last_activity_at"
+  [[ -n "$idle_ref" ]] || idle_ref="$status_changed_at"
+  [[ -n "$idle_ref" ]] || idle_ref="$started_at"
+  [[ -n "$idle_ref" ]] || return 1
+
+  local idle_epoch
+  idle_epoch=$(_iso_to_epoch "$idle_ref" 2>/dev/null) || return 1
+
+  local now_epoch
+  now_epoch=$(date +%s)
+  local delta=$((now_epoch - idle_epoch))
+  (( delta < 0 )) && delta=0
+  echo "$delta"
+}
+
+_reconcile_task_runtime_candidate() {
+  local id="$1" task_state="$2" claude_status="$3" idle_secs="$4"
+  local -i has_runtime="${5:-0}" live_runtime="${6:-0}" docked_task="${7:-0}"
+  local apply="${8:-false}" verbose="${9:-false}"
+
+  local finding=""
+  local apply_mode=""
+
+  if [[ "$task_state" == "active" ]] && [[ -n "$idle_secs" ]] && (( idle_secs >= TASK_ACTIVE_IDLE_TIMEOUT_SECS )); then
+    finding="task '${id}' is active but idle for at least 24h"
+    apply_mode="pause_active"
+  elif [[ "$task_state" == "needs_review" ]] && (( has_runtime == 1 )) && [[ -n "$idle_secs" ]] \
+    && (( idle_secs >= TASK_REVIEW_IDLE_TIMEOUT_SECS )) && (( docked_task == 0 )); then
+    finding="task '${id}' is needs_review and still owns a runtime after 1h idle"
+    apply_mode="close_runtime"
+  elif [[ "$task_state" == "done" || "$task_state" == "paused" ]] && (( has_runtime == 1 )); then
+    finding="task '${id}' is ${task_state} but still owns a runtime"
+    apply_mode="close_runtime"
+  elif (( has_runtime == 1 && live_runtime == 0 && docked_task == 0 )); then
+    finding="task '${id}' has a stale fallback shell runtime"
+    apply_mode="close_runtime"
+  fi
+
+  if [[ -n "$finding" ]]; then
+    _gc_findings=$((_gc_findings + 1))
+    if $apply; then
+      case "$apply_mode" in
+        pause_active)
+          _tmux_close_task_runtime "$id" || true
+          set_task_status "$id" "paused"
+          update_task_field_raw "$id" "claude_status" "null"
+          ;;
+        close_runtime)
+          _tmux_close_task_runtime "$id" || true
+          update_task_field_raw "$id" "claude_status" "null"
+          ;;
+      esac
+      _gc_actions=$((_gc_actions + 1))
+      $verbose && info "$finding"
+    else
+      $verbose && warn "$finding"
+    fi
+    return 0
+  fi
+
+  if $apply && [[ -n "$claude_status" ]] && (( live_runtime == 0 && docked_task == 0 )); then
+    update_task_field_raw "$id" "claude_status" "null"
+  fi
+}
+
+_reconcile_task_runtime_dashboard() {
   local apply="${1:-false}" verbose="${2:-false}"
+  tmux_session_exists || return 0
+
+  local dock_data="" dock_kind="" dock_id="" docked_task_id=""
+  dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  if [[ -n "$dock_data" ]]; then
+    IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+    [[ "$dock_kind" == "task" ]] && docked_task_id="$dock_id"
+  fi
+
+  local split_task_id=""
+  if _tmux_dashboard_has_split; then
+    split_task_id=$(_tmux_dashboard_task_id 2>/dev/null || true)
+    if [[ -n "$split_task_id" && "$dock_kind" != "cron" ]] && ! task_exists "$split_task_id"; then
+      _gc_findings=$((_gc_findings + 1))
+      if $apply; then
+        tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null || true
+        _gc_actions=$((_gc_actions + 1))
+        $verbose && info "closed orphaned dashboard split runtime '${split_task_id}'"
+      else
+        $verbose && warn "dashboard split runtime '${split_task_id}' has no matching task"
+      fi
+      split_task_id=""
+    fi
+  fi
+
+  typeset -A _gc_seen_ids=()
+  local id task_state claude_status last_activity_at status_changed_at started_at idle_secs
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    _gc_seen_ids[$id]=1
+
+    if ! task_exists "$id"; then
+      _gc_findings=$((_gc_findings + 1))
+      if $apply; then
+        _tmux_close_task_runtime "$id" || true
+        _gc_actions=$((_gc_actions + 1))
+        $verbose && info "closed orphaned runtime window '${id}'"
+      else
+        $verbose && warn "runtime window '${id}' has no matching task"
+      fi
+      continue
+    fi
+
+    task_state=$(task_status "$id")
+    claude_status=$(task_field "$id" "claude_status")
+    last_activity_at=$(task_field "$id" "last_activity_at")
+    status_changed_at=$(task_field "$id" "status_changed_at")
+    started_at=$(task_field "$id" "started_at")
+    idle_secs=$(_task_idle_seconds_from_refs "$last_activity_at" "$status_changed_at" "$started_at" 2>/dev/null || true)
+
+    local -i live_runtime=0 docked_task=0
+    _tmux_claude_alive "$id" && live_runtime=1
+    [[ "$id" == "$docked_task_id" ]] && docked_task=1
+    _reconcile_task_runtime_candidate "$id" "$task_state" "$claude_status" "$idle_secs" 1 "$live_runtime" "$docked_task" "$apply" "$verbose"
+  done < <(_tmux_runtime_window_names 2>/dev/null || true)
+
+  if [[ -n "$split_task_id" && -z "${_gc_seen_ids[$split_task_id]:-}" ]]; then
+    task_state=$(task_status "$split_task_id")
+    claude_status=$(task_field "$split_task_id" "claude_status")
+    last_activity_at=$(task_field "$split_task_id" "last_activity_at")
+    status_changed_at=$(task_field "$split_task_id" "status_changed_at")
+    started_at=$(task_field "$split_task_id" "started_at")
+    idle_secs=$(_task_idle_seconds_from_refs "$last_activity_at" "$status_changed_at" "$started_at" 2>/dev/null || true)
+
+    local -i split_live_runtime=0 split_docked_task=0
+    _tmux_pane_claude_alive "board:dashboard.1" && split_live_runtime=1
+    [[ "$split_task_id" == "$docked_task_id" ]] && split_docked_task=1
+    _reconcile_task_runtime_candidate "$split_task_id" "$task_state" "$claude_status" "$idle_secs" 1 "$split_live_runtime" "$split_docked_task" "$apply" "$verbose"
+  fi
+}
+
+_reconcile_task_runtime() {
+  local apply="${1:-false}" verbose="${2:-false}" mode="${3:-full}"
   _gc_findings=0
   _gc_actions=0
+  [[ "$mode" == "dashboard" ]] && {
+    _reconcile_task_runtime_dashboard "$apply" "$verbose"
+    return
+  }
+
+  local docked_task_id="" dock_kind="" dock_id=""
 
   if tmux_session_exists; then
+    local dock_data
+    dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+    if [[ -n "$dock_data" ]]; then
+      IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+      [[ "$dock_kind" == "task" ]] && docked_task_id="$dock_id"
+    fi
+
     local orphan_split_id
     orphan_split_id=$(_tmux_dashboard_task_id 2>/dev/null || true)
-    if [[ -n "$orphan_split_id" ]] && ! task_exists "$orphan_split_id"; then
+    if [[ -n "$orphan_split_id" && "$dock_kind" != "cron" ]] && ! task_exists "$orphan_split_id"; then
       _gc_findings=$((_gc_findings + 1))
       if $apply; then
         tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null || true
@@ -148,70 +301,17 @@ _reconcile_task_runtime() {
   while IFS=$'\x1e' read -r id task_state claude_status last_activity_at status_changed_at started_at; do
     [[ -n "$id" ]] || continue
 
-    local idle_ref="$last_activity_at"
-    [[ -n "$idle_ref" ]] || idle_ref="$status_changed_at"
-    [[ -n "$idle_ref" ]] || idle_ref="$started_at"
+    local -i docked_task=0
+    [[ "$id" == "$docked_task_id" ]] && docked_task=1
 
     local idle_secs=""
-    if [[ -n "$idle_ref" ]]; then
-      local idle_epoch
-      idle_epoch=$(_iso_to_epoch "$idle_ref" 2>/dev/null || true)
-      if [[ -n "$idle_epoch" ]]; then
-        local now_epoch
-        now_epoch=$(date +%s)
-        idle_secs=$((now_epoch - idle_epoch))
-        (( idle_secs < 0 )) && idle_secs=0
-      fi
-    fi
+    idle_secs=$(_task_idle_seconds_from_refs "$last_activity_at" "$status_changed_at" "$started_at" 2>/dev/null || true)
 
     local has_runtime=0
     local live_runtime=0
     _tmux_task_runtime_exists "$id" && has_runtime=1
     _tmux_task_runtime_live "$id" && live_runtime=1
-
-    local finding=""
-    local apply_mode=""
-
-    if [[ "$task_state" == "active" ]] && [[ -n "$idle_secs" ]] && (( idle_secs >= TASK_ACTIVE_IDLE_TIMEOUT_SECS )); then
-      finding="task '${id}' is active but idle for at least 24h"
-      apply_mode="pause_active"
-    elif [[ "$task_state" == "needs_review" ]] && (( has_runtime == 1 )) && [[ -n "$idle_secs" ]] \
-      && (( idle_secs >= TASK_REVIEW_IDLE_TIMEOUT_SECS )); then
-      finding="task '${id}' is needs_review and still owns a runtime after 1h idle"
-      apply_mode="close_runtime"
-    elif [[ "$task_state" == "done" || "$task_state" == "paused" ]] && (( has_runtime == 1 )); then
-      finding="task '${id}' is ${task_state} but still owns a runtime"
-      apply_mode="close_runtime"
-    elif (( has_runtime == 1 && live_runtime == 0 )); then
-      finding="task '${id}' has a stale fallback shell runtime"
-      apply_mode="close_runtime"
-    fi
-
-    if [[ -n "$finding" ]]; then
-      _gc_findings=$((_gc_findings + 1))
-      if $apply; then
-        case "$apply_mode" in
-          pause_active)
-            _tmux_close_task_runtime "$id" || true
-            set_task_status "$id" "paused"
-            update_task_field_raw "$id" "claude_status" "null"
-            ;;
-          close_runtime)
-            _tmux_close_task_runtime "$id" || true
-            update_task_field_raw "$id" "claude_status" "null"
-            ;;
-        esac
-        _gc_actions=$((_gc_actions + 1))
-        $verbose && info "$finding"
-      else
-        $verbose && warn "$finding"
-      fi
-      continue
-    fi
-
-    if $apply && [[ -n "$claude_status" ]] && (( live_runtime == 0 )); then
-      update_task_field_raw "$id" "claude_status" "null"
-    fi
+    _reconcile_task_runtime_candidate "$id" "$task_state" "$claude_status" "$idle_secs" "$has_runtime" "$live_runtime" "$docked_task" "$apply" "$verbose"
   done <<< "$task_data"
 }
 

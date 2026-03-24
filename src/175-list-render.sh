@@ -56,8 +56,8 @@ _render_list_group_header() {
   local active_cnt="${_repo_col_cnt[${repo_name}:1]:-0}"
   local review_cnt="${_repo_col_cnt[${repo_name}:2]:-0}"
 
-  local arrow="▼"
-  [[ "${_list_group_collapsed[$repo_name]:-}" == "1" ]] && arrow="▶"
+  local arrow="$TUI_GLYPH_EXPANDED"
+  [[ "${_list_group_collapsed[$repo_name]:-}" == "1" ]] && arrow="$TUI_GLYPH_COLLAPSED"
 
   local hdr_text="${arrow} ${repo_name} (${total} tasks: ${active_cnt} active, ${review_cnt} review)"
   local _hpad="${(r:${cols}:)hdr_text}"
@@ -82,8 +82,8 @@ _render_list_cron_header() {
     cron_total=$((cron_total + ${_cron_col_cnt[__cron:${_ci}]:-0}))
   done
 
-  local arrow="▼"
-  [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="▶"
+  local arrow="$TUI_GLYPH_EXPANDED"
+  [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="$TUI_GLYPH_COLLAPSED"
 
   local hdr_text="${arrow} cron jobs (${cron_total} items)"
   local _hpad="${(r:${width}:)hdr_text}"
@@ -99,7 +99,7 @@ _render_list_cron_header() {
 # ── Task card (1 line) ──────────────────────────────────────────────────────
 
 # Render a single-line task card. Appends to _frame.
-# Format: > ● Fix authentication bug          ⚙ #42
+# Format: > * Fix authentication bug          * #42
 # $1 = task_id, $2 = available width, $3 = 1 if selected
 _render_list_task_card() {
   local task_id="$1"
@@ -114,17 +114,17 @@ _render_list_task_card() {
   # Single-char status badge
   local badge_char="" badge_color=""
   case "$tstatus" in
-    active)       badge_char="●"; badge_color="$C_GREEN" ;;
-    needs_review) badge_char="◆"; badge_color="$C_YELLOW" ;;
-    pending)      badge_char="○"; badge_color="$C_DIM" ;;
-    paused)       badge_char="◫"; badge_color="$C_CYAN" ;;
-    done)         badge_char="✓"; badge_color="$C_DIM" ;;
+    active)       badge_char="$TUI_GLYPH_ACTIVE"; badge_color="$C_GREEN" ;;
+    needs_review) badge_char="$TUI_GLYPH_REVIEW"; badge_color="$C_YELLOW" ;;
+    pending)      badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM" ;;
+    paused)       badge_char="$TUI_GLYPH_PAUSED"; badge_color="$C_CYAN" ;;
+    done)         badge_char="$TUI_GLYPH_DONE"; badge_color="$C_DIM" ;;
   esac
 
   # Right-side metadata: claude indicator + PR short
   local right_meta=""
-  [[ "$claude" == "working" ]] && right_meta="⚙"
-  [[ "$claude" == "waiting" ]] && right_meta="○"
+  [[ "$claude" == "working" ]] && right_meta="$TUI_GLYPH_WORKING"
+  [[ "$claude" == "waiting" ]] && right_meta="$TUI_GLYPH_WAITING"
   if [[ -n "$pr" ]]; then
     local pr_short
     pr_short=$(echo "$pr" | command grep -oE '#[0-9]+' 2>/dev/null || echo "PR")
@@ -173,9 +173,9 @@ _render_list_task_card() {
 # ── Cron card (1 line) ──────────────────────────────────────────────────────
 
 # Render a single-line cron card. Appends to _frame.
-# Scheduled: "  ○ morning-routine              every 30m"
-# Active:    "  ● morning-routine              ● running"
-# Review:    "  ◆ morning-routine              ◆ review"
+# Scheduled: "  o morning-routine              every 30m"
+# Active:    "  * morning-routine              * running"
+# Review:    "  ! morning-routine              ! review"
 # $1 = cron_id, $2 = available width, $3 = 1 if selected
 _render_list_cron_card() {
   local cron_id="$1"
@@ -202,15 +202,15 @@ _render_list_cron_card() {
     local jsched="${_cron_job_schedule[$cron_id]:-}"
     local jenabled="${_cron_job_enabled[$cron_id]:-true}"
     if [[ "$jenabled" != "true" ]]; then
-      badge_char="⊘"; badge_color="$C_RED"
+      badge_char="$TUI_GLYPH_DISABLED"; badge_color="$C_RED"
       right_meta="disabled"
       right_color="$C_RED"
     elif [[ -n "$jsched" ]]; then
-      badge_char="○"; badge_color="$C_DIM"
+      badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
       right_meta="$jsched"
       right_color="$C_DIM"
     else
-      badge_char="○"; badge_color="$C_DIM"
+      badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
       right_meta="scheduled"
       right_color="$C_DIM"
     fi
@@ -220,16 +220,16 @@ _render_list_cron_card() {
     IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
     cron_name="${_cron_jobs[$rjob_id]:-$rjob_id}"
     case "$rstat" in
-      active)       badge_char="●"; badge_color="$C_GREEN";  right_meta="● running";  right_color="$C_GREEN" ;;
+      active)       badge_char="$TUI_GLYPH_ACTIVE"; badge_color="$C_GREEN";  right_meta="${TUI_GLYPH_ACTIVE} running";  right_color="$C_GREEN" ;;
       needs_review)
-        badge_char="◆"; badge_color="$C_YELLOW"; right_meta="◆ review"; right_color="$C_YELLOW"
+        badge_char="$TUI_GLYPH_REVIEW"; badge_color="$C_YELLOW"; right_meta="${TUI_GLYPH_REVIEW} review"; right_color="$C_YELLOW"
         if [[ -n "${rcompleted:-}" ]]; then
           _time_ago "$rcompleted"
           [[ -n "$_tago" ]] && right_meta="${right_meta} ${_tago}"
         fi
         ;;
-      reviewed)     badge_char="✓"; badge_color="$C_CYAN";   right_meta="✓ reviewed";  right_color="$C_CYAN" ;;
-      *)            badge_char="○"; badge_color="$C_DIM";     right_meta="$rstat";      right_color="$C_DIM" ;;
+      reviewed)     badge_char="$TUI_GLYPH_DONE"; badge_color="$C_CYAN";   right_meta="${TUI_GLYPH_DONE} reviewed";  right_color="$C_CYAN" ;;
+      *)            badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"; right_meta="$rstat"; right_color="$C_DIM" ;;
     esac
   fi
 
@@ -359,9 +359,9 @@ _render_list_full() {
 
 # ── Sidebar task card (compact, single-line) ─────────────────────────────────
 
-# Render a single-line sidebar task card. No task ID or PR; sidebar is narrow.
-# Format: > ● Fix auth bug     ⚙
-# $1 = task_id, $2 = available width, $3 = 1 if selected
+# Render a single-line sidebar task card wrapped inside inline box borders.
+# No task ID or PR; sidebar is narrow.
+# $1 = task_id, $2 = available inner width, $3 = 1 if selected
 _render_sidebar_task_card() {
   local task_id="$1"
   local width="$2"
@@ -374,16 +374,16 @@ _render_sidebar_task_card() {
   # Single-char status badge
   local badge_char="" badge_color=""
   case "$tstatus" in
-    active)       badge_char="●"; badge_color="$C_GREEN" ;;
-    needs_review) badge_char="◆"; badge_color="$C_YELLOW" ;;
-    pending)      badge_char="○"; badge_color="$C_DIM" ;;
-    paused)       badge_char="◫"; badge_color="$C_CYAN" ;;
-    done)         badge_char="✓"; badge_color="$C_DIM" ;;
+    active)       badge_char="$TUI_GLYPH_ACTIVE"; badge_color="$C_GREEN" ;;
+    needs_review) badge_char="$TUI_GLYPH_REVIEW"; badge_color="$C_YELLOW" ;;
+    pending)      badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM" ;;
+    paused)       badge_char="$TUI_GLYPH_PAUSED"; badge_color="$C_CYAN" ;;
+    done)         badge_char="$TUI_GLYPH_DONE"; badge_color="$C_DIM" ;;
   esac
 
   local claude_char=""
-  [[ "$claude" == "working" ]] && claude_char=" ⚙"
-  [[ "$claude" == "waiting" ]] && claude_char=" ○"
+  [[ "$claude" == "working" ]] && claude_char=" ${TUI_GLYPH_WORKING}"
+  [[ "$claude" == "waiting" ]] && claude_char=" ${TUI_GLYPH_WAITING}"
 
   # Append time ago for non-pending tasks
   if [[ "$tstatus" != "pending" ]]; then
@@ -413,9 +413,9 @@ _render_sidebar_task_card() {
   [[ $title_w -lt 0 ]] && title_w=0
 
   if [[ "$is_selected" == "1" ]]; then
-    _frame+="${sel_on}${prefix} ${badge_char} ${(r:$title_w:)title_str}${claude_char}${sel_off}"
+    _frame+="│${sel_on}${prefix} ${badge_char} ${(r:$title_w:)title_str}${claude_char}${sel_off}│"
   else
-    _frame+="${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$title_w:)title_str}${C_DIM}${claude_char}${C_RESET}"
+    _frame+="│${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$title_w:)title_str}${C_DIM}${claude_char}${C_RESET}│"
   fi
   _frame+=$'\n'
 }
@@ -424,21 +424,24 @@ _render_sidebar_task_card() {
 
 # Render the list as a narrow sidebar. Same logic as _render_list_full but
 # uses the narrower pane width and omits the scrollbar.
-# Content is inset by 1 col to leave room for the border overlay.
+# The sidebar border is rendered inline so every repaint fully overwrites the
+# previous frame at narrow widths.
 _render_list_sidebar() {
   local sidebar_w="${1:-$cols}"
   local viewport_height=${_viewport_height:-$((rows - 3))}
   [[ $viewport_height -lt 1 ]] && viewport_height=1
 
-  # Reserve 2 lines for top/bottom border, 1 col left inset for │
-  local content_w=$((sidebar_w - 1))
+  # Reserve 2 lines for top/bottom border and 2 cols for left/right borders.
+  local content_w=$((sidebar_w - 2))
   [[ $content_w -lt 4 ]] && content_w=4
   local content_vh=$((viewport_height - 2))
   [[ $content_vh -lt 1 ]] && content_vh=1
 
-  # Top border line (blank row that the overlay will paint over)
-  local _e=""
-  _frame+="${(r:${sidebar_w}:)_e}"$'\n'
+  # Top border line
+  local _e="" _border_line=""
+  local _bi
+  for ((_bi=0; _bi<content_w; _bi++)); do _border_line+="─"; done
+  _frame+="┌${_border_line}┐"$'\n'
 
   # Temporarily adjust viewport for border-reserved height
   local _save_vh=${_viewport_height:-$viewport_height}
@@ -465,18 +468,18 @@ _render_list_sidebar() {
     local item="${_list_items[$_rs_idx]}"
     case "$item" in
       group:*)
-        # Slim group header for sidebar (inset 1 col for left border)
+        # Slim group header for sidebar
         local rn="${item#group:}"
-        local arrow="▼"
-        [[ "${_list_group_collapsed[$rn]:-}" == "1" ]] && arrow="▶"
+        local arrow="$TUI_GLYPH_EXPANDED"
+        [[ "${_list_group_collapsed[$rn]:-}" == "1" ]] && arrow="$TUI_GLYPH_COLLAPSED"
         local total="${_repo_task_count[$rn]:-0}"
         local hdr=" ${arrow} ${rn} (${total})"
         hdr=$(trunc "$hdr" "$content_w")
         local _shpad="${(r:${content_w}:)hdr}"
         if [[ $is_sel -eq 1 ]]; then
-          _frame+="${C_BOLD}${C_BG_BLUE}${C_WHITE}${_shpad}${C_RESET}"
+          _frame+="│${C_BOLD}${C_BG_BLUE}${C_WHITE}${_shpad}${C_RESET}│"
         else
-          _frame+="${C_BOLD}${_shpad}${C_RESET}"
+          _frame+="│${C_BOLD}${_shpad}${C_RESET}│"
         fi
         _frame+=$'\n'
         ;;
@@ -484,10 +487,96 @@ _render_list_sidebar() {
         _render_sidebar_task_card "${item#task:}" "$content_w" "$is_sel"
         ;;
       cron_group:*)
-        _render_list_cron_header "$is_sel" "$content_w"
+        local arrow="$TUI_GLYPH_EXPANDED"
+        [[ "${_list_group_collapsed[__cron]:-}" == "1" ]] && arrow="$TUI_GLYPH_COLLAPSED"
+        local cron_total=0
+        local _ci
+        for _ci in {0..3}; do
+          cron_total=$((cron_total + ${_cron_col_cnt[__cron:${_ci}]:-0}))
+        done
+        local hdr=" ${arrow} cron jobs (${cron_total} items)"
+        hdr=$(trunc "$hdr" "$content_w")
+        local _shpad="${(r:${content_w}:)hdr}"
+        if [[ $is_sel -eq 1 ]]; then
+          _frame+="│${C_BOLD}${C_BG_BLUE}${C_WHITE}${_shpad}${C_RESET}│"
+        else
+          _frame+="│${C_BOLD}${_shpad}${C_RESET}│"
+        fi
+        _frame+=$'\n'
         ;;
       cron:*)
-        _render_list_cron_card "${item#cron:}" "$content_w" "$is_sel"
+        local cid="${item#cron:}"
+        local rdata="${_cron_run_data[$cid]:-}"
+        local prefix=" "
+        local sel_on="" sel_off=""
+        if [[ $is_sel -eq 1 ]]; then
+          prefix=">"
+          sel_on="${C_BOLD}${C_BG_BLUE}${C_WHITE}"
+          sel_off="${C_RESET}"
+        fi
+
+        local cron_name="" right_meta="" right_color=""
+        local badge_char="" badge_color=""
+        if [[ -z "$rdata" ]]; then
+          cron_name="${_cron_jobs[$cid]:-$cid}"
+          local jsched="${_cron_job_schedule[$cid]:-}"
+          local jenabled="${_cron_job_enabled[$cid]:-true}"
+          if [[ "$jenabled" != "true" ]]; then
+            badge_char="$TUI_GLYPH_DISABLED"; badge_color="$C_RED"
+            right_meta="disabled"
+            right_color="$C_RED"
+          elif [[ -n "$jsched" ]]; then
+            badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
+            right_meta="$jsched"
+            right_color="$C_DIM"
+          else
+            badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
+            right_meta="scheduled"
+            right_color="$C_DIM"
+          fi
+        else
+          local rjob_id rstat recode rstart rsid rwin rcompleted
+          IFS=$'\x1e' read -r rjob_id rstat recode rstart rsid rwin rcompleted <<< "$(echo -e "$rdata")"
+          cron_name="${_cron_jobs[$rjob_id]:-$rjob_id}"
+          case "$rstat" in
+            active)
+              badge_char="$TUI_GLYPH_ACTIVE"; badge_color="$C_GREEN"
+              right_meta="${TUI_GLYPH_ACTIVE} running"; right_color="$C_GREEN"
+              ;;
+            needs_review)
+              badge_char="$TUI_GLYPH_REVIEW"; badge_color="$C_YELLOW"
+              right_meta="${TUI_GLYPH_REVIEW} review"; right_color="$C_YELLOW"
+              if [[ -n "${rcompleted:-}" ]]; then
+                _time_ago "$rcompleted"
+                [[ -n "$_tago" ]] && right_meta="${right_meta} ${_tago}"
+              fi
+              ;;
+            reviewed)
+              badge_char="$TUI_GLYPH_DONE"; badge_color="$C_CYAN"
+              right_meta="${TUI_GLYPH_DONE} reviewed"; right_color="$C_CYAN"
+              ;;
+            *)
+              badge_char="$TUI_GLYPH_PENDING"; badge_color="$C_DIM"
+              right_meta="$rstat"; right_color="$C_DIM"
+              ;;
+          esac
+        fi
+
+        local right_str=""
+        [[ -n "$right_meta" ]] && right_str="  ${right_meta}"
+        local fixed_left=4
+        local right_len=${#right_str}
+        local name_w=$((content_w - fixed_left - right_len))
+        [[ $name_w -lt 1 ]] && name_w=1
+        local name_str
+        name_str=$(trunc "$cron_name" "$name_w")
+
+        if [[ $is_sel -eq 1 ]]; then
+          _frame+="│${sel_on}${prefix} ${badge_char} ${(r:$name_w:)name_str}${right_str}${sel_off}│"
+        else
+          _frame+="│${prefix} ${badge_color}${badge_char}${C_RESET} ${(r:$name_w:)name_str}${right_color}${right_str}${C_RESET}│"
+        fi
+        _frame+=$'\n'
         ;;
     esac
 
@@ -499,16 +588,12 @@ _render_list_sidebar() {
   [[ $rendered_lines -gt $content_vh ]] && rendered_lines=$content_vh
   local _pad_i _e=""
   for (( _pad_i=rendered_lines; _pad_i<content_vh; _pad_i++ )); do
-    _frame+="${(r:${content_w}:)_e}"
+    _frame+="│${(r:${content_w}:)_e}│"
     _frame+=$'\n'
   done
 
-  # Bottom border line (blank row that the overlay will paint over)
-  _frame+="${(r:${sidebar_w}:)_e}"$'\n'
-
-  # Store border dimensions for deferred overlay (painted after frame output)
-  _sidebar_border_vh=$content_vh
-  _sidebar_border_w=$sidebar_w
+  # Bottom border line
+  _frame+="└${_border_line}┘"$'\n'
 
   # Restore viewport height
   _viewport_height=$_save_vh
@@ -597,10 +682,6 @@ _list_handle_key() {
   local max_idx=$((${#_list_items[@]} - 1))
   [[ $max_idx -lt 0 ]] && max_idx=0
 
-  if [[ "${_split_active:-0}" == "1" ]]; then
-    _split_sync_state || true
-  fi
-
   case "$key" in
     j) # Cursor down
       if [[ $_list_cursor -lt $max_idx ]]; then
@@ -643,10 +724,17 @@ _list_handle_key() {
             echo "${C_RED}Repo path not found. Run: cloard-board repo update-path ${repo_name} <new-path>${C_RESET}"
             sleep 2
             stty -echo; cursor_hide
+          else
+            if [[ "${_split_active:-0}" == "1" ]] && ! _tmux_dashboard_has_split; then
+              _split_reset_state
+            fi
+          fi
+          if [[ -n "${_repo_stale[$repo_name]:-}" ]]; then
+            :
           elif [[ "${_split_active:-0}" == "1" ]]; then
             if [[ "${_split_is_cron:-0}" == "1" ]]; then
               # Switching from cron to task: close cron split, open task split
-              _split_close
+              _split_close keep
               _split_open "$sel_id"
             elif [[ "$sel_id" != "$_split_task_id" ]]; then
               _split_switch_session "$sel_id"
@@ -661,9 +749,12 @@ _list_handle_key() {
           local cid="${item#cron:}"
           local rdata="${_cron_run_data[$cid]:-}"
           if [[ -n "$rdata" ]]; then
+            if [[ "${_split_active:-0}" == "1" ]] && ! _tmux_dashboard_has_split; then
+              _split_reset_state
+            fi
             if [[ "${_split_active:-0}" == "1" ]]; then
               if [[ "$_split_task_id" != "$cid" ]]; then
-                _split_close
+                _split_close keep
                 _split_open_cron "$cid"
               fi
               # Keep focus on sidebar; user presses l to move to Claude pane
@@ -759,7 +850,11 @@ _list_handle_key() {
 
     b) # Toggle split view
       if [[ "${_split_active:-0}" == "1" ]]; then
-        _split_close
+        if _tmux_dashboard_has_split; then
+          _split_close clear
+        else
+          _split_clear_state
+        fi
       elif _list_get_selected_id; then
         _split_open "$_tid"
       elif _list_get_selected_cron_id; then
@@ -768,22 +863,34 @@ _list_handle_key() {
       ;;
 
     l) # Focus right pane (Claude session) when split is active
-      if [[ "${_split_active:-0}" == "1" ]]; then
+      if [[ "${_split_active:-0}" == "1" ]] && _tmux_dashboard_has_split; then
         tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       fi
       ;;
 
     F) # Full-screen the Claude session (exits split view)
       if [[ "${_split_active:-0}" == "1" && -n "${_split_task_id:-}" ]]; then
+        if ! _tmux_dashboard_has_split; then
+          _split_reset_state
+          return 0
+        fi
         local fs_task_id="$_split_task_id"
-        _split_close
-        tmux_select_window "$fs_task_id"
+        local fs_target="$fs_task_id"
+        if [[ "${_split_is_cron:-0}" == "1" ]]; then
+          fs_target=$(_split_break_name "$fs_task_id" "1")
+        fi
+        _split_close keep
+        tmux_select_window "$fs_target"
       fi
       ;;
 
     ESC) # Escape
       if [[ "${_split_active:-0}" == "1" ]]; then
-        _split_close
+        if _tmux_dashboard_has_split; then
+          _split_close clear
+        else
+          _split_clear_state
+        fi
       else
         # Collapse current group if cursor is on a task within it
         local item="${_list_items[$_list_cursor]:-}"

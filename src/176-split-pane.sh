@@ -91,12 +91,162 @@ _split_reset_state() {
   _split_unbind_sidebar_key
 }
 
-_split_sync_state() {
-  if [[ "${_split_active:-0}" == "1" ]] && ! _tmux_dashboard_has_split; then
-    _split_reset_state
-    return 1
+_split_clear_state() {
+  _tmux_dashboard_clear_dock
+  _split_reset_state
+}
+
+_split_activate_state() {
+  local kind="$1" dock_id="$2"
+  _split_active=1
+  _split_task_id="$dock_id"
+  if [[ "$kind" == "cron" ]]; then
+    _split_is_cron=1
+  else
+    _split_is_cron=0
   fi
-  return 0
+  _split_bind_sidebar_key
+  _tmux_dashboard_set_dock "$kind" "$dock_id"
+  _tmux_mark_task_pane "board:dashboard.1" "$dock_id"
+}
+
+_split_break_name() {
+  local dock_id="$1" is_cron="${2:-0}"
+  if [[ "$is_cron" == "1" ]]; then
+    echo "resume-${dock_id}"
+  else
+    echo "$dock_id"
+  fi
+}
+
+_split_sync_state() {
+  local dock_data=""
+  if [[ $# -gt 0 ]]; then
+    dock_data="$1"
+  else
+    dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  fi
+
+  local dock_kind="" dock_id=""
+  if [[ -n "$dock_data" ]]; then
+    IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+  fi
+
+  if _tmux_dashboard_has_split; then
+    local dash_id dash_kind="task"
+    dash_id=$(_tmux_dashboard_task_id 2>/dev/null || true)
+    if [[ -n "$dock_data" ]]; then
+      if [[ -z "$dash_id" || "$dock_id" == "$dash_id" ]]; then
+        dash_kind="$dock_kind"
+        [[ -z "$dash_id" ]] && dash_id="$dock_id"
+      fi
+    elif [[ "$dash_id" == cr-* ]]; then
+      dash_kind="cron"
+    fi
+
+    if [[ -z "$dash_id" ]]; then
+      _split_clear_state
+      return 1
+    fi
+
+    local -i want_is_cron=0
+    [[ "$dash_kind" == "cron" ]] && want_is_cron=1
+    local -i state_changed=0
+    if [[ "${_split_active:-0}" != "1" || "$_split_task_id" != "$dash_id" || "${_split_is_cron:-0}" != "$want_is_cron" ]]; then
+      state_changed=1
+    fi
+
+    _split_active=1
+    _split_task_id="$dash_id"
+    _split_is_cron=$want_is_cron
+    if [[ $state_changed -eq 1 ]]; then
+      _split_bind_sidebar_key
+    fi
+    if [[ -z "$dock_data" || "$dock_kind" != "$dash_kind" || "$dock_id" != "$dash_id" ]]; then
+      _tmux_dashboard_set_dock "$dash_kind" "$dash_id"
+    fi
+    return 0
+  fi
+
+  if [[ "${_split_active:-0}" == "1" ]]; then
+    _split_unbind_sidebar_key
+  fi
+  _split_active=0
+
+  if [[ -n "$dock_data" ]]; then
+    _split_task_id="$dock_id"
+    if [[ "$dock_kind" == "cron" ]]; then
+      _split_is_cron=1
+    else
+      _split_is_cron=0
+    fi
+  else
+    _split_task_id=""
+    _split_is_cron=0
+  fi
+  return 1
+}
+
+_split_restore_persisted_if_needed() {
+  local dock_data=""
+  if [[ $# -gt 0 ]]; then
+    dock_data="$1"
+  else
+    dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  fi
+
+  _split_sync_state "$dock_data" || true
+  [[ "${_split_active:-0}" == "1" ]] && return 0
+
+  [[ -n "$dock_data" ]] || return 1
+
+  local dock_kind dock_id
+  IFS=$'\x1e' read -r dock_kind dock_id <<< "$dock_data"
+
+  _view_mode="list"
+  _list_follow_id="$dock_id"
+  if [[ "$dock_kind" == "cron" ]]; then
+    _list_follow_type="cron"
+    [[ -n "${_cron_run_data[$dock_id]:-}" ]] || {
+      _split_clear_state
+      return 1
+    }
+    _split_open_cron "$dock_id" || {
+      _split_clear_state
+      return 1
+    }
+    return 0
+  fi
+
+  _list_follow_type="task"
+  task_exists "$dock_id" || {
+    _split_clear_state
+    return 1
+  }
+  _split_open "$dock_id" || {
+    _split_clear_state
+    return 1
+  }
+}
+
+# Reapply the persisted dock when the dashboard is still the active window but
+# the right-hand pane has disappeared.
+_dash_restore_dock_if_needed() {
+  local dock_data=""
+  if [[ $# -gt 0 ]]; then
+    dock_data="$1"
+  else
+    dock_data=$(_tmux_dashboard_read_dock 2>/dev/null || true)
+  fi
+
+  [[ -n "$dock_data" ]] || return 1
+  _tmux_dashboard_window_active || return 1
+
+  _split_sync_state "$dock_data" || true
+  [[ "${_split_active:-0}" == "1" ]] && return 1
+
+  _view_mode="list"
+  _split_restore_persisted_if_needed "$dock_data"
 }
 
 # Open a split pane with the task's Claude session on the right side.
@@ -118,15 +268,11 @@ _split_open() {
   if tmux_window_exists "$task_id"; then
     # Live session found: join it into the dashboard as right pane
     if tmux_cmd join-pane -h -s "board:${task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null; then
-      _split_active=1
-      _split_task_id="$task_id"
-      _split_is_cron=0
-      _split_bind_sidebar_key
-      _tmux_mark_task_pane "board:dashboard.1" "$task_id"
+      _split_activate_state "task" "$task_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
-    _split_reset_state
+    _split_clear_state
     return 1
   fi
 
@@ -139,16 +285,12 @@ _split_open() {
 
   if tmux_cmd split-window -h -t "board:dashboard" -p 60 \
     "export CLOARD_TASK_ID=${task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"; then
-    _split_active=1
-    _split_task_id="$task_id"
-    _split_is_cron=0
-    _split_bind_sidebar_key
-    _tmux_mark_task_pane "board:dashboard.1" "$task_id"
+    _split_activate_state "task" "$task_id"
     tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
 
-  _split_reset_state
+  _split_clear_state
   return 1
 }
 
@@ -168,14 +310,11 @@ _split_open_cron() {
   # Active run with live tmux window: join it into dashboard right pane
   if [[ "$rstat" == "active" && -n "$rwin" ]] && tmux_window_exists "$rwin"; then
     if tmux_cmd join-pane -h -s "board:${rwin}.0" -t "board:dashboard" -l '60%' 2>/dev/null; then
-      _split_active=1
-      _split_task_id="$cron_id"
-      _split_is_cron=1
-      _split_bind_sidebar_key
+      _split_activate_state "cron" "$cron_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
-    _split_reset_state
+    _split_clear_state
     return 1
   fi
 
@@ -190,25 +329,22 @@ _split_open_cron() {
     _purge_stale_windows "$resume_win"
     if tmux_window_exists "$resume_win"; then
       if ! tmux_cmd join-pane -h -s "board:${resume_win}.0" -t "board:dashboard" -l '60%' 2>/dev/null; then
-        _split_reset_state
+        _split_clear_state
         return 1
       fi
     else
       if ! tmux_cmd split-window -h -t "board:dashboard" -p 60 \
         "cd ${safe_wdir} && claude --resume ${rsid}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"; then
-        _split_reset_state
+        _split_clear_state
         return 1
       fi
     fi
-    _split_active=1
-    _split_task_id="$cron_id"
-    _split_is_cron=1
-    _split_bind_sidebar_key
+    _split_activate_state "cron" "$cron_id"
     tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
 
-  _split_reset_state
+  _split_clear_state
   return 1
 }
 
@@ -246,11 +382,7 @@ _split_switch_session() {
         tmux_cmd rename-window -t "board:${new_task_id}" "$old_task_id" 2>/dev/null || true
         _purge_stale_windows "$old_task_id"
       fi
-      _split_active=1
-      _split_task_id="$new_task_id"
-      _split_is_cron=0
-      _split_bind_sidebar_key
-      _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
+      _split_activate_state "task" "$new_task_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
@@ -270,15 +402,11 @@ _split_switch_session() {
   if tmux_window_exists "$new_task_id"; then
     # Live session found after fallback: join it
     if tmux_cmd join-pane -h -s "board:${new_task_id}.0" -t "board:dashboard" -l '60%' 2>/dev/null; then
-      _split_active=1
-      _split_task_id="$new_task_id"
-      _split_is_cron=0
-      _split_bind_sidebar_key
-      _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
+      _split_activate_state "task" "$new_task_id"
       tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
       return 0
     fi
-    _split_reset_state
+    _split_clear_state
     return 1
   fi
 
@@ -291,33 +419,30 @@ _split_switch_session() {
 
   if tmux_cmd split-window -h -t "board:dashboard" -p 60 \
     "export CLOARD_TASK_ID=${new_task_id} CLOARD_BOARD_DIR=${safe_global_dir} && cd ${safe_work_dir} && ${_sbc_cmd}; zsh; tmux -L cloard-board select-window -t board:dashboard 2>/dev/null"; then
-    _split_active=1
-    _split_task_id="$new_task_id"
-    _split_is_cron=0
-    _split_bind_sidebar_key
-    _tmux_mark_task_pane "board:dashboard.1" "$new_task_id"
+    _split_activate_state "task" "$new_task_id"
     tmux_cmd select-pane -t "board:dashboard.1" 2>/dev/null || true
     return 0
   fi
 
-  _split_reset_state
+  _split_clear_state
   return 1
 }
 
 # Close the split view, preserving the running session in its own tmux window.
 _split_close() {
+  local mode="${1:-keep}"
   if [[ -n "$_split_task_id" ]] && _tmux_dashboard_has_split; then
-    # For cron splits, preserve with resume- prefix so _split_open_cron can find it
-    local break_name="$_split_task_id"
-    if [[ "${_split_is_cron:-0}" == "1" ]]; then
-      break_name="resume-${_split_task_id}"
-    fi
+    local break_name
+    break_name=$(_split_break_name "$_split_task_id" "${_split_is_cron:-0}")
     # Kill stale windows first so break-pane creates the only named window
     _purge_stale_windows "$break_name"
     # Try to preserve as named window; fall back to killing the pane
     tmux_cmd break-pane -d -s "board:dashboard.1" -n "$break_name" 2>/dev/null \
       || tmux_cmd kill-pane -t "board:dashboard.1" 2>/dev/null \
       || true
+  fi
+  if [[ "$mode" == "clear" ]]; then
+    _tmux_dashboard_clear_dock
   fi
   _split_reset_state
 }

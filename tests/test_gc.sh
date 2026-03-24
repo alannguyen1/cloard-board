@@ -40,6 +40,14 @@ assert_match() {
   fi
 }
 
+dashboard_panes() {
+  tmux_cmd list-panes -t "board:dashboard" 2>/dev/null | wc -l | tr -d ' '
+}
+
+dock_state() {
+  _tmux_dashboard_read_dock 2>/dev/null || true
+}
+
 hours_ago_iso() {
   local hours="$1"
   date -u -v-"${hours}"H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
@@ -70,6 +78,7 @@ sed \
   "$BOARD" > "$BOARD_SRC"
 
 source "$BOARD_SRC"
+SCRIPT_PATH="$BOARD"
 trap 'tmux -L "$TMUX_SOCKET" kill-server 2>/dev/null || true; rm -rf "$TMPDIR_TEST"' EXIT
 
 old_review_at=$(hours_ago_iso 2)
@@ -133,6 +142,63 @@ assert_eq "live session count reduced to one" "1" "$(_tmux_live_session_count)"
 echo ""
 echo "D. Doctor is clean after GC"
 assert_match "doctor reports all clear after gc" 'all clear; no issues found' "$doctor_after"
+
+echo ""
+echo "E. Docked review runtimes stay pinned during GC"
+tmux -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
+ensure_tmux_session
+docked_review_at=$(hours_ago_iso 2)
+cat > "$GLOBAL_STATE" <<JSON
+{"version":5,"next_task_id":2,"repos":[],"tasks":[
+  {"id":"t-007","title":"docked review","repo":"r","status":"needs_review","created_at":"$docked_review_at","started_at":"$docked_review_at","completed_at":null,"status_changed_at":"$docked_review_at","last_activity_at":"$docked_review_at","claude_status":"waiting","worktree_mode":"none","session_uid":"uid-007","session_history":["uid-007"]}
+],"cron_jobs":[],"cron_runs":[]}
+JSON
+tmux_cmd new-window -t "board" -n "t-007" "zsh -c 'export CLOARD_TASK_ID=t-007; node -e \"setInterval(function(){}, 1000000)\"'"
+_tmux_mark_task_pane "board:t-007.0" "t-007"
+_tmux_dashboard_set_dock "task" "t-007"
+tmux_cmd join-pane -h -s "board:t-007.0" -t "board:dashboard" -l '60%'
+_tmux_mark_task_pane "board:dashboard.1" "t-007"
+sleep 1
+cmd_gc >/dev/null
+sleep 1
+assert_eq "docked review task keeps two-pane dashboard" "2" "$(dashboard_panes)"
+assert_eq "docked review task keeps dock metadata" $'task\x1et-007' "$(dock_state)"
+assert_eq "docked review task stays needs_review" "needs_review" "$(task_status "t-007")"
+assert_eq "docked review task keeps waiting status" "waiting" "$(jq -r '.tasks[] | select(.id == "t-007") | .claude_status // "null"' "$GLOBAL_STATE")"
+assert_eq "docked review runtime stays attached to dashboard" "t-007" "$(_tmux_dashboard_task_id 2>/dev/null || true)"
+
+echo ""
+echo "F. Dashboard GC only scans current runtimes"
+typeset -gi runtime_exists_calls=0 runtime_live_calls=0 live_window_checks=0 split_live_checks=0
+tmux_session_exists() { return 0; }
+_tmux_dashboard_read_dock() { return 1; }
+_tmux_dashboard_has_split() { return 1; }
+_tmux_dashboard_task_id() { echo "t-003"; }
+_tmux_runtime_window_names() { printf '%s\n' "t-001" "t-002"; }
+_tmux_claude_alive() { live_window_checks=$((live_window_checks + 1)); [[ "$1" == "t-001" ]]; }
+_tmux_pane_claude_alive() { split_live_checks=$((split_live_checks + 1)); return 0; }
+_tmux_close_task_runtime() { return 0; }
+_tmux_task_runtime_exists() { runtime_exists_calls=$((runtime_exists_calls + 1)); return 1; }
+_tmux_task_runtime_live() { runtime_live_calls=$((runtime_live_calls + 1)); return 1; }
+task_exists() {
+  [[ "$1" == "t-001" || "$1" == "t-002" || "$1" == "t-003" ]]
+}
+task_status() {
+  echo "active"
+}
+task_field() {
+  case "$2" in
+    claude_status) echo "working" ;;
+    last_activity_at|status_changed_at) minutes_ago_iso 5 ;;
+    started_at) minutes_ago_iso 10 ;;
+    *) echo "" ;;
+  esac
+}
+_reconcile_task_runtime false false dashboard
+assert_eq "dashboard mode avoids per-task runtime exists checks" "0" "$runtime_exists_calls"
+assert_eq "dashboard mode avoids per-task runtime live checks" "0" "$runtime_live_calls"
+assert_eq "dashboard mode checks only live runtime candidates" "2" "$live_window_checks"
+assert_eq "dashboard mode skips split probe without a split" "0" "$split_live_checks"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

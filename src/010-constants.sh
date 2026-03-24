@@ -5,6 +5,7 @@ readonly GLOBAL_DIR="$HOME/.cloard-board"
 readonly GLOBAL_STATE="$GLOBAL_DIR/state.json"
 readonly HOOKS_DIR="$GLOBAL_DIR/hooks"
 readonly DASH_REFRESH="${CLOARD_REFRESH:-1}"  # seconds between dashboard refreshes
+readonly DASH_ESC_READ_TIMEOUT="0.02"
 readonly HOOK_VERSION="4"
 readonly MAX_SESSION_HISTORY=10
 readonly TASK_REVIEW_IDLE_TIMEOUT_SECS=3600
